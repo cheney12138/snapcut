@@ -47,11 +47,27 @@ final class StatusItemController: NSObject {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
             if let frame = item.button?.window?.frame {
+                let screenMaxX = NSScreen.main?.frame.maxX ?? frame.maxX
                 Log.event(.tray, "tray.button.frame", [
                     "x": "\(Int(frame.minX))", "y": "\(Int(frame.minY))",
                     "w": "\(Int(frame.width))", "h": "\(Int(frame.height))",
                     "onScreen": "\(NSScreen.screens.contains { $0.frame.intersects(frame) })",
                 ])
+                // 兕底判定：图标被系统挤到时钟区（≈最右侧 40pt）或完全不在屏上
+                // 即视为隐藏。实测病例两种表现：
+                // ① 菜单栏满，button.frame 落在时钟区 x≈1690 且不可见；
+                // ② 本机（菜单栏无空位）：frame 落在 x=0,y=-22，onScreen=false。
+                let onScreen = NSScreen.screens.contains { $0.frame.intersects(frame) }
+                let inClockZone = frame.maxX > screenMaxX - 40
+                if inClockZone || !onScreen {
+                    Log.error(.tray, "tray.hidden.overflow", [
+                        "maxX": "\(Int(frame.maxX))",
+                        "screenMaxX": "\(Int(screenMaxX))",
+                        "onScreen": "\(onScreen)",
+                    ])
+                    CaptureToast.show(message: "菜单栏已满，Snapcut 图标被隐藏；⌘⇧A 仍可用；"
+                        + "可在 系统设置 → 控制中心 → 菜单栏 里腾位置")
+                }
             } else {
                 Log.error(.tray, "tray.button.noframe")
             }

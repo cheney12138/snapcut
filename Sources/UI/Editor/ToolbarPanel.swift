@@ -31,6 +31,7 @@ final class ToolbarPanel: NSPanel {
     private var widthButtons: [TBWidthButton] = []
     private var undoButton: TBIconButton!
     private var redoButton: TBIconButton!
+    private var eyeButton: TBIconButton?
     private var tooltip: ToolbarTooltipWindow?
 
     // 视觉 token（照抄原型 CSS，单位 pt）
@@ -182,6 +183,7 @@ final class ToolbarPanel: NSPanel {
 
         let eye = TBIconButton(symbol: "eye", fallback: "眼")
         eye.tag = 200
+        eyeButton = eye
         eye.target = self
         eye.action = #selector(actionTapped(_:))
         eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 H") }
@@ -301,8 +303,20 @@ final class ToolbarPanel: NSPanel {
         for button in widthButtons {
             button.setSelected(button.tag == session.strokeWidth)
         }
+        // 病例（首次 build）：isEnabled didSet → alphaValue 的路径在按钮刚挂上
+        // 视图树时可能未生效，这里显式再刷一次，保证「有标注变亮 / 无标注置灰」
         undoButton.isEnabled = session.store.canUndo
         redoButton.isEnabled = session.store.canRedo
+        undoButton.alphaValue = session.store.canUndo ? 1 : 0.35
+        redoButton.alphaValue = session.store.canRedo ? 1 : 0.35
+    }
+
+    /// 工具栏显隐态图标（隐藏时 eye.slash，显示时 eye）。
+    /// 注意：orderOut 期间用户看不到图标本身，这个状态在再次按 H / 点击唤回时
+    /// 用于表达「当前是隐藏态、再点一次收起」的语义。
+    func setToolbarHidden(_ hidden: Bool) {
+        eyeButton?.setSymbol(hidden ? "eye.slash" : "eye", fallback: "眼")
+        Log.event(.editor, "toolbar.eye.icon", ["state": hidden ? "hidden" : "visible"])
     }
 
     // MARK: - 悬停提示
@@ -416,6 +430,17 @@ private class TBIconButton: NSButton {
         isHot = false
         applyStyle()
         onHover?(false)
+    }
+
+    func setSymbol(_ symbol: String, fallback: String) {
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            self.image = image.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+            )
+        } else {
+            title = fallback
+            font = .systemFont(ofSize: 13, weight: .medium)
+        }
     }
 
     private var selectedState = false
@@ -623,9 +648,15 @@ private final class TBPrimaryButton: NSButton {
         layer?.shadowRadius = 5
         layer?.shadowOffset = CGSize(width: 0, height: -2)
         heightAnchor.constraint(equalToConstant: 28).isActive = true
-        let pad = NSEdgeInsets.left(10)
-        _ = pad
-        contentEdgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+    }
+
+    /// 真实布局：NSButton 原生 image+title 排列（imageLeading），
+    /// 宽度 = 自然内容宽 + 左右 10pt，高度锁 28。
+    /// ⚠️ macOS 26 SDK 已移除 NSButton.contentEdgeInsets（且旧实现用同名存储属性
+    /// 遮蔽了系统属性，内边距完全不生效、文字贴边），改用 intrinsicContentSize 注入 padding。
+    override var intrinsicContentSize: NSSize {
+        let base = super.intrinsicContentSize
+        return NSSize(width: base.width + 20, height: 28)   // 左右各 10pt
     }
 
     @available(*, unavailable)
@@ -651,16 +682,6 @@ private final class TBPrimaryButton: NSButton {
         onHover?(false)
         layer?.backgroundColor = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1).cgColor
         layer?.shadowRadius = 5
-    }
-
-    private var contentEdgeInsets: NSEdgeInsets = .init() {
-        didSet { needsLayout = true }
-    }
-}
-
-private extension NSEdgeInsets {
-    static func left(_ v: CGFloat) -> NSDirectionalEdgeInsets {
-        NSDirectionalEdgeInsets(top: 0, leading: v, bottom: 0, trailing: v)
     }
 }
 
@@ -714,7 +735,14 @@ private final class ToolbarTooltipWindow: NSPanel {
             let size = contentView?.fittingSize ?? CGSize(width: 80, height: 22)
             let w = size.width + 16, h: CGFloat = 22
             let x = rect.midX - w / 2
-            let y = rect.maxY + 8
+            // 默认在按钮上方 8pt；贴屏幕顶（会溢出）时翻到按钮下方
+            var y = rect.maxY + 8
+            let screen = NSScreen.screens.first {
+                $0.frame.contains(CGPoint(x: rect.midX, y: rect.midY))
+            } ?? NSScreen.main
+            if let screen, y + h > screen.frame.maxY {
+                y = rect.minY - 8 - h
+            }
             setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
             alphaValue = 0
             orderFrontRegardless()
