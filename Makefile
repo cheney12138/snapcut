@@ -1,5 +1,7 @@
 SHELL := /bin/bash
 BUNDLE := build/Snapcut.app
+# 稳定开发签名身份（TCC 授权随签名走：身份固定 ⇒ 屏幕录制授权不会每次构建后重置弹窗）
+SIGN_ID := "Apple Development: 18600607249@163.com (7KDMYNHX76)"
 
 .PHONY: gen dev run tail clean
 
@@ -7,16 +9,17 @@ BUNDLE := build/Snapcut.app
 gen:
 	xcodegen generate
 
-## Debug 构建（ad-hoc 签名，产物拷贝到 build/Snapcut.app）
+## Debug 构建（固定开发证书签名，产物拷贝到 build/Snapcut.app）
 dev: gen
 	rm -rf $(BUNDLE)
 	xcodebuild -project Snapcut.xcodeproj -scheme Snapcut -configuration Debug \
 		-derivedDataPath build/DerivedData \
-		CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=YES build 2>&1 | tail -30
+		CODE_SIGN_IDENTITY=$(SIGN_ID) \
+		DEVELOPMENT_TEAM= PKGINFO_PATH= build 2>&1 | tail -30
 	rsync -a --delete "build/DerivedData/Build/Products/Debug/Snapcut.app/" "$(BUNDLE)/"
 	@echo "== $(BUNDLE) ready =="
 
-## 终端直跑二进制（stdout/stderr 直观日志）
+## 终端直跑（实时 stderr 日志）
 run: dev
 	$(BUNDLE)/Contents/MacOS/Snapcut
 

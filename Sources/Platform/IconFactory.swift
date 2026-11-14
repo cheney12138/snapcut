@@ -6,16 +6,40 @@ import CoreGraphics
 /// 图形语义：四角选区括号 + 中心圆点 = "框选截图"
 enum IconFactory {
     /// 菜单栏模板图标（黑色绘制 + isTemplate，系统自动适配深浅色）
+    ///
+    /// ⚠️ 不用 lockFocus：改用 NSBitmapImageRep 显式位图上下文，保证
+    /// NSStatusBarButton 渲染路径一定能拿到像素（lockFocus 产物偶发空表示）
     static func statusIcon(pointSize: CGFloat = 18) -> NSImage {
-        let image = NSImage(size: NSSize(width: pointSize, height: pointSize))
-        image.lockFocus()
+        let scale: Int = 2
+        let px = Int(pointSize) * scale
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: px,
+            pixelsHigh: px,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .calibratedRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return NSImage() }
+        rep.size = NSSize(width: pointSize, height: pointSize)
+
+        NSGraphicsContext.saveGraphicsState()
+        let ctx = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current = ctx
         drawCropMarks(
             in: NSRect(x: 0, y: 0, width: pointSize, height: pointSize),
             strokeColor: .black,
             dotColor: .black,
             strokeScale: 1.0
         )
-        image.unlockFocus()
+        ctx?.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = NSImage(size: NSSize(width: pointSize, height: pointSize))
+        image.addRepresentation(rep)
         image.isTemplate = true
         return image
     }
