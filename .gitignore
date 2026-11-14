@@ -5,3 +5,4 @@ Snapcut.xcodeproj
 *.xcodeproj
 .DS_Store
 .swiftpm
+key.pem
