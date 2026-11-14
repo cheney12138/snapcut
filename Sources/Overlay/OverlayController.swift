@@ -111,6 +111,8 @@ final class OverlayController {
             NSApp.yieldActivation(to: prev)
             Log.event(.app, "focus.restored", ["to": prev.bundleIdentifier ?? "?"])
         } else {
+            // selftest 直跑（previousApp=自己）等边缘情况：无条件退出激活，
+            // 保证结束后键盘焦点不悬空
             NSApp.deactivate()
             Log.event(.app, "focus.deactivated")
         }
