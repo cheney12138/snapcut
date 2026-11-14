@@ -1020,10 +1020,8 @@ final class OverlayView: NSView {
         // 4.5 手柄（选区足够大时）：8 个白色方块，悬停的加粗
         drawSelectionHandles(ctx: ctx)
 
-        // 5. 文字提示（无标注时）
-        if session.store.annotations.isEmpty && pendingAnnotation == nil && textField == nil {
-            drawHintText("Snapcut · 框选完成，可直接标注 · 1-6 切工具 · H 藏工具栏 · Enter 复制 · Esc 取消")
-        }
+        // 5. 提示条已移除（病例：长条提示与工具栏重叠、压住按钮，原型 scene 03 也没有它；
+        //    快捷键教学放设置面板与首次引导，不占编辑画布）
     }
 
     /// 窗口名角标（白底深字胶囊，贴窗口左上角内侧）

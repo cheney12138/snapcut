@@ -14,10 +14,16 @@ final class StatusItemController: NSObject {
 
     func setup(coordinator: AppCoordinator) {
         self.coordinator = coordinator
+        // ⚠️ 不能用 variableLength：实测按钮占 38pt，菜单栏一挤就被系统隐藏
+        // （病例：图标"消失"，butt.frame 落在时钟区 x=1690 即被挤出可见区）
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.autosaveName = "SnapcutStatusItem"
+        item.behavior = [.removalAllowed]
         if let button = item.button {
             button.image = IconFactory.statusIcon() // 品牌 mark 剪影（StatusMark.png 模板）
             button.imageScaling = .scaleProportionallyDown
+            button.imagePosition = .imageOnly
+            button.title = ""
             // 手动弹菜单：展开前重建历史子菜单（NSMenuDelegate 在 Swift 6 下跨隔离域
             // 传递 NSMenu 会触发并发检查，改用显式 popUpMenu）
             button.target = self
@@ -27,7 +33,35 @@ final class StatusItemController: NSObject {
         // 少了这行 rootMenu/historyMenu 全为 nil（病例：托盘点击无反应、历史菜单空）
         _ = buildMenu()
         statusItem = item
-        Log.event(.tray, "tray.icon.created", ["src": "mark-silhouette"])
+        // 诊断：按钮在屏幕上的实际位置（验证图标是否真的上屏、是否被挤出菜单栏）
+        // ⚠️ 病例：菜单栏拥挤时，早期创建的 status item 会被系统判为「放不下」
+        // 而整体隐藏（button.frame 落到时钟区 x≈1690 且不可见）。
+        // 补救：启动后重新断言可见性并重置图标，让系统重新布局一次。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            item.isVisible = true
+            if let button = item.button {
+                button.image = IconFactory.statusIcon()
+                button.imageScaling = .scaleProportionallyDown
+                button.needsDisplay = true
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
+            if let frame = item.button?.window?.frame {
+                Log.event(.tray, "tray.button.frame", [
+                    "x": "\(Int(frame.minX))", "y": "\(Int(frame.minY))",
+                    "w": "\(Int(frame.width))", "h": "\(Int(frame.height))",
+                    "onScreen": "\(NSScreen.screens.contains { $0.frame.intersects(frame) })",
+                ])
+            } else {
+                Log.error(.tray, "tray.button.noframe")
+            }
+        }
+        Log.event(.tray, "tray.icon.created", [
+            "src": "mark-silhouette",
+            "img": item.button?.image.map { "\(Int($0.size.width))x\(Int($0.size.height))" } ?? "nil",
+            "visible": "\(item.button?.isHidden == false)",
+            "length": "\(item.length)",
+        ])
     }
 
     private func buildMenu() -> NSMenu {
