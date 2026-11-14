@@ -47,6 +47,40 @@ final class AppCoordinator {
         scheduleSelfTestIfRequested()
         tray.setup(coordinator: self)
         registerCaptureHotkeys()
+        presentOnboardingIfNeeded()
+    }
+
+    // MARK: - 首次运行引导（权限前置）
+
+    private var onboardingWindow: OnboardingWindow?
+    private static let onboardingKey = "onboarding.completed"
+
+    /// 首启或权限缺失时展示引导卡：把「授权」放在用户第一次想截图之前
+    private func presentOnboardingIfNeeded() {
+        let granted = deps.permission.isGranted()
+        let completed = UserDefaults.standard.bool(forKey: Self.onboardingKey)
+        guard !granted || !completed else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self else { return }
+            var created: OnboardingWindow?
+            created = OnboardingWindow(
+                permissionGranted: granted,
+                onPermissionTap: { [weak self] in
+                    self?.deps.permission.request()
+                    Log.event(.app, "onboarding.permissionTap")
+                },
+                onFinish: { [weak self] in
+                    UserDefaults.standard.set(true, forKey: Self.onboardingKey)
+                    created?.orderOut(nil)
+                    self?.onboardingWindow = nil
+                    Log.event(.app, "onboarding.finish", ["granted": "\(self?.deps.permission.isGranted() ?? false)"])
+                }
+            )
+            guard let window = created else { return }
+            self.onboardingWindow = window
+            window.showCentered(on: NSScreen.main ?? NSScreen.screens[0])
+            Log.event(.app, "onboarding.show", ["granted": "\(granted)", "completed": "\(completed)"])
+        }
     }
 
     /// 按用户设置注册两个截图热键（解析失败回落默认 ⌘⇧A / ⌘⇧S）
