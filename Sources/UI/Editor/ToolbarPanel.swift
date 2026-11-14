@@ -16,7 +16,7 @@ final class ToolbarPanel: NSPanel {
     private var onAction: (Action) -> Void = { _ in }
 
     enum Action {
-        case undo, redo, toggleVisibility, done, save, cancel
+        case undo, redo, toggleVisibility, done, save, cancel, ocr, pin
     }
 
     private var toolButtons: [EditorSession.Tool: ToolButton] = [:]
@@ -144,6 +144,18 @@ final class ToolbarPanel: NSPanel {
         hide.action = #selector(actionTapped(_:))
         stack.addArrangedSubview(hide)
 
+        let ocr = ActionButton(title: "取字 O", tooltip: "识别图中文字（Vision 本地）")
+        ocr.tag = 204
+        ocr.target = self
+        ocr.action = #selector(actionTapped(_:))
+        stack.addArrangedSubview(ocr)
+
+        let pin = ActionButton(title: "贴图 P", tooltip: "把截图钉在屏幕上")
+        pin.tag = 205
+        pin.target = self
+        pin.action = #selector(actionTapped(_:))
+        stack.addArrangedSubview(pin)
+
         let done = ActionButton(title: "复制 ↩", tooltip: "复制并完成", prominent: true)
         done.tag = 201
         done.target = self
@@ -248,6 +260,8 @@ final class ToolbarPanel: NSPanel {
         case 201: onAction(.done)
         case 202: onAction(.save)
         case 203: onAction(.cancel)
+        case 204: onAction(.ocr)
+        case 205: onAction(.pin)
         default: break
         }
     }

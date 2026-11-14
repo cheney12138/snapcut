@@ -20,6 +20,10 @@ final class AppCoordinator {
         }
     }
 
+    /// 合成根：唯一构造适配器的地方（六边形架构的 composition root）
+    let deps: Dependencies = {
+        MainActor.assumeIsolated { Dependencies.live() }
+    }()
     private let tray = StatusItemController()
     private let hotkeyCenter = CarbonHotKeyCenter.shared
     private let exporter = ExportCoordinator()
@@ -27,6 +31,7 @@ final class AppCoordinator {
 
     func start() {
         AppCoordinatorShared.coordinator = self
+        AppCoordinatorShared.deps = deps
         TCCPermission.preflight()
         scheduleSelfTestIfRequested()
         tray.setup(coordinator: self)

@@ -76,3 +76,42 @@ final class ScreenPermissionAdapter: ScreenPermissionChecking {
 // MARK: - 历史 / OCR / 贴图
 // 由各自模块提供（History / OCR / Pin），落地后在 AppCoordinator 的
 // Dependencies 合成里接线。
+
+// MARK: - 历史记录 / OCR / 贴图（并行模块产出的适配器）
+
+extension HistoryStore: HistoryRecording {}
+
+/// Vision OCR 适配器：领域只看到 `recognize(_:) async throws -> String`
+struct VisionTextRecognizerAdapter: TextRecognizing {
+    func recognize(_ image: CGImage) async throws -> String {
+        try await TextRecognizer.recognize(image)
+    }
+}
+
+/// 贴图适配器：领域不知道「贴图靠 NSWindow 实现」
+@MainActor
+final class PinPresenterAdapter: PinningPresenting {
+    func pin(_ image: CGImage, atGlobalRect rect: CGRect) {
+        let screen = NSScreen.screens.first { $0.frame.intersects(rect) } ?? NSScreen.main
+        guard let screen else { return }
+        PinWindowController.pin(image, atGlobalRect: rect, on: screen)
+    }
+}
+
+// MARK: - 合成根
+
+extension Dependencies {
+    /// 唯一允许 new 适配器的地方（AppCoordinator 启动时调用一次）
+    @MainActor
+    static func live() -> Dependencies {
+        Dependencies(
+            screen: ScreenCaptureAdapter(),
+            clipboard: PasteboardClipboard(),
+            history: HistoryStore.shared,
+            textRecognizer: VisionTextRecognizerAdapter(),
+            hotkeys: CarbonHotKeyCenter.shared,
+            permission: ScreenPermissionAdapter(),
+            pinning: PinPresenterAdapter()
+        )
+    }
+}

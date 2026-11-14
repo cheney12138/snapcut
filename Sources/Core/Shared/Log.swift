@@ -3,6 +3,7 @@ import os
 /// 日志分类（对齐 docs/03 §7.1）
 enum LogCategory: String {
     case app, capture, overlay, clipboard, hotkey, tray, permission, export, platform, editor, scroll
+    case history, ocr, pin
 }
 
 /// 统一日志门面：subsystem = app.snapcut，事件结构 evt=xxx key=value

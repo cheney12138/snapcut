@@ -731,6 +731,18 @@ final class OverlayView: NSView {
             } else {
                 super.keyDown(with: event)
             }
+        case kVK_ANSI_O:
+            if phase == .editing, !event.modifierFlags.contains(.command) {
+                controller.toolbarAction(.ocr)
+                return
+            }
+            super.keyDown(with: event)
+        case kVK_ANSI_P:
+            if phase == .editing, !event.modifierFlags.contains(.command) {
+                controller.toolbarAction(.pin)
+                return
+            }
+            super.keyDown(with: event)
         case kVK_ANSI_Z:
             if event.modifierFlags.contains(.command) {
                 if event.modifierFlags.contains(.shift) {

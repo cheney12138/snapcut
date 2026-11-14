@@ -333,7 +333,7 @@ final class OverlayController {
         return windows.first { $0.owningScreen == screen }
     }
 
-    private func toolbarAction(_ action: ToolbarPanel.Action) {
+    func toolbarAction(_ action: ToolbarPanel.Action) {
         guard let session = editorSession else { return }
         switch action {
         case .undo:
@@ -358,7 +358,44 @@ final class OverlayController {
             perform(action: .save)
         case .cancel:
             perform(action: .cancel)
+        case .ocr:
+            runOCR()
+        case .pin:
+            pinCurrentImage()
         }
+    }
+
+    // MARK: - OCR / 贴图（端口驱动）
+
+    /// 取字：识别当前合成图（含标注）→ 浮层展示
+    private func runOCR() {
+        guard let session = editorSession else { return }
+        let image = session.renderFinalImage()
+        let rect = session.selectionGlobal
+        let screen = session.screen
+        let recognizer = AppCoordinatorShared.deps?.textRecognizer
+        let clipboard = AppCoordinatorShared.deps?.clipboard
+        let history = AppCoordinatorShared.deps?.history
+        history?.record(image)
+        Log.event(.ocr, "ocr.start", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
+        Task { @MainActor in
+            guard let recognizer else { return }
+            let text = (try? await recognizer.recognize(image)) ?? ""
+            clipboard.map { _ in () }
+            OCRResultPanel.present(text: text, nearGlobalRect: rect, on: screen)
+            Log.event(.ocr, "ocr.present", ["chars": "\(text.count)"])
+        }
+    }
+
+    /// 贴图：把当前合成图钉在屏幕上
+    private func pinCurrentImage() {
+        guard let session = editorSession else { return }
+        let image = session.renderFinalImage()
+        let rect = session.selectionGlobal
+        AppCoordinatorShared.deps?.history.record(image)
+        AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: rect)
+        Log.event(.pin, "pin.wire", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
+        perform(action: .cancel)   // 贴图后结束截图会话（图像已经在屏幕上）
     }
 
     /// 工具栏可见性切换（快捷键 H 走这里）
@@ -569,6 +606,7 @@ final class OverlayController {
                 "pxW": "\(finalImage.width)",
                 "pxH": "\(finalImage.height)",
             ])
+            AppCoordinatorShared.deps?.history.record(finalImage)   // 任何导出都写历史
             let completion = self.completion
             end()
             self.completion = nil
@@ -585,6 +623,8 @@ final class OverlayController {
 @MainActor
 enum AppCoordinatorShared {
     static weak var coordinator: AppCoordinator?
+    /// 合成根注入的依赖（端口集合）；只有 AppCoordinator 写，其余只读
+    @MainActor static var deps: Dependencies?
     static func didEnterConfirm() {
         coordinator?.didEnterConfirm()
     }
