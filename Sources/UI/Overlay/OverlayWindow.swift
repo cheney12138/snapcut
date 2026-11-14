@@ -321,10 +321,21 @@ final class OverlayView: NSView {
         switch phase {
         case .dragging(let start):
             let point = convert(event.locationInWindow, from: nil)
-            let clamped = CGPoint(
+            var clamped = CGPoint(
                 x: min(max(point.x, 0), bounds.width),
                 y: min(max(point.y, 0), bounds.height)
             )
+            // Shift：锁 1:1（以按下点为锚，取较短边，方向跟随鼠标）
+            if event.modifierFlags.contains(.shift) {
+                let dx = clamped.x - start.x
+                let dy = clamped.y - start.y
+                let side = min(abs(dx), abs(dy))
+                clamped = CGPoint(
+                    x: start.x + (dx < 0 ? -side : side),
+                    y: start.y + (dy < 0 ? -side : side)
+                )
+            }
+            cursorLocal = clamped
             selectionLocal = CGRect(
                 x: min(start.x, clamped.x),
                 y: min(start.y, clamped.y),
@@ -570,6 +581,19 @@ final class OverlayView: NSView {
         reclaimKeyboard()
     }
 
+    /// 取色：采样冻结帧光标处像素 → 写剪贴板（hex）→ 结束会话
+    private func copyColorUnderCursor() {
+        guard let sampler = frozenSampler,
+              let frozen = frozenImage else { return }
+        let px = Int(cursorLocal.x / bounds.width * CGFloat(frozen.width))
+        let py = Int(cursorLocal.y / bounds.height * CGFloat(frozen.height))
+        let hex = sampler.hex(x: px, y: py)
+        guard hex.hasPrefix("#"), hex.count == 7 else { return }
+        AppCoordinatorShared.deps?.clipboard.writeText(hex)
+        Log.event(.overlay, "overlay.copyColor", ["hex": hex, "x": "\(px)", "y": "\(py)"])
+        controller.perform(action: .cancel)
+    }
+
     /// 键盘微调选区（编辑态方向键）
     private func nudgeSelection(dx: CGFloat, dy: CGFloat) {
         let newLocal = SelectionGeometry.nudged(editorRectLocal, dx: dx, dy: dy, limit: bounds)
@@ -694,6 +718,18 @@ final class OverlayView: NSView {
     override func keyDown(with event: NSEvent) {
         Log.logger(.overlay).debug("evt=overlay.keyDown key=\(event.keyCode, privacy: .public) phase=\(self.phaseLabel, privacy: .public)")
         // 文字输入态：普通键给输入框（first responder 已是 field，事件不会到这）
+        // C：选区阶段复制光标处像素颜色（取色器语义），随后结束会话
+        let inSelectionPhase: Bool = {
+            switch phase {
+            case .waitingForDrag, .dragging: return true
+            default: return false
+            }
+        }()
+        if Int(event.keyCode) == kVK_ANSI_C, inSelectionPhase,
+           !event.modifierFlags.contains(.command) {
+            copyColorUnderCursor()
+            return
+        }
         // 空格：编辑态临时切「整体移动」（按下期间有效）
         if Int(event.keyCode) == kVK_Space {
             if phase == .editing { spacePressed = true }
