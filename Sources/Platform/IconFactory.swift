@@ -5,11 +5,19 @@ import CoreGraphics
 ///
 /// 图形语义：四角选区括号 + 中心圆点 = "框选截图"
 enum IconFactory {
-    /// 菜单栏模板图标（黑色绘制 + isTemplate，系统自动适配深浅色）
+    /// 菜单栏模板图标（从品牌 mark 剪影资源加载；黑色 + isTemplate，
+    /// 系统自动适配浅色/深色/强调色菜单栏）
     ///
-    /// ⚠️ 不用 lockFocus：改用 NSBitmapImageRep 显式位图上下文，保证
-    /// NSStatusBarButton 渲染路径一定能拿到像素（lockFocus 产物偶发空表示）
+    /// 资源来源：GPT 生成的品牌 logo（蓝底白 mark）→ 阈值提取白色 mark
+    /// 剪影 → 64px PNG（Resources/StatusMark.png）。
+    /// 旧版代码绘制四角括号已废弃——品牌统一走 logo mark。
     static func statusIcon(pointSize: CGFloat = 18) -> NSImage {
+        if let url = Bundle.main.url(forResource: "StatusMark", withExtension: "png"),
+           let loaded = NSImage(contentsOf: url) {
+            loaded.isTemplate = true
+            return loaded
+        }
+        // 兜底：资源缺失时回退代码绘制（等比缩放保证任意 pointSize 可用）
         let scale: Int = 2
         let px = Int(pointSize) * scale
         guard let rep = NSBitmapImageRep(

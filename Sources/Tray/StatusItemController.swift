@@ -10,12 +10,12 @@ final class StatusItemController {
         self.coordinator = coordinator
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            button.image = IconFactory.statusIcon() // 代码绘制（CGPath 括号+圆点），模板渲染
+            button.image = IconFactory.statusIcon() // 品牌 mark 剪影（StatusMark.png 模板）
             button.imageScaling = .scaleProportionallyDown
         }
         item.menu = buildMenu()
         statusItem = item
-        Log.event(.tray, "tray.icon.created", ["src": "code-drawn"])
+        Log.event(.tray, "tray.icon.created", ["src": "mark-silhouette"])
     }
 
     private func buildMenu() -> NSMenu {
