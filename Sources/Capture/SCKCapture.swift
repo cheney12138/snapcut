@@ -2,7 +2,7 @@ import AppKit
 import CoreGraphics
 import ScreenCaptureKit
 
-enum CaptureError: LocalizedError {
+enum CaptureError: LocalizedError, Equatable {
     case displayNotFound
     case noScreen
     case cropFailed

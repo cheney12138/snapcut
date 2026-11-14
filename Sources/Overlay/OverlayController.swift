@@ -98,6 +98,10 @@ final class OverlayController {
                     case .save: completion?(.save(image))
                     case .cancel: break
                     }
+                } catch let error as CaptureError where error == .denied {
+                    // 截图被拒：拉起系统设置 + 贴身拖拽源浮窗引导授权
+                    TCCPermission.openSystemSettings()
+                    completion?(.cancelled)
                 } catch {
                     completion?(.cancelled)
                 }
