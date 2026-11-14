@@ -57,7 +57,9 @@ private final class OCRPanelController {
         )
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.level = .floating
+        // ⚠️ 必须与覆盖层同级（.screenSaver）：覆盖层占据 .screenSaver，
+        // .floating 的浮层会被压在它下面 ⇒ 用户完全看不到识别结果（实拍病例）
+        panel.level = .screenSaver
         panel.hasShadow = true
         panel.ignoresMouseEvents = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -132,7 +134,8 @@ private final class OCRPanelController {
 
     func present() {
         installKeyMonitor()
-        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+        panel.makeKey()
         if !isEmptyResult {
             panel.makeFirstResponder(textView)
             // 自动全选，方便直接 ⌘C

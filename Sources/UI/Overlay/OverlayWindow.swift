@@ -533,6 +533,20 @@ final class OverlayView: NSView {
         )
     }
 
+    /// 选区调整后夺回键盘路由（病例：拖手柄后 frontmost 变回终端 App，
+    /// 之后的 Enter/Esc/方向键全部落到别的 App，编辑器看起来"僵死"）
+    private func reclaimKeyboard() {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
+        controller.ensureActivation(reason: "selection.adjust")
+        Log.event(.editor, "editor.focus.reclaim", [
+            "active": "\(NSApp.isActive)",
+            "keyWin": "\(window?.isKeyWindow ?? false)",
+            "front": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?",
+        ])
+    }
+
     private func commitSelectionResize() {
         guard editorSession != nil, let screen = window?.screen else { return }
         let oldLocal = sessionLocalRect()
@@ -540,6 +554,7 @@ final class OverlayView: NSView {
         let offset = SelectionGeometry.annotationOffset(old: oldLocal, new: newLocal)
         let global = convertToGlobalRect(newLocal)
         controller.adjustSelection(to: global, on: screen, annotationOffset: offset)
+        reclaimKeyboard()
         Log.event(.overlay, "selection.resize.commit", [
             "ptW": "\(Int(newLocal.width))", "ptH": "\(Int(newLocal.height))",
         ])
@@ -552,6 +567,7 @@ final class OverlayView: NSView {
         let offset = SelectionGeometry.annotationOffset(old: oldLocal, new: newLocal)
         let global = convertToGlobalRect(newLocal)
         controller.adjustSelection(to: global, on: screen, annotationOffset: offset)
+        reclaimKeyboard()
     }
 
     /// 键盘微调选区（编辑态方向键）
