@@ -583,7 +583,7 @@ final class OverlayView: NSView {
         ctx.draw(session.baseImage, in: editorRectLocal)
         // 3. 标注层（同一渲染器 = 导出所见）
         let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
-        CGRenderer.render(annotations: annotations, in: editorRectLocal.size, context: ctx)
+        CGRenderer.render(annotations: annotations, in: editorRectLocal.size, context: ctx, contextIsYDown: true)
         ctx.restoreGState()
 
         // 4. 选区描边（编辑态的画布边界）
@@ -593,7 +593,7 @@ final class OverlayView: NSView {
 
         // 5. 文字提示（无标注时）
         if session.store.annotations.isEmpty && pendingAnnotation == nil && textField == nil {
-            drawHintText("工具栏选工具，热键 1-6 直选 · H 隐藏工具栏 · Enter 复制 · Esc 取消")
+            drawHintText("Snapcut · 框选完成，可直接标注 · 1-6 切工具 · H 藏工具栏 · Enter 复制 · Esc 取消")
         }
     }
 

@@ -7,10 +7,15 @@ import CoreGraphics
 /// 导出时同一函数按最终尺寸重绘。"编辑器所见 = 导出所得"由此保证。
 /// 所有几何输入为选区本地 point 坐标（原点左上、Y 向下）。
 enum CGRenderer {
-    /// 把标注层画到已锁定的 CGContext（调用方负责底图与上下文状态）
-    static func render(annotations: [AnnotationModel], in size: CGSize, context: CGContext) {
+    /// 把标注层画到 CGContext（调用方负责底图与上下文状态）
+    ///
+    /// - Parameter contextIsYDown: 上下文是否已是 Y 向下（AppKit isFlipped 视图的
+    /// cgContext 即 Y-down；导出 composite 的上下文是 Y-up + 已翻转标注层坐标系）。
+    /// 文字绘制需要局部翻转，两种上下文的翻转次数不同（病例：编辑器画布上
+    /// 文字倒置——Y-down 上下文里又翻了一次）
+    static func render(annotations: [AnnotationModel], in size: CGSize, context: CGContext, contextIsYDown: Bool = false) {
         for annotation in annotations {
-            draw(annotation, in: size, context: context)
+            draw(annotation, in: size, context: context, yDown: contextIsYDown)
         }
     }
 
@@ -43,7 +48,7 @@ enum CGRenderer {
 
     // MARK: - 单个标注绘制
 
-    private static func draw(_ a: AnnotationModel, in size: CGSize, context: CGContext) {
+    private static func draw(_ a: AnnotationModel, in size: CGSize, context: CGContext, yDown: Bool) {
         let color = a.color
         let width = CGFloat(a.strokeWidth + 1)  // 1→2pt 2→3pt 3→4pt（功能先行，手感后调）
         context.saveGState()
@@ -59,7 +64,7 @@ enum CGRenderer {
             context.stroke(normalized(r))
 
         case .text(let anchor):
-            drawText(a.text ?? "", at: anchor, color: color, size: 14, context: context)
+            drawText(a.text ?? "", at: anchor, color: color, size: 14, context: context, yDown: yDown)
 
         case .mosaic(let r):
             // 马赛克不用笔色；实际像素化在 composite 阶段对底图做（这里只画提示框）
@@ -67,7 +72,7 @@ enum CGRenderer {
             context.fill(normalized(r))
 
         case .sequence(let anchor):
-            drawText("\(a.index ?? 1)", at: anchor, color: color, size: 16, badge: true, context: context)
+            drawText("\(a.index ?? 1)", at: anchor, color: color, size: 16, badge: true, context: context, yDown: yDown)
 
         case .highlight(let from, let to):
             context.setStrokeColor(color.withAlphaComponent(0.4).cgColor)
@@ -120,7 +125,7 @@ enum CGRenderer {
     }
 
     /// 文字（text/sequence 共用；sequence 画成实心圆徽章）
-    private static func drawText(_ text: String, at anchor: CGPoint, color: NSColor, size: CGFloat, badge: Bool = false, context: CGContext) {
+    private static func drawText(_ text: String, at anchor: CGPoint, color: NSColor, size: CGFloat, badge: Bool = false, context: CGContext, yDown: Bool) {
         guard !text.isEmpty else { return }
         let font = NSFont.systemFont(ofSize: size, weight: badge ? .semibold : .medium)
         let attributed = NSAttributedString(string: text, attributes: [
@@ -141,10 +146,13 @@ enum CGRenderer {
             ))
             origin = CGPoint(x: anchor.x - lineBounds.width / 2, y: anchor.y - lineBounds.height / 2)
         }
-        // Y 翻转：CG 上下文当前是 Y 向下坐标系（render 入口统一翻转过）
+        // 文字局部翻转：只有 Y-up（导出路径，render 入口已统一翻转到 Y-down）
+        // 需要再翻一次；编辑器画布（isFlipped）本来就是 Y-down，再翻就倒置
         context.saveGState()
         context.translateBy(x: origin.x, y: origin.y + lineBounds.height)
-        context.scaleBy(x: 1, y: -1)
+        if !yDown {
+            context.scaleBy(x: 1, y: -1)
+        }
         CTLineDraw(line, context)
         context.restoreGState()
     }
