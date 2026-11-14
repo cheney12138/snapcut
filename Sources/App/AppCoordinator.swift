@@ -86,6 +86,10 @@ final class AppCoordinator {
                     self.exporter.savePanel(image)
                 } else {
                     self.exporter.copyToClipboard(image)
+                    // 复制反馈（设置可关）：右下角 toast，不抢焦点
+                    if self.settings.showCopyNotification {
+                        CaptureToast.show(image: image)
+                    }
                 }
             case .save(let image):
                 self.state = .exporting
