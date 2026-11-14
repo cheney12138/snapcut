@@ -199,7 +199,7 @@ final class OverlayController {
     // MARK: - 拖选完成（OverlayView 回调）
 
     /// 松手确认：冻结底图并进入编辑态
-    func didSelect(rect: CGRect, on screen: NSScreen) {
+    func didSelect(rect: CGRect, on screen: NSScreen, windowID: CGWindowID? = nil) {
         selectionScreen = screen
         selectionRectGlobal = rect
         let px = CoordinateConverter.pixelRect(selection: rect, onScreen: screen)
@@ -210,8 +210,26 @@ final class OverlayController {
         ])
         AppCoordinatorShared.didEnterConfirm()
 
-        // ⚡ 底图来源：优先用会话开始时冻结的整屏帧**本地裁剪**（零延迟，
-        // 且保证用户看到的内容 = 截到的内容）；缺失时回退实时屏捕
+        // 窗口截图：走 SCK 单窗口滤镜（拿窗口自身内容，被遮挡也正确）
+        // ⚡ 其余走冻结帧本地裁剪（零延迟，所见=所得）
+        if let windowID {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let base = try await SCKCapture.shared.captureWindow(windowID: windowID)
+                    self.enterEditor(base: base, selection: rect, screen: screen)
+                } catch {
+                    Log.error(.capture, "capture.window.fail", ["err": "\(error.localizedDescription)"])
+                    // 回退：冻结帧本地裁剪（窗口被遮挡时会截到遮挡物，但至少有结果）
+                    if let frozen = self.cropFrozenImage(selection: rect, screen: screen) {
+                        self.enterEditor(base: frozen, selection: rect, screen: screen)
+                    } else {
+                        TCCPermission.openSystemSettings()
+                    }
+                }
+            }
+            return
+        }
         if let frozen = cropFrozenImage(selection: rect, screen: screen) {
             Log.event(.overlay, "overlay.commit.frozen", [
                 "pxW": "\(frozen.width)", "pxH": "\(frozen.height)",

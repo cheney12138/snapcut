@@ -7,6 +7,7 @@ enum CaptureError: LocalizedError, Equatable {
     case noScreen
     case cropFailed
     case denied
+    case windowNotFound
 
     var errorDescription: String? {
         switch self {
@@ -14,6 +15,7 @@ enum CaptureError: LocalizedError, Equatable {
         case .noScreen: return "无法解析目标 NSScreen"
         case .cropFailed: return "选区裁剪失败（坐标越界？）"
         case .denied: return "屏幕录制权限被拒绝"
+        case .windowNotFound: return "SCShareableContent 中找不到目标窗口"
         }
     }
 }
@@ -46,6 +48,33 @@ actor SCKCapture {
         config.showsCursor = false
         config.scalesToFit = false
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        return image
+    }
+
+    /// 单窗口捕获（SCK 桌面独立窗口滤镜）
+    ///
+    /// 为什么要单窗口而不是「整屏裁剪」：整屏裁剪只能拿到**当前可见像素**，
+    /// 窗口被别的窗口遮住时会截到遮挡物（病例）。SCK 的 desktopIndependentWindow
+    /// 滤镜拿到的是该窗口自己的内容，且 ignoreShadows 去掉系统阴影/圆角外残留。
+    func captureWindow(windowID: CGWindowID) async throws -> CGImage {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+            throw CaptureError.windowNotFound
+        }
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let config = SCStreamConfiguration()
+        // 忽略阴影后内容尺寸 = 窗口 frame；按屏幕实测缩放比放大到物理像素
+        let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+        config.width = max(1, Int(window.frame.width * scale))
+        config.height = max(1, Int(window.frame.height * scale))
+        config.showsCursor = false
+        config.captureResolution = .best
+        config.ignoreShadowsSingleWindow = true
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+        Log.event(.capture, "capture.window.ok", [
+            "pxW": "\(image.width)", "pxH": "\(image.height)",
+            "windowId": "\(windowID)",
+        ])
         return image
     }
 }

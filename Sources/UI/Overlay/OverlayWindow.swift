@@ -415,7 +415,7 @@ final class OverlayView: NSView {
             "title": target.title,
             "size": "\(Int(target.rectGlobal.width))x\(Int(target.rectGlobal.height))",
         ])
-        controller.didSelect(rect: target.rectGlobal, on: screen)
+        controller.didSelect(rect: target.rectGlobal, on: screen, windowID: target.windowID)
     }
 
     private func pickFullDisplay() {
