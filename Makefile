@@ -8,11 +8,15 @@ LOCAL_SIGN_ID := 38E79C988C72B625EFCC85754C65E1F0ED62D0D7
 .PHONY: gen dev run tail clean
 
 ## 生成 Xcode 工程（project.yml -> Snapcut.xcodeproj，工程不入 git）
+# 六边形架构守卫（依赖方向只能向内；破坏即失败，防止 Core 被 AppKit 污染）
+check-arch:
+	@./scripts/check-architecture.sh
+
 gen:
 	xcodegen generate
 
 ## Debug 构建（固定开发证书签名，产物拷贝到 build/Snapcut.app）
-dev: gen
+dev: gen check-arch
 	# ⚠️ 不删重 bundle（rm -rf 换 inode + 重签名反复注册会把 LS 的 bundle ID
 	# 记录搞脏 → 状态栏图标消失，换过两次 ID 的病例）；原地 rsync 更新
 	xcodebuild -project Snapcut.xcodeproj -scheme Snapcut -configuration Debug \

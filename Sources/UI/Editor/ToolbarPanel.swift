@@ -102,7 +102,7 @@ final class ToolbarPanel: NSPanel {
 
         // 五色（原型：圆点 + 选中白描边）
         for (i, color) in AnnotationModel.palette.enumerated() {
-            let button = ColorButton(color: color)
+            let button = ColorButton(color: NSColor(cgColor: color.cgColor) ?? .red)
             button.tag = i
             button.target = self
             button.action = #selector(colorTapped(_:))

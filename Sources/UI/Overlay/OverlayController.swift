@@ -230,6 +230,33 @@ final class OverlayController {
         }
     }
 
+    // MARK: - 选区调整（编辑态拖手柄 / 方向键）
+
+    /// 选区变更：尺寸变了就按新选区从冻结帧重裁底图；纯移动只换全局坐标。
+    /// 标注按 `annotationOffset` 平移，保证它们"钉在屏幕原位置"。
+    func adjustSelection(to newGlobal: CGRect, on screen: NSScreen, annotationOffset: CGSize) {
+        guard let session = editorSession else { return }
+        let old = session.selectionGlobal
+        let sizeUnchanged = abs(newGlobal.width - old.width) < 0.5
+            && abs(newGlobal.height - old.height) < 0.5
+
+        var base = session.baseImage
+        if !sizeUnchanged {
+            guard let cropped = cropFrozenImage(selection: newGlobal, screen: screen) else {
+                Log.error(.overlay, "selection.adjust.noFrozen")
+                return
+            }
+            base = cropped
+        }
+        session.applySelectionChange(
+            newSelection: newGlobal, newBase: base, annotationOffset: annotationOffset
+        )
+        selectionRectGlobal = newGlobal
+        // 编辑画布跟随新选区（视图侧自己算过一次，这里以 controller 为准再同步）
+        editorWindow()?.contentView?.needsDisplay = true
+        toolbar?.place(below: newGlobal)
+    }
+
     // MARK: - 编辑态
 
     private func enterEditor(base: CGImage, selection: CGRect, screen: NSScreen) {

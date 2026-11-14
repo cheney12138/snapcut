@@ -93,6 +93,22 @@ final class OverlayView: NSView {
     /// 冻结帧（会话开始时的整屏静态画面；有它就不再实时看桌面）
     private var frozenImage: CGImage?
 
+    /// 编辑态手势（改选区尺寸 / 整体移动）
+    private enum EditGesture {
+        case none
+        case resize(edge: SelectionEdge, startRect: CGRect)
+        case move(startRect: CGRect, startPoint: CGPoint)
+    }
+    private var editGesture: EditGesture = .none
+    /// 空格按下（临时切「整体移动」）
+    private var spacePressed = false
+    /// 悬停中的手柄（绘制手柄高亮 + 光标反馈）
+    private var hoverEdge: SelectionEdge?
+    /// 放大镜采样器（安装冻结帧时构建一次）
+    private var frozenSampler: FrozenSampler?
+    /// 光标本地坐标（放大镜跟随；Y 向下）
+    private var cursorLocal: CGPoint = .zero
+
     /// 悬停命中的窗口（窗口截图预览 + 单击整窗）
     private var hovered: HoveredWindow?
     private var hoveredLocalRect: CGRect?
@@ -166,6 +182,8 @@ final class OverlayView: NSView {
     /// 安装冻结帧并重绘（"屏幕定住"效果的唯一来源）
     func installFrozenImage(_ image: CGImage) {
         frozenImage = image
+        // 放大镜/取色用：一次性解像素，之后 O(1) 采样（禁止实时屏捕）
+        frozenSampler = FrozenSampler(image: image)
         needsDisplay = true
     }
 
@@ -186,8 +204,40 @@ final class OverlayView: NSView {
 
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
-        guard phase == .waitingForDrag, !scrollMode else { return }
-        updateHover(at: convert(event.locationInWindow, from: nil))
+        let local = convert(event.locationInWindow, from: nil)
+        cursorLocal = local
+        if scrollMode { return }
+        switch phase {
+        case .waitingForDrag:
+            updateHover(at: local)
+            needsDisplay = true      // 放大镜跟随
+        case .editing:
+            updateHoverEdge(at: local)
+        default:
+            break
+        }
+    }
+
+    /// 编辑态：光标是否压在手柄上（决定光标形状 + 手柄高亮）
+    private func updateHoverEdge(at local: CGPoint) {
+        let rect = editorRectLocal
+        let edge: SelectionEdge? = (rect.width >= SelectionGeometry.handleVisibilityThreshold
+            || rect.height >= SelectionGeometry.handleVisibilityThreshold)
+            ? SelectionGeometry.edge(atLocal: local, in: rect)
+            : nil
+        guard edge != hoverEdge else { return }
+        hoverEdge = edge
+        if let edge {
+            switch edge {
+            case .left, .right: NSCursor.resizeLeftRight.set()
+            case .top, .bottom: NSCursor.resizeUpDown.set()
+            case .topLeft, .bottomRight: NSCursor.crosshair.set()
+            case .topRight, .bottomLeft: NSCursor.crosshair.set()
+            }
+        } else {
+            NSCursor.crosshair.set()
+        }
+        needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -381,7 +431,21 @@ final class OverlayView: NSView {
 
     private func handleEditorMouseDown(_ point: CGPoint, event: NSEvent) {
         guard let session = editorSession else { return }
-        // 点击在选区外：忽略（R7：移出选区不生效）
+
+        // 1) 手柄优先：拖手柄改选区（Snow Shot 同款「快速选区修改」）
+        if let edge = SelectionGeometry.edge(atLocal: point, in: editorRectLocal) {
+            editGesture = .resize(edge: edge, startRect: editorRectLocal)
+            Log.event(.overlay, "selection.resize.begin", ["edge": "\(edge)"])
+            return
+        }
+
+        // 2) 空格 + 选区内拖拽 = 整体移动
+        if spacePressed && editorRectLocal.contains(point) {
+            editGesture = .move(startRect: editorRectLocal, startPoint: point)
+            return
+        }
+
+        // 3) 常规标注：点击在选区外忽略（R7：移出选区不生效）
         guard editorRectLocal.contains(point) else { return }
 
         switch session.currentTool {
@@ -420,6 +484,22 @@ final class OverlayView: NSView {
     }
 
     private func handleEditorDragged(_ point: CGPoint) {
+        switch editGesture {
+        case .resize(let edge, let startRect):
+            editorRectLocal = SelectionGeometry.resized(
+                startRect, edge: edge, to: point, limit: bounds
+            )
+            needsDisplay = true
+            return
+        case .move(let startRect, let startPoint):
+            let delta = CGSize(width: point.x - startPoint.x, height: point.y - startPoint.y)
+            editorRectLocal = SelectionGeometry.moved(startRect, by: delta, limit: bounds)
+            needsDisplay = true
+            return
+        case .none:
+            break
+        }
+
         guard var pending = pendingAnnotation else { return }
         let a = localToAnnotation(point)
         switch pending.shape {
@@ -440,6 +520,49 @@ final class OverlayView: NSView {
 
     private var pendingStartPoint: CGPoint?
 
+    // MARK: - 选区调整提交
+
+    /// 当前选区在会话里的本地坐标（Y 向下），用于算标注平移量
+    private func sessionLocalRect() -> CGRect {
+        guard let session = editorSession, let frame = window?.frame else { return .zero }
+        let g = session.selectionGlobal
+        return CGRect(
+            x: g.minX - frame.minX,
+            y: frame.maxY - g.maxY,
+            width: g.width, height: g.height
+        )
+    }
+
+    private func commitSelectionResize() {
+        guard editorSession != nil, let screen = window?.screen else { return }
+        let oldLocal = sessionLocalRect()
+        let newLocal = editorRectLocal
+        let offset = SelectionGeometry.annotationOffset(old: oldLocal, new: newLocal)
+        let global = convertToGlobalRect(newLocal)
+        controller.adjustSelection(to: global, on: screen, annotationOffset: offset)
+        Log.event(.overlay, "selection.resize.commit", [
+            "ptW": "\(Int(newLocal.width))", "ptH": "\(Int(newLocal.height))",
+        ])
+    }
+
+    private func commitSelectionMove() {
+        guard editorSession != nil, let screen = window?.screen else { return }
+        let oldLocal = sessionLocalRect()
+        let newLocal = editorRectLocal
+        let offset = SelectionGeometry.annotationOffset(old: oldLocal, new: newLocal)
+        let global = convertToGlobalRect(newLocal)
+        controller.adjustSelection(to: global, on: screen, annotationOffset: offset)
+    }
+
+    /// 键盘微调选区（编辑态方向键）
+    private func nudgeSelection(dx: CGFloat, dy: CGFloat) {
+        let newLocal = SelectionGeometry.nudged(editorRectLocal, dx: dx, dy: dy, limit: bounds)
+        guard newLocal != editorRectLocal else { return }
+        editorRectLocal = newLocal
+        needsDisplay = true
+        commitSelectionMove()
+    }
+
     private var phaseLabel: String {
         if scrollMode { return "scroll" }
         switch phase {
@@ -451,6 +574,19 @@ final class OverlayView: NSView {
     }
 
     private func handleEditorMouseUp(_ point: CGPoint) {
+        // 选区调整提交：重裁底图 + 平移标注 + 工具栏跟随
+        if case .none = editGesture {} else {
+            if case .move = editGesture {
+                // 移动不改尺寸 → 不重裁，只更新全局选区
+                commitSelectionMove()
+            } else {
+                commitSelectionResize()
+            }
+            editGesture = .none
+            pendingAnnotation = nil
+            needsDisplay = true
+            return
+        }
         guard let pending = pendingAnnotation, let session = editorSession else { return }
         let a = localToAnnotation(point)
         var final = pending
@@ -493,7 +629,7 @@ final class OverlayView: NSView {
         ))
         field.font = .systemFont(ofSize: 14, weight: .medium)
         if let colorIndex = editorSession?.colorIndex, AnnotationModel.palette.indices.contains(colorIndex) {
-            field.textColor = AnnotationModel.palette[colorIndex]
+            field.textColor = NSColor(cgColor: AnnotationModel.palette[colorIndex].cgColor) ?? .red
         }
         field.placeholderString = "输入文字，Enter 确认"
         field.target = self
@@ -529,11 +665,36 @@ final class OverlayView: NSView {
         window?.makeFirstResponder(self)
     }
 
+    override func keyUp(with event: NSEvent) {
+        if Int(event.keyCode) == kVK_Space {
+            spacePressed = false
+            return
+        }
+        super.keyUp(with: event)
+    }
+
     // MARK: - 键盘
 
     override func keyDown(with event: NSEvent) {
         Log.logger(.overlay).debug("evt=overlay.keyDown key=\(event.keyCode, privacy: .public) phase=\(self.phaseLabel, privacy: .public)")
         // 文字输入态：普通键给输入框（first responder 已是 field，事件不会到这）
+        // 空格：编辑态临时切「整体移动」（按下期间有效）
+        if Int(event.keyCode) == kVK_Space {
+            if phase == .editing { spacePressed = true }
+            return
+        }
+        // 方向键：编辑态微调选区（Shift = 10pt）
+        if phase == .editing, [kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow].contains(Int(event.keyCode)) {
+            let step: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
+            switch Int(event.keyCode) {
+            case kVK_LeftArrow: nudgeSelection(dx: -step, dy: 0)
+            case kVK_RightArrow: nudgeSelection(dx: step, dy: 0)
+            case kVK_UpArrow: nudgeSelection(dx: 0, dy: -step)
+            case kVK_DownArrow: nudgeSelection(dx: 0, dy: step)
+            default: break
+            }
+            return
+        }
         switch Int(event.keyCode) {
         case kVK_Escape:
             if scrollMode {
@@ -662,6 +823,7 @@ final class OverlayView: NSView {
             drawEditor(ctx: ctx)
         default:
             drawSelection(ctx: ctx)
+            drawSelectionOverlays(ctx: ctx)
         }
     }
 
@@ -746,6 +908,11 @@ final class OverlayView: NSView {
         }
     }
 
+    /// 选区阶段收尾：放大镜（独立方法，draw() 里在蒙层/选框之后调用）
+    private func drawSelectionOverlays(ctx: CGContext) {
+        drawMagnifier(ctx: ctx)
+    }
+
     /// 编辑阶段：选区外蒙层 + 选区内冻结底图 + 标注层
     private func drawEditor(ctx: CGContext) {
         guard let session = editorSession else { return }
@@ -779,6 +946,9 @@ final class OverlayView: NSView {
         ctx.setLineWidth(1)
         ctx.stroke(editorRectLocal)
 
+        // 4.5 手柄（选区足够大时）：8 个白色方块，悬停的加粗
+        drawSelectionHandles(ctx: ctx)
+
         // 5. 文字提示（无标注时）
         if session.store.annotations.isEmpty && pendingAnnotation == nil && textField == nil {
             drawHintText("Snapcut · 框选完成，可直接标注 · 1-6 切工具 · H 藏工具栏 · Enter 复制 · Esc 取消")
@@ -809,6 +979,51 @@ final class OverlayView: NSView {
         ctx?.addPath(path)
         ctx?.fillPath()
         (shown as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 2), withAttributes: attributes)
+    }
+
+    /// 8 向手柄（四角 + 四边中点）
+    private func drawSelectionHandles(ctx: CGContext) {
+        let rect = editorRectLocal
+        guard rect.width >= SelectionGeometry.handleVisibilityThreshold
+                || rect.height >= SelectionGeometry.handleVisibilityThreshold else { return }
+        let size: CGFloat = 7
+        let points: [(CGPoint, SelectionEdge)] = [
+            (CGPoint(x: rect.minX, y: rect.minY), .topLeft),
+            (CGPoint(x: rect.midX, y: rect.minY), .top),
+            (CGPoint(x: rect.maxX, y: rect.minY), .topRight),
+            (CGPoint(x: rect.minX, y: rect.midY), .left),
+            (CGPoint(x: rect.maxX, y: rect.midY), .right),
+            (CGPoint(x: rect.minX, y: rect.maxY), .bottomLeft),
+            (CGPoint(x: rect.midX, y: rect.maxY), .bottom),
+            (CGPoint(x: rect.maxX, y: rect.maxY), .bottomRight),
+        ]
+        for (center, edge) in points {
+            let isHot = hoverEdge == edge
+            let s = isHot ? size + 3 : size
+            let box = CGRect(x: center.x - s / 2, y: center.y - s / 2, width: s, height: s)
+            ctx.setFillColor(NSColor.white.cgColor)
+            ctx.fill(box)
+            ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.45).cgColor)
+            ctx.setLineWidth(1)
+            ctx.stroke(box)
+        }
+    }
+
+    /// 放大镜（选区阶段；纯离线采样冻结帧，绝不实时屏捕）
+    private func drawMagnifier(ctx: CGContext) {
+        guard let sampler = frozenSampler,
+              let frozen = frozenImage,
+              let frame = window?.frame,
+              let screen = window?.screen else { return }
+        MagnifierPainter.draw(
+            sampler: sampler,
+            cursorLocal: cursorLocal,
+            bounds: bounds,
+            imageSize: CGSize(width: frozen.width, height: frozen.height),
+            screenPoints: screen.frame.size,
+            globalOrigin: CGPoint(x: frame.minX, y: screen.frame.maxY),
+            ctx: ctx
+        )
     }
 
     private func drawBadge(text: String, below rect: CGRect) {

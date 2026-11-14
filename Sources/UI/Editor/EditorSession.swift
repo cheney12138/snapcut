@@ -29,11 +29,23 @@ final class EditorSession {
         }
     }
 
-    /// 冻结底图（选区像素，scale 已含）
-    let baseImage: CGImage
-    let scale: CGFloat
-    let selectionGlobal: CGRect
+    /// 冻结底图（选区像素，scale 已含）。选区调整后会按新选区从冻结帧重裁
+    private(set) var baseImage: CGImage
+    private(set) var scale: CGFloat
+    private(set) var selectionGlobal: CGRect
     let screen: NSScreen
+
+    /// 选区调整（拖手柄 / 方向键）：换底图 + 平移既有标注，保证标注钉在图像上
+    func applySelectionChange(newSelection: CGRect, newBase: CGImage, annotationOffset: CGSize) {
+        store.offsetAll(dx: annotationOffset.width, dy: annotationOffset.height)
+        baseImage = newBase
+        selectionGlobal = newSelection
+        scale = CGFloat(newBase.width) / max(1, newSelection.width)
+        Log.event(.editor, "editor.selection.change", [
+            "pxW": "\(newBase.width)", "pxH": "\(newBase.height)",
+            "ptW": "\(Int(newSelection.width))", "ptH": "\(Int(newSelection.height))",
+        ])
+    }
 
     let store = AnnotationStore()
 

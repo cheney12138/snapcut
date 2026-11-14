@@ -49,7 +49,7 @@ enum CGRenderer {
     // MARK: - 单个标注绘制
 
     private static func draw(_ a: AnnotationModel, in size: CGSize, context: CGContext, yDown: Bool) {
-        let color = a.color
+        let color = NSColor(cgColor: a.color.cgColor) ?? .red
         let width = CGFloat(a.strokeWidth + 1)  // 1→2pt 2→3pt 3→4pt（功能先行，手感后调）
         context.saveGState()
 

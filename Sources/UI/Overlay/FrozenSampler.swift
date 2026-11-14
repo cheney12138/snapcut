@@ -17,16 +17,18 @@ struct FrozenSampler {
         height = image.height
         guard width > 0, height > 0 else { return nil }
         let rowBytes = width * 4
+        let w = width
+        let h = height
         var buffer = [UInt8](repeating: 0, count: rowBytes * height)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let ok: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in
             guard let base = raw.baseAddress,
                   let ctx = CGContext(
-                    data: base, width: width, height: height,
+                    data: base, width: w, height: h,
                     bitsPerComponent: 8, bytesPerRow: rowBytes, space: colorSpace,
                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
                   ) else { return false }
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
             return true
         }
         guard ok else { return nil }

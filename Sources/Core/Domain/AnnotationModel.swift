@@ -1,4 +1,3 @@
-import AppKit
 import CoreGraphics
 
 /// 标注模型（docs/03 §6：AnnotationModel 纯数据，Codable）
@@ -22,15 +21,36 @@ struct AnnotationModel: Equatable {
     var text: String?     // text shape 专用
     var index: Int?       // sequence shape 专用
 
-    static let palette: [NSColor] = [
-        NSColor(calibratedRed: 1.0, green: 0.23, blue: 0.19, alpha: 1),  // 红
-        NSColor(calibratedRed: 0.0, green: 0.48, blue: 1.0, alpha: 1),   // 蓝
-        NSColor(calibratedRed: 1.0, green: 0.84, blue: 0.0, alpha: 1),   // 黄
-        .black,
-        .white,
-    ]
+    /// 调色板（领域值类型，UI 负责转 NSColor/CGColor）
+    static let palette: [RGBAColor] = [.red, .blue, .yellow, .black, .white]
 
-    var color: NSColor { Self.palette[colorIndex % Self.palette.count] }
+    var color: RGBAColor { Self.palette[colorIndex % Self.palette.count] }
+
+    /// 几何平移（选区调整时用，样式与序号不变）
+    func offsetBy(dx: CGFloat, dy: CGFloat) -> AnnotationModel {
+        var copy = self
+        switch shape {
+        case .arrow(let from, let to):
+            copy.shape = .arrow(
+                from: CGPoint(x: from.x + dx, y: from.y + dy),
+                to: CGPoint(x: to.x + dx, y: to.y + dy)
+            )
+        case .rect(let rect):
+            copy.shape = .rect(rect.offsetBy(dx: dx, dy: dy))
+        case .text(let anchor):
+            copy.shape = .text(anchor: CGPoint(x: anchor.x + dx, y: anchor.y + dy))
+        case .mosaic(let rect):
+            copy.shape = .mosaic(rect.offsetBy(dx: dx, dy: dy))
+        case .sequence(let anchor):
+            copy.shape = .sequence(anchor: CGPoint(x: anchor.x + dx, y: anchor.y + dy))
+        case .highlight(let from, let to):
+            copy.shape = .highlight(
+                from: CGPoint(x: from.x + dx, y: from.y + dy),
+                to: CGPoint(x: to.x + dx, y: to.y + dy)
+            )
+        }
+        return copy
+    }
 }
 
 /// 标注存储：有序列表 + undo/redo 栈（R8：只走 Cmd+Z / Cmd+Shift+Z，无双轨）
@@ -63,6 +83,13 @@ final class AnnotationStore {
         undoStack.append(annotations)
         annotations = redoStack.removeLast()
         Log.event(.editor, "editor.redo", ["count": "\(annotations.count)"])
+    }
+
+    /// 选区调整后整体平移所有标注（保持标注"钉在图像上"）
+    func offsetAll(dx: CGFloat, dy: CGFloat) {
+        guard dx != 0 || dy != 0 else { return }
+        pushUndo()
+        annotations = annotations.map { $0.offsetBy(dx: dx, dy: dy) }
     }
 
     func consumeSequenceNumber() -> Int {
