@@ -57,7 +57,12 @@ final class ToolbarPanel: NSPanel {
             backing: .buffered,
             defer: false
         )
-        level = .floating
+        // ⚠️ 必须与覆盖层同级（.screenSaver）：覆盖层是 .screenSaver，
+        // 工具栏若停在 .floating 就会被压在下面——不仅看不见，鼠标点击也全被
+        // 覆盖层吃掉（病例：所有按钮点了没反应，toolbar.mousedown 零日志）
+        // ⚠️ 比覆盖层（.screenSaver）再高一级：同级时靠 order 决定前后，
+        // 覆盖层每次 makeKeyAndOrderFront 就会压到工具栏上面，把点击全吃掉
+        level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         isOpaque = false
         backgroundColor = .clear
@@ -260,6 +265,27 @@ final class ToolbarPanel: NSPanel {
             self.animator().setFrame(finalFrame, display: true)
             self.animator().alphaValue = 1
         })
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.dumpButtonCenters()
+        }
+    }
+
+    /// 诊断：把每个按钮的屏幕中心点打出来（真机点击验证用，平时无副作用）
+    func dumpButtonCenters() {
+        guard let contentView else { return }
+        var entries: [String] = []
+        for sub in contentView.subviews.first?.subviews ?? [] {
+            guard sub is NSButton || sub.subviews.first is NSButton else { continue }
+            let target = (sub as? NSButton) ?? (sub.subviews.first as? NSButton)
+            guard let button = target else { continue }
+            let rect = button.convert(button.bounds, to: nil)
+            let screenRect = self.convertToScreen(rect)
+            entries.append("\(button.tag)@\(Int(screenRect.midX)),\(Int(screenRect.midY))")
+        }
+        Log.event(.editor, "toolbar.buttons", [
+            "panel": "\(Int(frame.minX)),\(Int(frame.minY)),\(Int(frame.width)),\(Int(frame.height))",
+            "centers": entries.joined(separator: " "),
+        ])
     }
 
     // MARK: - 状态刷新
@@ -294,6 +320,15 @@ final class ToolbarPanel: NSPanel {
 
     // MARK: - 事件
 
+    /// 诊断：任何落到面板上的鼠标点击都记录一次（判断是事件没进来还是按钮没接住）
+    override func mouseDown(with event: NSEvent) {
+        let inWindow = event.locationInWindow
+        Log.event(.editor, "toolbar.mousedown", [
+            "x": "\(Int(inWindow.x))", "y": "\(Int(inWindow.y))",
+        ])
+        super.mouseDown(with: event)
+    }
+
     @objc private func toolTapped(_ sender: NSButton) {
         guard let tool = EditorSession.Tool(rawValue: sender.tag) else { return }
         session?.currentTool = tool
@@ -304,11 +339,13 @@ final class ToolbarPanel: NSPanel {
 
     @objc private func colorTapped(_ sender: NSButton) {
         session?.colorIndex = sender.tag
+        Log.event(.editor, "toolbar.color", ["index": "\(sender.tag)"])
         refreshSelectionState()
     }
 
     @objc private func strokeTapped(_ sender: NSButton) {
         session?.strokeWidth = sender.tag
+        Log.event(.editor, "toolbar.stroke", ["width": "\(sender.tag)"])
         refreshSelectionState()
     }
 

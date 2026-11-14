@@ -320,6 +320,8 @@ final class OverlayController {
             self.ensureActivation(reason: "editor.enter")
             editorWindow.makeKeyAndOrderFront(nil)
             _ = editorWindow.makeFirstResponder(editorView)
+            // 覆盖层 makeKey 之后必须把工具栏重新提到最前（否则点不到按钮）
+            self.toolbar?.orderFrontRegardless()
             let keyOK = editorWindow.isKeyWindow
             let active = NSApp.isActive
             Log.event(.editor, "editor.focus", [
