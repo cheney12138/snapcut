@@ -68,8 +68,12 @@ struct TestStitchMain {
         let solo = try cropped(page2, y: 0, height: 600, name: "solo")
         let disjoint = try cropped(page2, y: 0, height: 600, name: "disjoint") // 与 solo 相同区域…会重叠
         // 改用页内相距超过帧高的两段：必然无可信重叠
+        // ⚠️ 负向用例必须用「行不相关」的内容：行纯色页面在整数 seed 下只是
+        // 行相位偏移（seed=7 ⇒ page2 第 r 行颜色 == page1 第 r-7 行），会伪对齐。
+        // 改为反转色页面：任何行对亮度差都极大，不可能有可信重叠。
+        let pageInv = try renderPage(width: width, height: 600, seed: 7, invert: true)
         let far = try cropped(page2, y: 0, height: 600, name: "far-0")
-        let farB = try cropped(page1, y: 0, height: 600, name: "far-1") // 不同整页，内容完全不同
+        let farB = try cropped(pageInv, y: 0, height: 600, name: "far-inv")
         do {
             _ = try Stitcher.stitch(frames: [far, farB])
             // 注意：disjoint/solo 未使用，仅为占位变量命名清晰
@@ -85,7 +89,7 @@ struct TestStitchMain {
     /// 渲染「整页」：白色底 + 每行基色随行号按黄金比例相位变化（真实感渐变），
     /// 再在每一行画两条位置伪随机的黑色短横线 —— 保证任意两行的行签名亮度差
     /// 远大于拼接容差阈值（16），可无歧义地检测重叠；同时叠若干形状增加真实感。
-    static func renderPage(width: Int, height: Int, seed: Int) throws -> CGImage {
+    static func renderPage(width: Int, height: Int, seed: Int, invert: Bool = false) throws -> CGImage {
         guard let ctx = CGContext(
             data: nil, width: width, height: height,
             bitsPerComponent: 8, bytesPerRow: width * 4,
@@ -99,8 +103,12 @@ struct TestStitchMain {
 
         // CGContext 原点在左下；第 row 行（图像坐标，顶部为 0）对应 ctx y = height-row-1
         for row in 0..<height {
-            let hue = CGFloat((Double(row + seed) * 0.6180339887).truncatingRemainder(dividingBy: 1.0))
-            let brightness = 0.45 + 0.15 * sin(Double(row) / 17.0 + Double(seed))
+            var hue = CGFloat((Double(row + seed) * 0.6180339887).truncatingRemainder(dividingBy: 1.0))
+            var brightness = 0.45 + 0.15 * sin(Double(row) / 17.0 + Double(seed))
+            if invert {
+                hue = (1.0 - hue).truncatingRemainder(dividingBy: 1.0)
+                brightness = 1.0 - brightness
+            }
             ctx.setFillColor(CGColor(srgbRed: hue, green: 0.45, blue: CGFloat(brightness), alpha: 1))
             ctx.fill(CGRect(x: 0, y: CGFloat(height - row - 1), width: CGFloat(width), height: 1))
         }

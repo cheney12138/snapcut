@@ -50,9 +50,13 @@ enum Stitcher {
         var minOverlap: Int = 16
         /// 行签名比对容差：一行内采样点平均绝对亮度差超过该值视为「不匹配行」
         /// （Retina 缩放 / 抗锯齿噪声通常在个位数）
-        var rowDiffThreshold: UInt32 = 16
-        /// 允许的「不匹配行」占比上限（0.02 = 2%）
-        var maxMismatchRatio: Double = 0.02
+        /// 行签名比对容差：一行内采样点平均绝对亮度差超过该值视为「不匹配行」
+        /// （Retina 缩放 / 抗锯齿噪声通常在个位数；真实滚动帧实测需要 24：
+        /// 抗锯齿 + 滚动条 + 子像素位移会把正确对齐的行差拉到 17-23）
+        var rowDiffThreshold: UInt32 = 24
+        /// 允许的「不匹配行」占比上限（0.10 = 10%；默认 2% 在真实帧上
+        /// 会把正确对齐误判为不匹配——2026-11-14 ScrollHost 实测病例）
+        var maxMismatchRatio: Double = 0.10
         /// 行签名沿宽度方向的采样点数
         var signatureSamples: Int = 64
     }

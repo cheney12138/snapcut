@@ -11,16 +11,22 @@ private let kSnapcutHotKeySignature: OSType = 0x534E5043 // 'SNPC'
 
 @MainActor
 final class CarbonHotKeyCenter {
+    /// 单例：EventHotKey 派发 handler 只装一次，注册必须全部落在同一实例
+    /// （病例：滚动收尾热键 new 了第二个实例 ⇒ InstallEventHandler -9866，
+    /// 且事件派发查的是第一个实例的表 ⇒ Enter 收不到）
+    static let shared = CarbonHotKeyCenter()
 
-    private var hotKeyRef: EventHotKeyRef?
+
+    private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
     private var handlerRef: EventHandlerRef?
     private var hotKeyIDs: [UInt32: () -> Void] = [:]
     private var nextID: UInt32 = 1
 
     // MARK: - 注册
 
-    /// 注册全局快捷键。action 在主线程回调。
-    func register(keyCode: Int, modifiers: NSEvent.ModifierFlags, action: @escaping () -> Void) -> Bool {
+    /// 注册全局快捷键，返回热键 id（用于 unregister）。action 在主线程回调。
+    @discardableResult
+    func register(keyCode: Int, modifiers: NSEvent.ModifierFlags, action: @escaping () -> Void) -> UInt32? {
         installHandlerIfNeeded()
 
         let id = nextID
@@ -40,20 +46,32 @@ final class CarbonHotKeyCenter {
         guard status == noErr, ref != nil else {
             hotKeyIDs[id] = nil
             Log.error(.hotkey, "hotkey.register.fail", ["err": "\(status)"])
-            return false
+            return nil
         }
-        hotKeyRef = ref
+        hotKeyRefs[id] = ref
         Log.event(.hotkey, "hotkey.registered", [
             "id": "\(id)",
             "key": keyDescription(keyCode: keyCode, modifiers: modifiers),
         ])
-        return true
+        return id
+    }
+
+    /// 注销单个热键（返回注册时拿到的 id；传 nil 安全）
+    func unregister(_ id: UInt32?) {
+        guard let id else { return }
+        if let ref = hotKeyRefs.removeValue(forKey: id) {
+            UnregisterEventHotKey(ref)
+        }
+        hotKeyIDs[id] = nil
+        Log.event(.hotkey, "hotkey.unregistered", ["id": "\(id)"])
     }
 
     func teardown() {
-        if let hotKeyRef {
-            UnregisterEventHotKey(hotKeyRef)
+        for (_, ref) in hotKeyRefs {
+            UnregisterEventHotKey(ref)
         }
+        hotKeyRefs.removeAll()
+        hotKeyIDs.removeAll()
         if let handlerRef {
             RemoveEventHandler(handlerRef)
         }

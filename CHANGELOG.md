@@ -47,3 +47,49 @@
 **坑 6（小）：调试用例把用户带进"实例空窗期"**
 - 用户 18:27:48 退出实例、18:27:52 新实例才起来，中间拍的菜单栏截图当然没图标
 - 教训：对照实验要钉死"进程活着"的前提（pgrep + 日志时间戳对齐）
+
+## 2026-11-14（晚）— v0.2 标注编辑器 + 滚动截图 + 设计原型（并行开发）
+
+### ✅ 完成
+- **v0.2 标注编辑器**：选区松手即冻结底图 → 玻璃工具栏（6 工具：箭头/矩形/文字/马赛克/序号/高亮，
+  热键 1-6 直选，5 色 3 粗细，undo/redo）→ Enter 复制/⌘S 保存/Esc 取消/双击复制。
+  **工具栏永不入图**（底图在工具栏出现前冻结——需求「截图时隐藏工具栏」的架构级解法），H 键隐藏工具栏。
+- **滚动截图（v0.6 提前）**：S 键进入 → 手动滚动 + 400ms 抓帧 → Enter 拼接 → 导出；
+  静止画面退化输出首帧（产品承诺：不卡死、明确回退）。
+- **设计原型**（DeepSeek 设计 agent 并行）：`~/work/project/html-pages/snapcut-design/index.html`
+  Apple 玻璃质感 8 场景交互原型 + 7 张自验截图。
+- **e2e 自动化验证体系**：CGEvent 注入真实键盘/鼠标/滚动事件 + ScrollHost 滚动宿主窗口，
+  全链路无人值守验证（不是 mock，全部真实管线）。
+
+### 🕳️ 踩坑记录
+
+**坑 7：make dev 构建失败仍显示 "ready"（rsync 无保护）**
+- xcodebuild 失败 → tail 吞掉错误行 → rsync 把旧产物复制出去 → 屏幕上跑旧代码
+- 修复：tee 完整日志 + grep BUILD SUCCEEDED 挡板；**新二进制用 strings 验证特征字符串**
+
+**坑 8：编辑态键盘丢失（appActive=false + keyWin=nil）**
+- 病例：ToolbarPanel 创建后 App 失活，无激活态窗口无法成为 key → Enter/Esc 全丢
+- 修复：editor.enter 后 activate + makeKeyAndOrderFront + makeFirstResponder（延后一个 runloop tick）
+
+**坑 9：SCK 返回分辨率与 NSScreen 物理像素不匹配（BetterDisplay/虚拟分辨率）**
+- 病例：3456×2234 物理的屏，SCK 整屏图实测 1920×1080（不是 nominal 也不是 exact 能救的）
+- 根因：backingScale 假设在虚拟分辨率模式下失效
+- 修复：CoordinateConverter 一律用「实际图尺寸 ÷ 屏幕 point 尺寸」实测比例；EditorSession.scale 同理
+
+**坑 10：滚动事件被覆盖层挡住（产品级 bug，不是测试问题）**
+- 病例：滚动模式下用户滚鼠标 → 事件给 key window（我们的覆盖层）→ 底下内容不动 → 永远拼接失败
+- 修复：scrollMode 时覆盖层 ignoresMouseEvents=true（事件穿透）
+
+**坑 11：滚动收尾键盘收不到（焦点在别的 App）**
+- 病例：滚动时焦点回到被滚动 App，Enter 普通键路径失效
+- 修复：Enter/Esc 用系统级 Carbon 热键动态注册（会话期注册/结束注销）
+
+**坑 12：CarbonHotKeyCenter 多实例（-9866 + 派发表查错实例）**
+- 病例：滚动热键 new 了第二个实例 → InstallEventHandler 重复安装报 -9866，
+  且事件派发查的是第一个实例的表 → 热键注册成功但永远不触发
+- 修复：单例化（CarbonHotKeyCenter.shared）
+
+**坑 13：Stitcher 默认容差在真实滚动帧上过严**
+- 病例：真实帧（抗锯齿+滚动条+子像素位移）在正确对齐处行差 17-23，默认 threshold 16 + 2% 不匹配率直接误判
+- 修复：threshold 24 + 10%（合成图与真实帧双验证）；同时修掉合成负向用例的伪对齐
+ （行纯色页面在整数 seed 下只是行相位偏移——seed=7 ⇒ 伪重叠；改为反转色页）

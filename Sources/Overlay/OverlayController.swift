@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 
 /// 覆盖层控制器：每屏一窗，管理 选区 → 编辑 → 导出 全会话
@@ -31,6 +32,17 @@ final class OverlayController {
     /// 编辑会话（编辑态非空）
     private(set) var editorSession: EditorSession?
     private var toolbar: ToolbarPanel?
+    /// 滚动截图会话（S 键触发；非空时覆盖层显示滚动 HUD）
+    private(set) var scrollFrames: [CGImage] = []
+    private var scrollController: ScrollCaptureController?
+    private var scrollTimer: Timer?
+    private var scrollSelectionRect: CGRect?
+    private var scrollScreen: NSScreen?
+    /// 滚动会话专用热键（Enter 完成 / Esc 取消）
+    /// ⚠️ 滚动模式下覆盖层 ignoresMouseEvents=true，焦点会落到被滚动的 App，
+    /// 普通 keyDown 收不到——必须用系统级 Carbon 热键收尾（e2e 实测病例）
+    private var scrollFinishHotKey: UInt32?
+    private var scrollCancelHotKey: UInt32?
 
     // MARK: - 会话
 
@@ -65,7 +77,20 @@ final class OverlayController {
         editorSession = nil
         toolbar?.orderOut(nil)
         toolbar = nil
+        unregisterScrollHotKeys()
+        scrollTimer?.invalidate()
+        scrollTimer = nil
+        scrollController?.stop()
+        scrollController = nil
         restoreFocus()
+    }
+
+    private func unregisterScrollHotKeys() {
+        let center = CarbonHotKeyCenter.shared
+        center.unregister(scrollFinishHotKey)
+        center.unregister(scrollCancelHotKey)
+        scrollFinishHotKey = nil
+        scrollCancelHotKey = nil
     }
 
     private func dismissAll() {
@@ -121,9 +146,11 @@ final class OverlayController {
     // MARK: - 编辑态
 
     private func enterEditor(base: CGImage, selection: CGRect, screen: NSScreen) {
+        // scale 用实测比例（px/pt），不信任 backingScale（BetterDisplay 病例）
+        let realScale = CGFloat(base.width) / max(1, selection.width)
         let session = EditorSession(
             baseImage: base,
-            scale: screen.backingScaleFactor,
+            scale: realScale,
             selectionGlobal: selection,
             screen: screen
         )
@@ -199,6 +226,142 @@ final class OverlayController {
     /// 工具栏可见性切换（快捷键 H 走这里）
     func toggleToolbarVisibility() {
         toolbarAction(.toggleVisibility)
+    }
+
+    // MARK: - 滚动截图（S 键，手动滚动模式）
+
+    /// 编辑态下按 S：进入滚动采集（丢弃冻结底图，覆盖层切滚动 HUD）
+    func beginScrollCapture() {
+        guard editorSession != nil,
+              scrollController == nil,
+              let rect = selectionRectGlobal,
+              let screen = selectionScreen else {
+            Log.error(.scroll, "scroll.begin.guard", [
+                "hasSession": "\(editorSession != nil)",
+                "noController": "\(scrollController == nil)",
+                "hasRect": "\(selectionRectGlobal != nil)",
+                "hasScreen": "\(selectionScreen != nil)",
+            ])
+            return
+        }
+        // 退出编辑态 UI
+        toolbar?.orderOut(nil)
+        toolbar = nil
+        editorSession = nil
+        scrollFrames = []
+        scrollSelectionRect = rect
+        scrollScreen = screen
+
+        let controller = ScrollCaptureController()
+        controller.onFrame = { [weak self] frame in
+            guard let self else { return }
+            self.scrollFrames.append(frame)
+            Log.event(.scroll, "scroll.frame", ["n": "\(self.scrollFrames.count)"])
+            self.editorWindow()?.contentView?.needsDisplay = true
+        }
+        controller.onStop = { [weak self] count in
+            guard let self else { return }
+            Log.event(.scroll, "scroll.stop", ["frames": "\(count)"])
+        }
+        do {
+            try controller.start(region: rect)
+            scrollController = controller
+            // 系统级收尾热键（焦点在别的 App 也能收到）
+            scrollFinishHotKey = CarbonHotKeyCenter.shared.register(
+                keyCode: kVK_Return, modifiers: []
+            ) { [weak self] in self?.finishScrollForSelfTest() }
+            scrollCancelHotKey = CarbonHotKeyCenter.shared.register(
+                keyCode: kVK_Escape, modifiers: []
+            ) { [weak self] in self?.perform(action: .cancel) }
+            Log.event(.scroll, "scroll.begin", ["rect": "\(Int(rect.width))x\(Int(rect.height))"])
+            // 编辑窗口切滚动 HUD
+            for window in windows where window.owningScreen == screen {
+                window.enterScrollMode()
+            }
+            // 帧 HUD 计数刷新
+            scrollTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.editorWindow()?.contentView?.needsDisplay = true
+                }
+            }
+        } catch {
+            Log.error(.scroll, "scroll.begin.fail", ["err": error.localizedDescription])
+        }
+    }
+
+    /// Enter：结束采集 → 拼接 → 预览面板
+    private func finishScrollCapture() {
+        guard let controller = scrollController else { return }
+        scrollTimer?.invalidate()
+        scrollTimer = nil
+        controller.stop()
+        scrollController = nil
+
+        let frames = scrollFrames
+        let selection = scrollSelectionRect
+        scrollFrames = []
+
+        let screen = scrollScreen
+        for window in windows { window.exitScrollMode() }
+
+        guard frames.count > 0 else {
+            Log.error(.scroll, "scroll.stitch.fail", ["err": "no frames"])
+            perform(action: .cancel)
+            return
+        }
+        Log.event(.scroll, "scroll.stitch.begin", ["frames": "\(frames.count)"])
+        Task {
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try Stitcher.stitch(frames: frames)
+                }.value
+                Log.event(.scroll, "scroll.stitch.ok", [
+                    "pxW": "\(result.image.width)",
+                    "pxH": "\(result.image.height)",
+                    "seams": "\(result.seams.count)",
+                ])
+                let completion = self.completion
+                let action = self.pendingScrollExport ?? .copy
+                self.end()
+                self.completion = nil
+                switch action {
+                case .save: completion?(.save(result.image))
+                case .cancel: break
+                case .copy: completion?(.copy(result.image))
+                }
+            } catch {
+                // 拼接失败：静止画面（无可信重叠）时退化为输出首帧，
+                // 其余失败明确回退（产品承诺：绝不卡死）
+                Log.error(.scroll, "scroll.stitch.fail", ["err": error.localizedDescription])
+                if frames.count >= 1 {
+                    let completion = self.completion
+                    let action = self.pendingScrollExport ?? .copy
+                    self.end()
+                    self.completion = nil
+                    Log.event(.scroll, "scroll.fallback", ["mode": "firstFrame"])
+                    switch action {
+                    case .save: completion?(.save(frames[0]))
+                    case .cancel: break
+                    case .copy: completion?(.copy(frames[0]))
+                    }
+                } else {
+                    self.perform(action: .cancel)
+                }
+            }
+        }
+    }
+
+    /// 滚动 HUD 里的导出意图（Enter 后默认复制）
+    private var pendingScrollExport: Action?
+
+    /// OverlayView 滚动 HUD 读取（选区全局矩形 / 已抓帧数）
+    var scrollSelectionGlobal: CGRect? { scrollSelectionRect }
+    var scrollFrameCount: Int { scrollFrames.count }
+
+    /// 键盘 Enter / 自测驱动：结束滚动采集
+    func finishScrollForSelfTest() {
+        pendingScrollExport = .copy
+        finishScrollCapture()
     }
 
     // MARK: - 编辑器内标注落库（OverlayView 手势回调）

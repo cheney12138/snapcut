@@ -15,7 +15,8 @@ dev: gen
 	xcodebuild -project Snapcut.xcodeproj -scheme Snapcut -configuration Debug \
 		-derivedDataPath build/DerivedData \
 		CODE_SIGN_IDENTITY=$(SIGN_ID) \
-		DEVELOPMENT_TEAM= PKGINFO_PATH= build 2>&1 | tail -30
+		DEVELOPMENT_TEAM= PKGINFO_PATH= build 2>&1 | tee /tmp/snapcut_build.log | tail -20
+	@grep -q "BUILD SUCCEEDED" /tmp/snapcut_build.log || { echo "BUILD FAILED, bundle not updated"; exit 1; }
 	rsync -a --delete "build/DerivedData/Build/Products/Debug/Snapcut.app/" "$(BUNDLE)/"
 	@echo "== $(BUNDLE) ready =="
 

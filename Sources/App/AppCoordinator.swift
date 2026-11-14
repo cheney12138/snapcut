@@ -21,7 +21,7 @@ final class AppCoordinator {
     }
 
     private let tray = StatusItemController()
-    private let hotkeyCenter = CarbonHotKeyCenter()
+    private let hotkeyCenter = CarbonHotKeyCenter.shared
     private let exporter = ExportCoordinator()
     private var overlayController: OverlayController?
 

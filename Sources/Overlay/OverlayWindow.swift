@@ -36,6 +36,15 @@ final class OverlayWindow: NSWindow {
     func enterEditorMode(session: EditorSession) {
         (contentView as? OverlayView)?.enterEditorMode(session: session)
     }
+
+    /// 滚动截图模式（滚动 HUD）
+    func enterScrollMode() {
+        (contentView as? OverlayView)?.enterScrollMode()
+    }
+
+    func exitScrollMode() {
+        (contentView as? OverlayView)?.exitScrollMode()
+    }
 }
 
 /// 覆盖层视图：蒙层 / 橡皮筋选框 / 尺寸角标 + 编辑态（冻结底图 + 标注 + 手势）
@@ -62,6 +71,11 @@ final class OverlayView: NSView {
 
     /// 拖拽中的标注预览（未确认，不入 store）
     private var pendingAnnotation: AnnotationModel?
+
+    /// 滚动截图模式（controller 的 scrollController 非空）
+    private(set) var scrollMode = false
+    /// 滚动 HUD 显示的选区（本窗口负责的那块，可能是 nil=本屏无选区）
+    private var scrollRectLocal: CGRect?
 
     /// 文字输入框（text 工具）
     private var textField: NSTextField?
@@ -98,6 +112,32 @@ final class OverlayView: NSView {
             width: global.width,
             height: global.height
         )
+        needsDisplay = true
+    }
+
+    func enterScrollMode() {
+        scrollMode = true
+        // ⚠️ 滚动事件必须穿透到下层 App（否则用户滚动的是我们的覆盖层，
+        // 底下内容不动，拼接永远失败——e2e 实测 12 帧全静止的病例）
+        window?.ignoresMouseEvents = true
+        if let global = controller.scrollSelectionGlobal {
+            let frame = window?.frame ?? .zero
+            scrollRectLocal = CGRect(
+                x: global.minX - frame.minX,
+                y: frame.maxY - global.maxY,
+                width: global.width,
+                height: global.height
+            )
+        } else {
+            scrollRectLocal = nil
+        }
+        needsDisplay = true
+    }
+
+    func exitScrollMode() {
+        scrollMode = false
+        window?.ignoresMouseEvents = false
+        scrollRectLocal = nil
         needsDisplay = true
     }
 
@@ -244,6 +284,7 @@ final class OverlayView: NSView {
     private var pendingStartPoint: CGPoint?
 
     private var phaseLabel: String {
+        if scrollMode { return "scroll" }
         switch phase {
         case .waitingForDrag: return "wait"
         case .dragging: return "drag"
@@ -334,10 +375,14 @@ final class OverlayView: NSView {
     // MARK: - 键盘
 
     override func keyDown(with event: NSEvent) {
-        Log.logger(.overlay).debug("evt=overlay.keyDown key=\(event.keyCode, privacy: .public) phase=\(phaseLabel, privacy: .public)")
+        Log.logger(.overlay).debug("evt=overlay.keyDown key=\(event.keyCode, privacy: .public) phase=\(self.phaseLabel, privacy: .public)")
         // 文字输入态：普通键给输入框（first responder 已是 field，事件不会到这）
         switch Int(event.keyCode) {
         case kVK_Escape:
+            if scrollMode {
+                controller.perform(action: .cancel)
+                return
+            }
             if textField != nil {
                 // 文字输入态的 Esc：取消文字（R4 语义在编辑器内优先作用于文字）
                 textField?.removeFromSuperview()
@@ -348,6 +393,10 @@ final class OverlayView: NSView {
             }
             controller.perform(action: .cancel)
         case kVK_Return, kVK_ANSI_KeypadEnter:
+            if scrollMode {
+                controller.finishScrollForSelfTest()
+                return
+            }
             if phase == .editing {
                 if textField != nil { commitTextFieldIfNeeded(); return }
                 controller.perform(action: .copy)
@@ -357,6 +406,10 @@ final class OverlayView: NSView {
         case kVK_ANSI_S:
             if event.modifierFlags.contains(.command), phase == .editing || phase == .confirmed {
                 controller.perform(action: .save)
+            } else if phase == .editing, !event.modifierFlags.contains(.command) {
+                // S = 滚动截图模式（需求 3：滚动截图）
+                Log.event(.scroll, "scroll.keyReceived")
+                controller.beginScrollCapture()
             } else {
                 super.keyDown(with: event)
             }
@@ -443,12 +496,46 @@ final class OverlayView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
+        if scrollMode {
+            drawScrollHUD(ctx: ctx)
+            return
+        }
         switch phase {
         case .editing:
             drawEditor(ctx: ctx)
         default:
             drawSelection(ctx: ctx)
         }
+    }
+
+    /// 滚动 HUD：选区框 + 帧/引导
+    private func drawScrollHUD(ctx: CGContext) {
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.2).cgColor)
+        ctx.fill(bounds)
+        guard let rect = scrollRectLocal else { return }
+        ctx.saveGState()
+        ctx.setBlendMode(.clear)
+        ctx.fill(rect)
+        ctx.restoreGState()
+        ctx.setStrokeColor(NSColor.white.cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.stroke(rect)
+
+        let frames = controller.scrollFrameCount
+        let text = "滚动内容以捕获 · 已抓 \(frames) 帧 · Enter 完成拼接 · Esc 取消"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let textSize = (text as NSString).size(withAttributes: attributes)
+        let padding: CGFloat = 10
+        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + 8))
+        var origin = CGPoint(x: rect.midX - size.width / 2, y: rect.maxY + 10)
+        if origin.y + size.height > bounds.height { origin.y = rect.minY - size.height - 10 }
+        origin.x = min(max(origin.x, 8), bounds.width - 8 - size.width)
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
+        ctx.fill(CGRect(origin: origin, size: size))
+        (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 4), withAttributes: attributes)
     }
 
     /// 选区阶段：蒙层 + 橡皮筋 + 角标 + 提示

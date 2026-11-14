@@ -32,6 +32,9 @@ actor SCKCapture {
         }
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
+        // ⚠️ 默认 .nominal 会返回降采样图（逻辑分辨率），坐标按物理像素裁剪就会越界
+        // （病例：屏幕下方选区 pxH=80 而非 500）。.exact = 显示器原生像素。
+        config.captureResolution = .best
         config.showsCursor = false
         config.scalesToFit = false
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
@@ -53,16 +56,20 @@ enum CaptureService {
             let elapsedMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
             )
-            let pxRect = CoordinateConverter.pixelRect(selection: selection, onScreen: screen)
+            // 用实际捕获图尺寸做比例换算（见 CoordinateConverter 的病例注释）
+            let pxRect = CoordinateConverter.pixelRect(
+                selection: selection, onScreen: screen,
+                imageWidth: full.width, imageHeight: full.height
+            )
             guard let cropped = full.cropping(to: pxRect), cropped.width > 0, cropped.height > 0 else {
                 throw CaptureError.cropFailed
             }
-            let scale = screen.backingScaleFactor
+            let realScale = CGFloat(full.width) / screen.frame.width
             Log.event(.capture, "capture.display.ok", [
                 "ms": "\(elapsedMs)",
                 "pxW": "\(cropped.width)",
                 "pxH": "\(cropped.height)",
-                "scale": "\(scale)",
+                "scale": String(format: "%.2f", realScale),
                 "displayId": "\(displayID)",
                 "rectPx": "\(Int(pxRect.minX)),\(Int(pxRect.minY)),\(Int(pxRect.width)),\(Int(pxRect.height))",
             ])

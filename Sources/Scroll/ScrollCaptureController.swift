@@ -164,23 +164,29 @@ enum ScrollFrameGrabber {
         }
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
+        // ⚠️ 默认 .nominal 会返回降采样图（逻辑分辨率），坐标按物理像素裁剪就会越界
+        // （病例：屏幕下方选区 pxH=80 而非 500）。.exact = 显示器原生像素。
+        config.captureResolution = .best
         config.showsCursor = false
         config.scalesToFit = false
         let full = try await SCScreenshotManager.captureImage(
             contentFilter: filter, configuration: config)
 
-        // AppKit 全局坐标（左下原点）→ 图像坐标（左上原点）：
-        // 显示器上边缘的全局 y = 包含它的 NSScreen.frame.maxY
-        let screenTop = NSScreen.screens
-            .first { Self.displayID(of: $0) == displayID }?.frame.maxY ?? 0
-        let pxX = region.minX * scale
-        let pxY = (screenTop - region.maxY) * scale
+        // ⚠️ 不信任传入 scale（BetterDisplay/虚拟分辨率病例：SCK 整屏图 1920×1080
+        // 而屏物理 3456×2234）——用「实际图尺寸 ÷ 屏幕 point 尺寸」实测比例裁剪
+        let screen = NSScreen.screens.first { Self.displayID(of: $0) == displayID }
+        guard let frame = screen?.frame, frame.width > 0, frame.height > 0 else {
+            throw ScrollCaptureController.ScrollCaptureError.displayNotFound
+        }
+        let scaleX = CGFloat(full.width) / frame.width
+        let scaleY = CGFloat(full.height) / frame.height
         let pxRect = CGRect(
-            x: pxX, y: pxY,
-            width: region.width * scale, height: region.height * scale
+            x: (region.minX - frame.minX) * scaleX,
+            y: (frame.maxY - region.maxY) * scaleY,
+            width: region.width * scaleX,
+            height: region.height * scaleY
         ).integral
         guard pxRect.width > 0, pxRect.height > 0,
-              pxRect.maxX <= CGFloat(full.width), pxRect.maxY <= CGFloat(full.height),
               let cropped = full.cropping(to: pxRect) else {
             throw ScrollCaptureController.ScrollCaptureError.regionOffScreen
         }
