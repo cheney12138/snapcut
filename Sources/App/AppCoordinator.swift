@@ -93,6 +93,11 @@ final class AppCoordinator {
         deps.hotkeys.register(keyCode: full.keyCode, modifiers: full.modifiers) { [weak self] in
             self?.beginFullScreenCapture()
         }
+        // 兜底可达性（菜单栏满时图标会被系统隐藏，实测连最小 App 也不显示）：
+        // ⌥⌘H 在光标处弹出完整菜单，⌥⌘, 直接开设置
+        deps.hotkeys.register(keyCode: UInt32(kVK_ANSI_H), modifiers: [.option, .command]) { [weak self] in
+            self?.tray.showMenuAtCursor()
+        }
         // 兜底可达性：菜单栏满时托盘图标可能被系统整体隐藏（tray.hidden.overflow 病例），
         // ⌥⌘, 直接打开设置窗口，保证无图标也能进设置
         deps.hotkeys.register(

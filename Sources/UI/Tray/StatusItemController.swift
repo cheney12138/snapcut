@@ -19,8 +19,9 @@ final class StatusItemController: NSObject {
         // ⚠️ 不能用 variableLength：实测按钮占 38pt，菜单栏一挤就被系统隐藏
         // （病例：图标"消失"，butt.frame 落在时钟区 x=1690 即被挤出可见区）
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.autosaveName = "SnapcutStatusItem"
-        item.behavior = [.removalAllowed]
+        // ⚠️ 不要 autosaveName / .removalAllowed：它们会让系统「记住」图标的隐藏/移除
+        // 状态，一旦被 ⌘-拖走或被判放不下，重启也一直停在 y=-22 的停车位（病例）
+        item.isVisible = true
         if let button = item.button {
             button.image = IconFactory.statusIcon() // 品牌 mark 剪影（StatusMark.png 模板）
             button.imageScaling = .scaleProportionallyDown
@@ -216,6 +217,20 @@ final class StatusItemController: NSObject {
         menu.addItem(quitItem)
         self.rootMenu = menu
         return menu
+    }
+
+    /// 图标被系统隐藏时的替代入口：在光标处弹出同一个菜单
+    /// （⌥⌘H 触发；菜单内容、历史子菜单重建逻辑与图标点击完全一致）
+    func showMenuAtCursor() {
+        if let historyMenu { rebuildHistoryMenu(historyMenu) }
+        guard let rootMenu else { return }
+        let mouse = NSEvent.mouseLocation
+        // accessory App 在后台时 popUp 不会显示，必须先激活自己
+        NSApp.activate(ignoringOtherApps: true)
+        Log.event(.tray, "tray.menu.atCursor", ["x": "\(Int(mouse.x))", "y": "\(Int(mouse.y))"])
+        DispatchQueue.main.async {
+            rootMenu.popUp(positioning: nil, at: NSPoint(x: mouse.x, y: mouse.y), in: nil)
+        }
     }
 
     @objc private func statusItemClicked(_ sender: Any?) {

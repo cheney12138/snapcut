@@ -357,11 +357,20 @@ final class ToolbarPanel: NSPanel {
         applyPanelShadowPaths()
         contentView?.layoutSubtreeIfNeeded()
         let size = frame.size
-        var origin = CGPoint(x: selection.midX - size.width / 2, y: selection.minY - size.height - 12)
-        if origin.y < (targetScreen?.visibleFrame.minY ?? 0) + 8 {
-            origin.y = selection.maxY + 12
-        }
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        // 1) 优先选区下方 12pt；2) 下方放不下翻到上方；3) 全屏截图这种上下都没有外部
+        // 空间的情况，**落进可视区内**（贴底），否则会跑到屏幕外被裁掉（用户实拍病例）
+        var origin = CGPoint(x: selection.midX - size.width / 2, y: selection.minY - size.height - 12)
+        if origin.y < visible.minY + 8 {
+            let above = selection.maxY + 12
+            if above + size.height <= visible.maxY - 8 {
+                origin.y = above
+            } else {
+                // 全屏/贴边选区：放在可视区靠下位置（比贴顶更符合直觉、更好点）
+                origin.y = visible.minY + 16
+            }
+        }
+        origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - size.height - 8)
         origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
 
         // 原型入场：translateY(8px)→0 + scale(.985)→1 + 淡入，240ms spring
