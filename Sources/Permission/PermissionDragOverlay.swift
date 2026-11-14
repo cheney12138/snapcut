@@ -21,7 +21,8 @@ final class PermissionDragOverlay {
     private static let tickInterval: TimeInterval = 0.1
     private static let permissionPollInterval: TimeInterval = 2.0
     /// 目标窗消失超过这个时长 → 收浮层（孤儿浮层比没有浮层更糟）
-    private static let orphanGrace: TimeInterval = 5.0
+    /// 12s：系统设置冷启动可能 >5s（病例：浮窗等不到目标出现就退场了）
+    private static let orphanGrace: TimeInterval = 12.0
 
     private static let panelSize = CGSize(width: 172, height: 116)
     private static let anchorRight: CGFloat = 12
@@ -38,6 +39,8 @@ final class PermissionDragOverlay {
     /// 用户已把 App 拖进权限列表（等待重启生效）——浮窗切换「已添加」文案
     private var droppedInList = false
     private var dismissTimer: Timer?
+    /// 是否已至少见过一次系统设置窗口（区分「冷启动中」与「已消失」）
+    private var hasSeenTarget = false
 
     // MARK: - 对外接口
 
@@ -46,6 +49,7 @@ final class PermissionDragOverlay {
         guard !isShown else { return }
         isShown = true
         droppedInList = false
+        hasSeenTarget = false
         targetGoneSince = nil
         // 拖放进列表后：屏幕录制 TCC 需重启本进程才生效，轮询 preflight
         // 永远看不到 granted=true（Glance 辅助功能是即时生效，这里是特例）
@@ -58,7 +62,8 @@ final class PermissionDragOverlay {
 
         let panel = makePanel()
         self.panel = panel
-        panel.orderFrontRegardless()
+        // 显示交给 tick：第一次找到系统设置窗口后才 orderFront + 贴角
+        // （冷启动期直接显示会在错误位置闪现）
         Log.event(.permission, "dragOverlay.show")
 
         let tick = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
@@ -138,13 +143,14 @@ final class PermissionDragOverlay {
         guard let panel, isShown else { return }
 
         if let target = settingsWindowFrame() {
+            hasSeenTarget = true
             targetGoneSince = nil
             if !panel.isVisible {
                 panel.orderFrontRegardless()
             }
             place(panel: panel, at: target)
-        } else {
-            // 目标窗最小化/切 Space → 跟着藏；进程退出 → 等 5s 后收
+        } else if hasSeenTarget {
+            // 目标窗最小化/切 Space → 跟着藏；进程退出 → 孤儿期后收
             if panel.isVisible {
                 panel.orderOut(nil)
             }
@@ -154,6 +160,7 @@ final class PermissionDragOverlay {
                 dismiss()
             }
         }
+        // 冷启动（从未见过目标）：安静等待系统设置窗口出现，不显示不销毁
     }
 
     /// 贴角：目标窗右下角内侧（右距 12 / 下距 16），夹进屏幕 visibleFrame

@@ -138,19 +138,19 @@ final class PanelContentView: NSView {
         // 文案（右侧）
         let textX: CGFloat = 76
         let titleLabel = NSTextField(labelWithString: "拖我到「屏幕录制」列表")
-        title.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        title.textColor = .labelColor
+        titleLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.frame = NSRect(x: textX, y: bounds.midY + 2, width: bounds.width - textX - 24, height: 16)
+        titleLabel.lineBreakMode = .byWordWrapping
+        addSubview(titleLabel)
         title = titleLabel
-        title.frame = NSRect(x: textX, y: bounds.midY + 2, width: bounds.width - textX - 24, height: 16)
-        title.lineBreakMode = .byWordWrapping
-        addSubview(title)
 
         let subtitleLabel = NSTextField(labelWithString: "松手即完成授权")
+        subtitleLabel.font = NSFont.systemFont(ofSize: 10)
+        subtitleLabel.textColor = .secondaryLabelColor
+        subtitleLabel.frame = NSRect(x: textX, y: bounds.midY - 14, width: bounds.width - textX - 24, height: 13)
+        addSubview(subtitleLabel)
         subtitle = subtitleLabel
-        subtitle.font = NSFont.systemFont(ofSize: 10)
-        subtitle.textColor = .secondaryLabelColor
-        subtitle.frame = NSRect(x: textX, y: bounds.midY - 14, width: bounds.width - textX - 24, height: 13)
-        addSubview(subtitle)
 
         // 关闭按钮（右上角）
         let close = NSButton(
