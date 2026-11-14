@@ -2,12 +2,16 @@ import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 
-/// 覆盖层窗口：无边框、透明、screenSaver 层级、全屏盖住单台显示器（docs/03 §3）
+/// 覆盖层窗口：无边框、透明、screenSaver 层级、全屏盖住单台显示器
 @MainActor
 final class OverlayWindow: NSWindow {
-    // 无边框窗口默认 canBecomeKey=false，必须显式允许才能接收 Enter/Esc 键盘事件
+    // 无边框窗口默认 canBecomeKey=false，必须显式允许才能接收键盘事件
     override var canBecomeKey: Bool { true }
+
+    let owningScreen: NSScreen
+
     init(screen: NSScreen, controller: OverlayController) {
+        self.owningScreen = screen
         super.init(
             contentRect: screen.frame,
             styleMask: [.borderless],
@@ -22,33 +26,49 @@ final class OverlayWindow: NSWindow {
         acceptsMouseMovedEvents = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hidesOnDeactivate = false
-        isReleasedWhenClosed = false // 由 OverlayController 统一管理生命周期
+        isReleasedWhenClosed = false
 
         let view = OverlayView(frame: NSRect(origin: .zero, size: screen.frame.size), controller: controller)
         contentView = view
     }
+
+    /// 选区所在屏进入编辑模式（显示冻结底图 + 标注交互）
+    func enterEditorMode(session: EditorSession) {
+        (contentView as? OverlayView)?.enterEditorMode(session: session)
+    }
 }
 
-/// 覆盖层视图：蒙层 / 橡皮筋选框 / 尺寸角标 / 确认提示 + 手势（docs/03 R2/R3/R4/R5）
+/// 覆盖层视图：蒙层 / 橡皮筋选框 / 尺寸角标 + 编辑态（冻结底图 + 标注 + 手势）
 @MainActor
 final class OverlayView: NSView {
     private unowned let controller: OverlayController
 
-    /// 选区状态
     private enum Phase: Equatable {
-        case waitingForDrag          // 等待按下鼠标
-        case dragging(start: CGPoint) // 拖拽中
-        case confirmed               // 松手，待 Enter/⌘S/Esc/双击
+        case waitingForDrag
+        case dragging(start: CGPoint)
+        case confirmed    // 松手，等底图冻结
+        case editing      // 编辑态（有 editorSession）
     }
     private var phase: Phase = .waitingForDrag
 
-    /// 选区（视图本地坐标，原点左下）
+    /// 选区（视图本地坐标，Y 向上）
     private var selectionLocal: CGRect = .zero
 
-    // 视觉常量（贴合系统截图观感）
+    /// 编辑会话（编辑态非空）
+    private var editorSession: EditorSession?
+
+    /// 编辑态：选区在视图本地坐标（Y 向上）
+    private var editorRectLocal: CGRect = .zero
+
+    /// 拖拽中的标注预览（未确认，不入 store）
+    private var pendingAnnotation: AnnotationModel?
+
+    /// 文字输入框（text 工具）
+    private var textField: NSTextField?
+
+    // 视觉常量
     private let dimAlpha: CGFloat = 0.25
     private let borderWidth: CGFloat = 1.5
-    private let badgeFontSize: CGFloat = 12
     private let minSelectionSize: CGFloat = 4
 
     init(frame frameRect: NSRect, controller: OverlayController) {
@@ -62,11 +82,35 @@ final class OverlayView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
     override var canBecomeKeyView: Bool { true }
+    override var isFlipped: Bool { true }  // 统一 Y 向下（与标注几何一致）
+
+    // MARK: - 编辑态切入
+
+    func enterEditorMode(session: EditorSession) {
+        editorSession = session
+        phase = .editing
+        // 全局选区 → 本地坐标（Y 向下）
+        let global = session.selectionGlobal
+        let frame = window?.frame ?? .zero
+        editorRectLocal = CGRect(
+            x: global.minX - frame.minX,
+            y: frame.maxY - global.maxY,  // AppKit 全局 Y 向上 → 本地 Y 向下
+            width: global.width,
+            height: global.height
+        )
+        needsDisplay = true
+    }
 
     // MARK: - 光标
 
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .crosshair)
+        switch phase {
+        case .editing:
+            addCursorRect(editorRectLocal, cursor: .crosshair)
+            addCursorRect(bounds.minus(editorRectLocal), cursor: .arrow)
+        default:
+            addCursorRect(bounds, cursor: .crosshair)
+        }
     }
 
     // MARK: - 手势
@@ -78,14 +122,14 @@ final class OverlayView: NSView {
         case .waitingForDrag:
             phase = .dragging(start: point)
             selectionLocal = CGRect(origin: point, size: .zero)
-            // 本窗口成为 key window 以接收键盘事件（Enter/Esc/⌘S）
             window?.makeKey()
             needsDisplay = true
         case .confirmed:
-            // R5：确认态双击 = 复制退出
             if event.clickCount >= 2 {
                 controller.perform(action: .copy)
             }
+        case .editing:
+            handleEditorMouseDown(point, event: event)
         case .dragging:
             break
         }
@@ -93,59 +137,295 @@ final class OverlayView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         super.mouseDragged(with: event)
-        guard case .dragging(let start) = phase else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        // 橡皮筋选框（v0.1：限制在本屏内；跨屏拖拽 v0.2 处理）
-        let clamped = CGPoint(
-            x: min(max(point.x, 0), bounds.width),
-            y: min(max(point.y, 0), bounds.height)
-        )
-        selectionLocal = CGRect(
-            x: min(start.x, clamped.x),
-            y: min(start.y, clamped.y),
-            width: abs(clamped.x - start.x),
-            height: abs(clamped.y - start.y)
-        )
-        needsDisplay = true
+        switch phase {
+        case .dragging(let start):
+            let point = convert(event.locationInWindow, from: nil)
+            let clamped = CGPoint(
+                x: min(max(point.x, 0), bounds.width),
+                y: min(max(point.y, 0), bounds.height)
+            )
+            selectionLocal = CGRect(
+                x: min(start.x, clamped.x),
+                y: min(start.y, clamped.y),
+                width: abs(clamped.x - start.x),
+                height: abs(clamped.y - start.y)
+            )
+            needsDisplay = true
+        case .editing:
+            handleEditorDragged(convert(event.locationInWindow, from: nil))
+        default:
+            break
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
-        guard case .dragging = phase else { return }
-        // 过小选区视为误触：回到等待态
-        if selectionLocal.width < minSelectionSize || selectionLocal.height < minSelectionSize {
-            phase = .waitingForDrag
-            selectionLocal = .zero
+        switch phase {
+        case .dragging:
+            if selectionLocal.width < minSelectionSize || selectionLocal.height < minSelectionSize {
+                phase = .waitingForDrag
+                selectionLocal = .zero
+                needsDisplay = true
+                return
+            }
+            phase = .confirmed
             needsDisplay = true
-            return
+            let globalRect = convertToGlobalRect(selectionLocal)
+            let screen = window?.screen ?? NSScreen.main!
+            controller.didSelect(rect: globalRect, on: screen)
+        case .editing:
+            handleEditorMouseUp(convert(event.locationInWindow, from: nil))
+        default:
+            break
         }
-        phase = .confirmed
-        needsDisplay = true
-        // 上报全局矩形（AppKit 全局坐标）
-        let globalRect = window?.convertToScreen(selectionLocal) ?? selectionLocal
-        let screen = window?.screen ?? NSScreen.main!
-        controller.didSelect(rect: globalRect, on: screen)
     }
 
-    // MARK: - 键盘（R4：Enter 复制 / ⌘S 保存 / Esc 取消）
+    // MARK: - 编辑态手势（标注绘制）
+
+    private func handleEditorMouseDown(_ point: CGPoint, event: NSEvent) {
+        guard let session = editorSession else { return }
+        // 点击在选区外：忽略（R7：移出选区不生效）
+        guard editorRectLocal.contains(point) else { return }
+
+        switch session.currentTool {
+        case .text:
+            beginTextEditing(at: localToAnnotation(point))
+        case .sequence:
+            controller.addAnnotation(AnnotationModel(
+                shape: .sequence(anchor: localToAnnotation(point)),
+                colorIndex: session.colorIndex,
+                strokeWidth: session.strokeWidth,
+                index: session.store.consumeSequenceNumber()
+            ))
+        case .arrow:
+            pendingStartPoint = localToAnnotation(point)
+            pendingAnnotation = AnnotationModel(
+                shape: .arrow(from: localToAnnotation(point), to: localToAnnotation(point)),
+                colorIndex: session.colorIndex, strokeWidth: session.strokeWidth, text: nil, index: nil
+            )
+        case .rect, .mosaic:
+            pendingStartPoint = localToAnnotation(point)
+            let startRect = CGRect(origin: point, size: .zero)
+            pendingAnnotation = AnnotationModel(
+                shape: session.currentTool == .rect
+                    ? .rect(annotationRect(startRect))
+                    : .mosaic(annotationRect(startRect)),
+                colorIndex: session.colorIndex, strokeWidth: session.strokeWidth, text: nil, index: nil
+            )
+        case .highlight:
+            pendingStartPoint = localToAnnotation(point)
+            pendingAnnotation = AnnotationModel(
+                shape: .highlight(from: localToAnnotation(point), to: localToAnnotation(point)),
+                colorIndex: session.colorIndex, strokeWidth: session.strokeWidth, text: nil, index: nil
+            )
+        }
+        needsDisplay = true
+    }
+
+    private func handleEditorDragged(_ point: CGPoint) {
+        guard var pending = pendingAnnotation else { return }
+        let a = localToAnnotation(point)
+        switch pending.shape {
+        case .arrow(_, _):
+            pending.shape = .arrow(from: pendingStartPoint ?? a, to: a)
+        case .highlight(let from, _):
+            pending.shape = .highlight(from: from, to: a)
+        case .rect(let r):
+            pending.shape = .rect(unionRect(r, a))
+        case .mosaic(let r):
+            pending.shape = .mosaic(unionRect(r, a))
+        default:
+            break
+        }
+        pendingAnnotation = pending
+        needsDisplay = true
+    }
+
+    private var pendingStartPoint: CGPoint?
+
+    private func handleEditorMouseUp(_ point: CGPoint) {
+        guard let pending = pendingAnnotation, let session = editorSession else { return }
+        let a = localToAnnotation(point)
+        var final = pending
+        // 交互预览态 → 定稿几何
+        switch pending.shape {
+        case .arrow(let from, _):
+            let start = pendingStartPoint ?? from
+            if hypot(a.x - start.x, a.y - start.y) < 4 { pendingAnnotation = nil; needsDisplay = true; return }
+            final.shape = .arrow(from: start, to: a)
+        case .highlight(let from, _):
+            if hypot(a.x - from.x, a.y - from.y) < 4 { pendingAnnotation = nil; needsDisplay = true; return }
+            final.shape = .highlight(from: from, to: a)
+        case .rect(let r):
+            let rect = unionRect(r, a)
+            if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return }
+            final.shape = .rect(rect)
+        case .mosaic(let r):
+            let rect = unionRect(r, a)
+            if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return }
+            final.shape = .mosaic(rect)
+        default: break
+        }
+        controller.addAnnotation(final)
+        pendingAnnotation = nil
+        pendingStartPoint = nil
+        needsDisplay = true
+    }
+
+    // MARK: - 文字输入
+
+    private func beginTextEditing(at annotationPoint: CGPoint) {
+        // 已有输入框先落库
+        commitTextFieldIfNeeded()
+
+        let localPoint = annotationToLocal(annotationPoint)
+        let field = NSTextField(frame: NSRect(
+            x: localPoint.x, y: localPoint.y - 14,
+            width: max(120, editorRectLocal.width - localPoint.x),
+            height: 24
+        ))
+        field.font = .systemFont(ofSize: 14, weight: .medium)
+        if let colorIndex = editorSession?.colorIndex, AnnotationModel.palette.indices.contains(colorIndex) {
+            field.textColor = AnnotationModel.palette[colorIndex]
+        }
+        field.placeholderString = "输入文字，Enter 确认"
+        field.target = self
+        field.action = #selector(textFieldCommit(_:))
+        field.delegate = self
+        addSubview(field)
+        window?.makeFirstResponder(field)
+        textField = field
+        // 记录落点（确认时生成标注）
+        textFieldAnchor = annotationPoint
+    }
+
+    private var textFieldAnchor: CGPoint?
+
+    @objc private func textFieldCommit(_ sender: NSTextField?) {
+        commitTextFieldIfNeeded()
+    }
+
+    private func commitTextFieldIfNeeded() {
+        guard let field = textField, let anchor = textFieldAnchor, let session = editorSession else { return }
+        let text = field.stringValue
+        field.removeFromSuperview()
+        if !text.isEmpty {
+            controller.addAnnotation(AnnotationModel(
+                shape: .text(anchor: anchor),
+                colorIndex: session.colorIndex,
+                strokeWidth: session.strokeWidth,
+                text: text
+            ))
+        }
+        textField = nil
+        textFieldAnchor = nil
+        window?.makeFirstResponder(self)
+    }
+
+    // MARK: - 键盘
 
     override func keyDown(with event: NSEvent) {
+        // 文字输入态：普通键给输入框（first responder 已是 field，事件不会到这）
         switch Int(event.keyCode) {
         case kVK_Escape:
+            if textField != nil {
+                // 文字输入态的 Esc：取消文字（R4 语义在编辑器内优先作用于文字）
+                textField?.removeFromSuperview()
+                textField = nil
+                textFieldAnchor = nil
+                window?.makeFirstResponder(self)
+                return
+            }
             controller.perform(action: .cancel)
         case kVK_Return, kVK_ANSI_KeypadEnter:
-            if phase == .confirmed {
+            if phase == .editing {
+                if textField != nil { commitTextFieldIfNeeded(); return }
+                controller.perform(action: .copy)
+            } else if phase == .confirmed {
                 controller.perform(action: .copy)
             }
         case kVK_ANSI_S:
-            if event.modifierFlags.contains(.command), phase == .confirmed {
+            if event.modifierFlags.contains(.command), phase == .editing || phase == .confirmed {
                 controller.perform(action: .save)
             } else {
                 super.keyDown(with: event)
             }
+        case kVK_ANSI_Z:
+            if event.modifierFlags.contains(.command) {
+                if event.modifierFlags.contains(.shift) {
+                    controller.redoAnnotation()
+                } else {
+                    controller.undoAnnotation()
+                }
+            } else {
+                super.keyDown(with: event)
+            }
+        case kVK_ANSI_H:
+            if phase == .editing {
+                controller.toggleToolbarVisibility()
+            } else {
+                super.keyDown(with: event)
+            }
         default:
+            // 热键 1-6 直选工具（R6）
+            if phase == .editing,
+               let tool = toolFor(keyCode: Int(event.keyCode)) {
+                editorSession?.currentTool = tool
+                controller.refreshToolbar()
+                needsDisplay = true
+                return
+            }
             super.keyDown(with: event)
         }
+    }
+
+    private func toolFor(keyCode: Int) -> EditorSession.Tool? {
+        let map = [
+            kVK_ANSI_1: EditorSession.Tool.arrow,
+            kVK_ANSI_2: EditorSession.Tool.rect,
+            kVK_ANSI_3: EditorSession.Tool.text,
+            kVK_ANSI_4: EditorSession.Tool.mosaic,
+            kVK_ANSI_5: EditorSession.Tool.sequence,
+            kVK_ANSI_6: EditorSession.Tool.highlight,
+        ]
+        return map[keyCode]
+    }
+
+    // MARK: - 坐标换算
+
+    /// 视图本地（Y 向下，屏幕点）→ 标注几何（选区本地 Y 向下 point）
+    private func localToAnnotation(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: p.x - editorRectLocal.minX, y: p.y - editorRectLocal.minY)
+    }
+
+    /// 标注几何 → 视图本地
+    private func annotationToLocal(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: p.x + editorRectLocal.minX, y: p.y + editorRectLocal.minY)
+    }
+
+    private func annotationRect(_ r: CGRect) -> CGRect {
+        CGRect(
+            x: r.minX - editorRectLocal.minX, y: r.minY - editorRectLocal.minY,
+            width: r.width, height: r.height
+        )
+    }
+
+    private func unionRect(_ r: CGRect, _ point: CGPoint) -> CGRect {
+        CGRect(
+            x: min(r.minX, point.x), y: min(r.minY, point.y),
+            width: abs(point.x - (r.minX + r.width)) , height: abs(point.y - (r.minY + r.height))
+        )
+    }
+
+    /// 本地选区矩形（Y 向下）→ AppKit 全局（Y 向上）
+    private func convertToGlobalRect(_ local: CGRect) -> CGRect {
+        guard let windowFrame = window?.frame else { return local }
+        return CGRect(
+            x: windowFrame.minX + local.minX,
+            y: windowFrame.maxY - local.maxY,
+            width: local.width,
+            height: local.height
+        )
     }
 
     // MARK: - 绘制
@@ -153,86 +433,95 @@ final class OverlayView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-        // 1. 全屏蒙层（选区外）
-        ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
-        ctx.fill(bounds)
-
-        if selectionLocal.width > 0 || selectionLocal.height > 0 {
-            let showBadge = (phase != .waitingForDrag)
-
-            // 2. 选区“挖空”蒙层（clear 混合模式）
-            ctx.saveGState()
-            ctx.setBlendMode(.clear)
-            ctx.fill(selectionLocal)
-            ctx.restoreGState()
-
-            // 3. 选区描边（白底 + 深色内衬，模拟系统截图的双层描边）
-            ctx.saveGState()
-            ctx.setStrokeColor(NSColor.white.cgColor)
-            ctx.setLineWidth(borderWidth)
-            ctx.stroke(selectionLocal)
-            ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.6).cgColor)
-            ctx.setLineWidth(0.5)
-            let inset = borderWidth / 2 + 0.5
-            ctx.stroke(selectionLocal.insetBy(dx: inset, dy: inset))
-            ctx.restoreGState()
-
-            // 4. 尺寸角标（选区右下角外侧）
-            if showBadge {
-                let scale = window?.screen?.backingScaleFactor ?? 1
-                let sizeText = "\(Int(selectionLocal.width * scale))×\(Int(selectionLocal.height * scale))"
-                drawBadge(text: sizeText, near: selectionLocal, ctx: ctx, scale: scale)
-
-                // 5. 确认态提示条
-                if phase == .confirmed {
-                    drawHint(ctx: ctx)
-                }
-            }
+        switch phase {
+        case .editing:
+            drawEditor(ctx: ctx)
+        default:
+            drawSelection(ctx: ctx)
         }
     }
 
-    /// 尺寸角标：黑底白字胶囊，跟随选区右下角（不超出屏幕）
-    private func drawBadge(text: String, near rect: CGRect, ctx: CGContext, scale: CGFloat) {
+    /// 选区阶段：蒙层 + 橡皮筋 + 角标 + 提示
+    private func drawSelection(ctx: CGContext) {
+        // 1. 蒙层
+        ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
+        ctx.fill(bounds)
+
+        guard selectionLocal.width > 0 || selectionLocal.height > 0 else { return }
+
+        // 2. 挖空
+        ctx.saveGState()
+        ctx.setBlendMode(.clear)
+        ctx.fill(selectionLocal)
+        ctx.restoreGState()
+
+        // 3. 描边
+        ctx.setStrokeColor(NSColor.white.cgColor)
+        ctx.setLineWidth(borderWidth)
+        ctx.stroke(selectionLocal)
+
+        // 4. 尺寸角标
+        if phase != .waitingForDrag {
+            let scale = window?.screen?.backingScaleFactor ?? 1
+            let sizeText = "\(Int(selectionLocal.width * scale))×\(Int(selectionLocal.height * scale))"
+            drawBadge(text: sizeText, below: selectionLocal)
+        }
+    }
+
+    /// 编辑阶段：选区外蒙层 + 选区内冻结底图 + 标注层
+    private func drawEditor(ctx: CGContext) {
+        guard let session = editorSession else { return }
+
+        // 1. 选区外蒙层（比选区阶段浅，弱化干扰）
+        ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha * 0.7).cgColor)
+        ctx.fill(bounds)
+        ctx.saveGState()
+        ctx.setBlendMode(.clear)
+        ctx.fill(editorRectLocal)
+        ctx.restoreGState()
+
+        // 2. 冻结底图（像素 → point 直绘；isFlipped 上下文 Y 向下 ✓）
+        ctx.saveGState()
+        ctx.clip(to: editorRectLocal)
+        ctx.draw(session.baseImage, in: editorRectLocal)
+        // 3. 标注层（同一渲染器 = 导出所见）
+        let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
+        CGRenderer.render(annotations: annotations, in: editorRectLocal.size, context: ctx)
+        ctx.restoreGState()
+
+        // 4. 选区描边（编辑态的画布边界）
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.setLineWidth(1)
+        ctx.stroke(editorRectLocal)
+
+        // 5. 文字提示（无标注时）
+        if session.store.annotations.isEmpty && pendingAnnotation == nil && textField == nil {
+            drawHintText("工具栏选工具，热键 1-6 直选 · H 隐藏工具栏 · Enter 复制 · Esc 取消")
+        }
+    }
+
+    private func drawBadge(text: String, below rect: CGRect) {
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: badgeFontSize, weight: .medium),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
             .foregroundColor: NSColor.white,
         ]
         let textSize = (text as NSString).size(withAttributes: attributes)
         let padding: CGFloat = 6
-        let badgeSize = CGSize(
-            width: ceil(textSize.width + padding * 2),
-            height: ceil(textSize.height + padding)
-        )
-        // 锚点：选区右下角（视图本地坐标 Y 向上 → minY 侧）
-        var origin = CGPoint(
-            x: rect.maxX - badgeSize.width,
-            y: rect.minY - badgeSize.height - 6
-        )
-        // 边界保护
-        if origin.y < 0 { origin.y = rect.maxY + 6 }
-        if origin.x < 0 { origin.x = 0 }
-        if origin.x + badgeSize.width > bounds.width {
-            origin.x = bounds.width - badgeSize.width
-        }
-        let badgeRect = CGRect(origin: origin, size: badgeSize)
-        let path = CGPath(
-            roundedRect: badgeRect,
-            cornerWidth: badgeSize.height / 2,
-            cornerHeight: badgeSize.height / 2,
-            transform: nil
-        )
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
-        ctx.addPath(path)
-        ctx.fillPath()
-        (text as NSString).draw(
-            at: CGPoint(x: origin.x + padding, y: origin.y + padding / 2),
-            withAttributes: attributes
-        )
+        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + padding))
+        var origin = CGPoint(x: rect.maxX - size.width, y: min(rect.maxY + 6, bounds.height - size.height))
+        if origin.y + size.height > bounds.height { origin.y = rect.minY - size.height - 6 }
+        if origin.y < 0 { origin.y = 4 }
+        if origin.x < 0 { origin.x = 4 }
+        let badgeRect = CGRect(origin: origin, size: size)
+        let path = CGPath(roundedRect: badgeRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
+        let ctx = NSGraphicsContext.current?.cgContext
+        ctx?.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
+        ctx?.addPath(path)
+        ctx?.fillPath()
+        (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + padding / 2), withAttributes: attributes)
     }
 
-    /// 确认态提示：选区上方居中的操作提示胶囊
-    private func drawHint(ctx: CGContext) {
-        let text = "Enter 复制 · ⌘S 保存 · Esc 取消 · 双击复制"
+    private func drawHintText(_ text: String) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12),
             .foregroundColor: NSColor.white,
@@ -241,19 +530,46 @@ final class OverlayView: NSView {
         let padding: CGFloat = 8
         let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + 4))
         var origin = CGPoint(
-            x: selectionLocal.midX - size.width / 2,
-            y: selectionLocal.maxY + 8
+            x: editorRectLocal.midX - size.width / 2,
+            y: editorRectLocal.maxY + 8
         )
         if origin.y + size.height > bounds.height {
-            origin.y = selectionLocal.minY - size.height - 8
+            origin.y = editorRectLocal.minY - size.height - 8
         }
-        if origin.x < 8 { origin.x = 8 }
-        if origin.x + size.width > bounds.width - 8 { origin.x = bounds.width - 8 - size.width }
+        origin.x = min(max(origin.x, 8), bounds.width - 8 - size.width)
         let rect = CGRect(origin: origin, size: size)
-        let path = CGPath(roundedRect: rect, cornerWidth: 6, cornerHeight: 6, transform: nil)
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
-        ctx.addPath(path)
-        ctx.fillPath()
+        let ctx = NSGraphicsContext.current?.cgContext
+        ctx?.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
+        ctx?.fill(CGPath(roundedRect: rect, cornerWidth: 6, cornerHeight: 6, transform: nil).boundingBox)
         (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 2), withAttributes: attributes)
     }
+}
+
+// MARK: - 文字输入框委托（Enter 落库 / Esc 取消在 keyDown 里处理不了 field 的，走 doCommandBy）
+
+extension OverlayView: NSTextFieldDelegate {
+    nonisolated func control(_: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        MainActor.assumeIsolated {
+            switch commandSelector {
+            case #selector(NSResponder.insertNewline(_:)):
+                commitTextFieldIfNeeded()
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                textField?.removeFromSuperview()
+                textField = nil
+                textFieldAnchor = nil
+                window?.makeFirstResponder(self)
+                return true
+            default:
+                return false
+            }
+        }
+    }
+}
+
+// MARK: - 辅助
+
+private extension NSRect {
+    /// 粗粒度：编辑态选区外光标区域（功能先行，视觉后调）
+    func minus(_ other: NSRect) -> NSRect { self }
 }

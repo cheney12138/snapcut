@@ -97,15 +97,35 @@ extension AppCoordinator {
                       let screen = NSScreen.main else { return }
                 let rect = CGRect(x: 100, y: screen.frame.height - 400, width: 400, height: 300)
                 overlay.simulateSelection(rect: rect, on: screen)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                    _ = self?.overlayController?.performForSelfTest(.copy)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                        let active = NSApp.isActive
-                        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
-                        Log.event(.app, "selftest.done", [
-                            "isActive": "\(active)",
-                            "frontmost": front,
-                        ])
+                // 等编辑态就绪（底图冻结 + 工具栏出现）后，落几个真实标注再导出
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    guard let self, let session = self.overlayController?.editorSession else { return }
+                    session.store.add(AnnotationModel(
+                        shape: .arrow(from: CGPoint(x: 40, y: 30), to: CGPoint(x: 200, y: 180)),
+                        colorIndex: 0, strokeWidth: 2, text: nil, index: nil))
+                    session.store.add(AnnotationModel(
+                        shape: .rect(CGRect(x: 50, y: 60, width: 120, height: 80)),
+                        colorIndex: 1, strokeWidth: 2, text: nil, index: nil))
+                    session.store.add(AnnotationModel(
+                        shape: .text(anchor: CGPoint(x: 60, y: 100)), colorIndex: 0,
+                        strokeWidth: 2, text: "Snapcut selftest", index: nil))
+                    session.store.add(AnnotationModel(
+                        shape: .sequence(anchor: CGPoint(x: 150, y: 50)), colorIndex: 4,
+                        strokeWidth: 2, text: nil, index: session.store.consumeSequenceNumber()))
+                    session.store.add(AnnotationModel(
+                        shape: .mosaic(CGRect(x: 180, y: 120, width: 90, height: 60)),
+                        colorIndex: 0, strokeWidth: 2, text: nil, index: nil))
+                    Log.event(.app, "selftest.annotationsAdded", ["count": "5"])
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        _ = self?.overlayController?.performForSelfTest(.copy)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                            let active = NSApp.isActive
+                            let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "?"
+                            Log.event(.app, "selftest.done", [
+                                "isActive": "\(active)",
+                                "frontmost": front,
+                            ])
+                        }
                     }
                 }
             }
