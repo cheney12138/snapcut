@@ -17,9 +17,11 @@ struct AnnotationModel: Equatable {
 
     var shape: Shape
     var colorIndex: Int   // 调色板索引（功能先行：0 红 1 蓝 2 黄 3 黑 4 白）
-    var strokeWidth: Int  // 1=细 2=中 3=粗
+    var strokeWidth: CGFloat  // 连续 2-6pt（滑杆无极调节；绘制端 width = max(1.5, strokeWidth)）
     var text: String?     // text shape 专用
     var index: Int?       // sequence shape 专用
+    var fontSize: CGFloat = 14  // text shape 专用（4 档 12/14/17/21，默认 14；
+                                // 带默认值 ⇒ memberwise 构造器对既有调用点保持兼容）
 
     /// 调色板（领域值类型，UI 负责转 NSColor/CGColor）
     static let palette: [RGBAColor] = [.red, .blue, .yellow, .black, .white]
@@ -63,8 +65,19 @@ final class AnnotationStore {
     var canUndo: Bool { !undoStack.isEmpty }
     var canRedo: Bool { !redoStack.isEmpty }
 
-    /// 序号工具的下一个值（本次截图会话内连续）
-    private var nextSequence = 1
+    /// 序号工具的下一个值（Snow Shot 同款「派生」语义）
+    ///
+    /// ⚠️ 不是自增计数器：旧实现 mouseDown 时 nextSequence += 1，撤销不回退 ⇒
+    /// 撤销后下一个序号跳号（用户实报「序号也有问题」）。改为从当前画面上
+    /// 可见的序号标注派生：最大已有序号 + 1（等价「可见序号数 + 1」，且
+    /// 中间撤销时不会与既有序号撞号）。
+    func nextSequenceNumber() -> Int {
+        let maxExisting = annotations.compactMap { $0.index }.max() ?? 0
+        return maxExisting + 1
+    }
+
+    /// 兼容旧调用点（AppCoordinator selftest 等）；语义已改为派生值（见上）
+    func consumeSequenceNumber() -> Int { nextSequenceNumber() }
 
     func add(_ annotation: AnnotationModel) {
         pushUndo()
@@ -91,14 +104,6 @@ final class AnnotationStore {
         pushUndo()
         annotations = annotations.map { $0.offsetBy(dx: dx, dy: dy) }
     }
-
-    func consumeSequenceNumber() -> Int {
-        let n = nextSequence
-        nextSequence += 1
-        return n
-    }
-
-    func resetSequence() { nextSequence = 1 }
 
     private func pushUndo() {
         undoStack.append(annotations)

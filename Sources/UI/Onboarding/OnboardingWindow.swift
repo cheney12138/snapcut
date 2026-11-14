@@ -107,7 +107,10 @@ final class OnboardingWindow: NSPanel {
                 ? (permissionGranted ? NSColor.systemGreen : NSColor.systemOrange)
                 : NSColor.white.withAlphaComponent(0.92)
             let valueWidth: CGFloat = isPermission ? 90 : 120
-            value.frame = NSRect(x: size.width - pad - valueWidth - (isPermission ? 78 : 0),
+            // 病例（用户实报「已授权没有靠右」）：78pt 按钮预留位在已授权时也生效了，
+            // 文字卡在中间。只有未授权（真的有「去授权」按钮）才需要让位。
+            let buttonInset: CGFloat = (isPermission && !permissionGranted) ? 78 : 0
+            value.frame = NSRect(x: size.width - pad - valueWidth - buttonInset,
                                  y: y - rowHeight + 2, width: valueWidth, height: 18)
             card.addSubview(value)
             if isPermission { permissionRowValue = value }

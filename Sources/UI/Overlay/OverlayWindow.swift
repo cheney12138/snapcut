@@ -506,7 +506,7 @@ final class OverlayView: NSView {
                 shape: .sequence(anchor: localToAnnotation(point)),
                 colorIndex: session.colorIndex,
                 strokeWidth: session.strokeWidth,
-                index: session.store.consumeSequenceNumber()
+                index: session.store.nextSequenceNumber()
             ))
         case .arrow:
             pendingStartPoint = localToAnnotation(point)
@@ -709,17 +709,26 @@ final class OverlayView: NSView {
 
     // MARK: - 文字输入
 
+    /// 4 档字号（与 session.textFontSize 同源）
+    private static let textFontSizes: [Int] = [12, 14, 17, 21]
+
+    /// 浮动字号选择条（工具栏由并行任务占用，字号档位先在这里给：
+    /// 输入框上方一排 4 个小按钮，点选即改 session 档位并实时套到输入框）
+    private var fontSizePicker: NSSegmentedControl?
+
     private func beginTextEditing(at annotationPoint: CGPoint) {
         // 已有输入框先落库
         commitTextFieldIfNeeded()
 
+        let pointSize = CGFloat(editorSession?.textFontSize
+            ?? OverlayView.textFontSizes[1])
         let localPoint = annotationToLocal(annotationPoint)
         let field = NSTextField(frame: NSRect(
             x: localPoint.x, y: localPoint.y - 14,
             width: max(120, editorRectLocal.width - localPoint.x),
             height: 24
         ))
-        field.font = .systemFont(ofSize: 14, weight: .medium)
+        field.font = .systemFont(ofSize: pointSize, weight: .medium)
         if let colorIndex = editorSession?.colorIndex, AnnotationModel.palette.indices.contains(colorIndex) {
             field.textColor = NSColor(cgColor: AnnotationModel.palette[colorIndex].cgColor) ?? .red
         }
@@ -730,8 +739,42 @@ final class OverlayView: NSView {
         addSubview(field)
         window?.makeFirstResponder(field)
         textField = field
+        installFontSizePicker(near: localPoint)
         // 记录落点（确认时生成标注）
         textFieldAnchor = annotationPoint
+    }
+
+    /// 浮动 4 档字号选择条（Aa12/Aa14/Aa17/Aa21）：贴在输入框上方，
+    /// 放不下（贴近画布顶部/屏幕顶）则改到输入框下方，并夹在可视范围内
+    private func installFontSizePicker(near fieldOrigin: CGPoint) {
+        let labels = OverlayView.textFontSizes.map { "Aa\($0)" }
+        let picker = NSSegmentedControl(
+            labels: labels,
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(fontSizePickerChanged(_:))
+        )
+        picker.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        picker.selectedSegment = OverlayView.textFontSizes.firstIndex(of: editorSession?.textFontSize ?? 14) ?? 1
+        picker.sizeToFit()
+        let size = picker.frame.size
+        let aboveY = fieldOrigin.y - 14 - size.height - 4
+        var origin = CGPoint(x: fieldOrigin.x, y: aboveY >= editorRectLocal.minY ? aboveY : fieldOrigin.y + 14)
+        origin.x = min(max(origin.x, 4), bounds.width - size.width - 4)
+        origin.y = min(max(origin.y, 4), bounds.height - size.height - 4)
+        picker.frame = CGRect(origin: origin, size: size)
+        addSubview(picker)
+        fontSizePicker = picker
+    }
+
+    @objc private func fontSizePickerChanged(_ sender: NSSegmentedControl) {
+        let index = sender.selectedSegment
+        guard OverlayView.textFontSizes.indices.contains(index) else { return }
+        let size = OverlayView.textFontSizes[index]
+        editorSession?.textFontSize = size
+        // 实时套用到正在编辑的输入框（所见 = 所选）
+        textField?.font = .systemFont(ofSize: CGFloat(size), weight: .medium)
+        Log.event(.editor, "editor.text.fontSize", ["size": "\(size)"])
     }
 
     private var textFieldAnchor: CGPoint?
@@ -744,17 +787,26 @@ final class OverlayView: NSView {
         guard let field = textField, let anchor = textFieldAnchor, let session = editorSession else { return }
         let text = field.stringValue
         field.removeFromSuperview()
+        removeFontSizePicker()
         if !text.isEmpty {
             controller.addAnnotation(AnnotationModel(
                 shape: .text(anchor: anchor),
                 colorIndex: session.colorIndex,
                 strokeWidth: session.strokeWidth,
-                text: text
+                text: text,
+                index: nil,
+                fontSize: CGFloat(session.textFontSize)
             ))
         }
         textField = nil
         textFieldAnchor = nil
         window?.makeFirstResponder(self)
+    }
+
+    /// Esc/提交后一并拆掉浮动字号条
+    private func removeFontSizePicker() {
+        fontSizePicker?.removeFromSuperview()
+        fontSizePicker = nil
     }
 
     override func keyUp(with event: NSEvent) {
@@ -810,6 +862,7 @@ final class OverlayView: NSView {
                 textField?.removeFromSuperview()
                 textField = nil
                 textFieldAnchor = nil
+                removeFontSizePicker()
                 window?.makeFirstResponder(self)
                 return
             }
@@ -1057,13 +1110,31 @@ final class OverlayView: NSView {
         // 坐标处理：CGContext.draw 假设 Y-up；本视图 Y-down ⇒ 局部翻转一次
         // 再 draw，方向即正确（病例三连：①不翻=倒置 ②NSImage.draw 按 point
         // size 重采样=模糊+错位 ③正确解=显式翻转+像素尺寸矩形）
+        let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
+
+        // 2.5 马赛克预览：已提交 + 拖拽中（pending）的 mosaic 都走与导出 composite
+        // 完全相同的像素化算法（CGRenderer.applyMosaic → 「编辑器所见 = 导出所得」）。
+        // ⚠️ 病例：马赛克只有矢量层 5% 黑罩时，选区内拖拽看不到任何效果
+        //（用户实报「点了没反应」）——必须在底图上真实打码才有拖拽反馈。
+        let hasMosaic = annotations.contains { annotation in
+            if case .mosaic = annotation.shape { return true }
+            return false
+        }
+        let baseForDraw: CGImage
+        if hasMosaic {
+            baseForDraw = CGRenderer.renderMosaicPreview(
+                base: session.baseImage, annotations: annotations, scale: session.scale
+            )
+        } else {
+            baseForDraw = session.baseImage
+        }
         ctx.saveGState()
         ctx.clip(to: editorRectLocal)
         ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
         ctx.scaleBy(x: 1, y: -1)
         ctx.translateBy(x: -editorRectLocal.minX, y: -editorRectLocal.minY)
         ctx.interpolationQuality = .none
-        ctx.draw(session.baseImage, in: editorRectLocal)
+        ctx.draw(baseForDraw, in: editorRectLocal)
         ctx.restoreGState()
 
         // 3. 标注层（同一渲染器 = 导出所见）
@@ -1071,7 +1142,6 @@ final class OverlayView: NSView {
         // 准备的绝对坐标翻转，标注却是选区局部坐标 → 画出来必然被 clip 裁光
         // （用户实报：矩形工具画不出任何东西；log 里 shape.commit 都在，屏幕零像素）。
         // 正确姿势：回到视图原生 Y-down CTM，clip 选区 + 平移原点即可。
-        let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
         Log.event(.editor, "editor.draw", [
             "count": "\(annotations.count)", "shapes": annotations.map { "\($0.shape)" }.joined(separator: "|"),
         ])
@@ -1223,6 +1293,7 @@ extension OverlayView: NSTextFieldDelegate {
                 textField?.removeFromSuperview()
                 textField = nil
                 textFieldAnchor = nil
+                removeFontSizePicker()
                 window?.makeFirstResponder(self)
                 return true
             default:

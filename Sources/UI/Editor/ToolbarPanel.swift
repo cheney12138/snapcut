@@ -5,15 +5,15 @@ import CoreGraphics
 ///
 /// 视觉真源：`html-pages/snapcut-design/index.html` 第 7 节 `.toolbar / .tb-btn /
 /// .tb-colors / .tb-widths / .tb-primary`。逐条对齐（CSS px = pt）：
-/// - 面板：padding 5/6、radius 12、rgba(38,38,43,.60) + blur(.hudWindow)、
+/// - 面板：padding 8/8（v0.4 呼吸感，8pt 栅格）、radius 12、rgba(38,38,43,.60) + blur(.hudWindow)、
 ///   border 0.5pt 白 16%、inset 高光 0 1px 0 白 14%、
 ///   双层投影 0 14px 34px -8px rgba(0,0,0,.55) + 0 2px 6px rgba(0,0,0,.30)
 /// - 按钮：28×28、radius 8、图标 17pt、默认白 82%、hover 白 12% + 上移 2pt，
 ///   选中 #0A84FF + inset 白高光 0 1px 0 白 30% + 蓝色外发光 0 2px 8px rgba(10,132,255,.42)
-/// - 颜色点 15px（选中：白 1.5px 环 + 外圈 3px 黑 32% 环）、间距 5
-/// - 粗细三档 26×28 内横条 13pt 宽、高度 2/4/6（原型 1.5/3/5 的整数化，保证 2x 屏一眼可分）
-/// - 主按钮「复制」28 高、padding 0 10、margin 0 2、11.5pt semibold、图标 14pt
-/// - 分隔线 0.5×17、margin 0 5px（叠加 flex gap 1 ⇒ 按钮到分隔线 6pt）
+/// - 颜色点 15px（选中：白 1.5px 环 + 外圈 3px 黑 32% 环）、间距 8
+/// - 主按钮「复制」纯图标方形胶囊 30×28（tooltip「复制并完成 ↩」保留）
+/// - 粗细：连续滑杆 2-6pt（tickless + continuous，实时生效；下一个新标注用当前值）
+/// - 分隔线 0.5×17、左右各 8pt（叠加栈间距 8 ⇒ 线到内容 16pt）
 /// - 悬停提示：深色胶囊（10.5pt，上方 8pt，阴影 0 6px 16px 黑 35%）
 ///
 /// 结构要点：按钮的蓝色发光与 hover 态不能被裁剪 ⇒ 栈不放进 effect view
@@ -22,19 +22,22 @@ import CoreGraphics
 ///
 /// 铁律：nonactivatingPanel（不抢激活）；点击不 makeKey。
 
-/// 视觉 token（照抄原型 CSS，单位 pt；px == pt）——文件级私有，按钮类共用
+/// 视觉 token（原型 CSS 为基线 + 8pt 栅格拉档，单位 pt；px == pt）——文件级私有，按钮类共用
+/// 呼吸感改造（v0.4）：栈间距 1→8、面板 padding 5/6→8/8（面板高 38→44）、
+/// 分区之间分隔线左右各 8（叠加栈间距 8 ⇒ 线到内容 16pt），色点间距 5→8
 private enum TBStyle {
-    static let paddingH: CGFloat = 6
-    static let paddingV: CGFloat = 5
+    static let paddingH: CGFloat = 8
+    static let paddingV: CGFloat = 8
     static let cornerRadius: CGFloat = 12
     static let buttonSide: CGFloat = 28
     static let buttonRadius: CGFloat = 8
     static let iconSize: CGFloat = 17
     static let separatorWidth: CGFloat = 0.5
     static let separatorHeight: CGFloat = 17
-    static let separatorMargin: CGFloat = 5
+    static let separatorMargin: CGFloat = 8
     static let dotSide: CGFloat = 15
-    static let dotGap: CGFloat = 5
+    static let dotGap: CGFloat = 8
+    static let sliderWidth: CGFloat = 88
     static let accent = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1)        // #0A84FF
     static let accentHover = NSColor(srgbRed: 0.102, green: 0.549, blue: 1.0, alpha: 1)   // #1A8CFF
     static let accentGlow = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 0.42) // rgba(10,132,255,.42)
@@ -56,7 +59,7 @@ final class ToolbarPanel: NSPanel {
     private var rootStack: NSStackView!
     private var toolButtons: [EditorSession.Tool: TBToolButton] = [:]
     private var colorButtons: [TBColorButton] = []
-    private var widthButtons: [TBWidthButton] = []
+    private var strokeWidthSlider: NSSlider!
     private var undoButton: TBIconButton!
     private var redoButton: TBIconButton!
     private var eyeButton: TBIconButton?
@@ -64,7 +67,7 @@ final class ToolbarPanel: NSPanel {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 38),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 44),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -85,6 +88,7 @@ final class ToolbarPanel: NSPanel {
         self.session = session
         self.onToolChange = onToolChange
         self.onAction = onAction
+        strokeWidthSlider.doubleValue = Double(session.strokeWidth)
         refreshSelectionState()
     }
 
@@ -130,7 +134,7 @@ final class ToolbarPanel: NSPanel {
         let stack = NSStackView()
         stack.orientation = .horizontal
         stack.alignment = .centerY
-        stack.spacing = 1
+        stack.spacing = 8    // 8pt 栅格：控件间距（旧值 1）
         stack.edgeInsets = NSEdgeInsets(top: TBStyle.paddingV, left: TBStyle.paddingH,
                                         bottom: TBStyle.paddingV, right: TBStyle.paddingH)
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -183,21 +187,22 @@ final class ToolbarPanel: NSPanel {
 
         stack.addArrangedSubview(makeSeparator())
 
-        // 3) 三档粗细（.tb-widths：gap 1）
-        let widthsGroup = NSStackView(views: [])
-        widthsGroup.orientation = .horizontal
-        widthsGroup.alignment = .centerY
-        widthsGroup.spacing = 1
-        for width in 1...3 {
-            let button = TBWidthButton(level: width)
-            button.tag = width
-            button.target = self
-            button.action = #selector(strokeTapped(_:))
-            button.onHover = { [weak self] inside in self?.handleHover(inside, button: button, text: self?.widthName(width) ?? "粗细") }
-            widthButtons.append(button)
-            widthsGroup.addArrangedSubview(button)
-        }
-        stack.addArrangedSubview(widthsGroup)
+        // 3) 粗细连续滑杆（2-6pt 实时生效：下一个新标注用当前值，已有标注不变）
+        let slider = TBStrokeSlider(value: 2, minValue: 2, maxValue: 6, target: self, action: #selector(strokeSliderChanged(_:)))
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        let sliderHolder = NSView()
+        sliderHolder.translatesAutoresizingMaskIntoConstraints = false
+        sliderHolder.addSubview(slider)
+        NSLayoutConstraint.activate([
+            slider.leadingAnchor.constraint(equalTo: sliderHolder.leadingAnchor),
+            slider.trailingAnchor.constraint(equalTo: sliderHolder.trailingAnchor),
+            slider.centerYAnchor.constraint(equalTo: sliderHolder.centerYAnchor),
+            sliderHolder.widthAnchor.constraint(equalToConstant: TBStyle.sliderWidth),
+            sliderHolder.heightAnchor.constraint(equalToConstant: TBStyle.buttonSide),
+        ])
+        slider.onHover = { [weak self] inside in self?.handleHover(inside, button: sliderHolder, text: "粗细") }
+        strokeWidthSlider = slider
+        stack.addArrangedSubview(sliderHolder)
 
         stack.addArrangedSubview(makeSeparator())
 
@@ -241,13 +246,13 @@ final class ToolbarPanel: NSPanel {
         eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 H") }
         stack.addArrangedSubview(eye)
 
-        // 6) 主按钮「复制」（margin 0 2）+ 保存 + 关闭
-        let copy = TBPrimaryButton(symbol: "doc.on.doc", title: "复制")
+        // 6) 主按钮「复制」（纯图标方形胶囊 30×28，tooltip 保留）+ 保存 + 关闭
+        let copy = TBPrimaryButton(symbol: "doc.on.doc")
         copy.tag = 201
         copy.target = self
         copy.action = #selector(actionTapped(_:))
         copy.onHover = { [weak self] inside in self?.handleHover(inside, button: copy, text: "复制并完成 ↩") }
-        stack.addArrangedSubview(wrapWithMargin(copy, margin: 2))
+        stack.addArrangedSubview(copy)
 
         let save = TBIconButton(symbol: "square.and.arrow.down", fallback: "存")
         save.tag = 202
@@ -267,23 +272,6 @@ final class ToolbarPanel: NSPanel {
         root.layoutSubtreeIfNeeded()
         let fitting = root.fittingSize
         setContentSize(fitting)
-    }
-
-    /// CSS margin 0 Npx：包一层左右各 Npt 的定宽容器（栈间距 1 照常叠加）
-    private func wrapWithMargin(_ view: NSView, margin: CGFloat) -> NSView {
-        let wrapper = NSView()
-        wrapper.translatesAutoresizingMaskIntoConstraints = false
-        wrapper.addSubview(view)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: margin),
-            view.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -margin),
-            view.centerYAnchor.constraint(equalTo: wrapper.centerYAnchor),
-            wrapper.heightAnchor.constraint(equalToConstant: TBStyle.buttonSide),
-        ])
-        // 宽度 = 内容自适应宽 + 两侧 margin；在布局后由 fitting 决定，
-        // 这里用 >= 兜底，最终面板宽度由 fittingSize 算出
-        wrapper.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-        return wrapper
     }
 
     private func makeShadowView(radius: CGFloat, offset: CGSize, alpha: CGFloat, spread: CGFloat) -> NSView {
@@ -339,10 +327,6 @@ final class ToolbarPanel: NSPanel {
 
     private func colorName(_ index: Int) -> String {
         ["红", "蓝", "黄", "黑", "白"][index % 5]
-    }
-
-    private func widthName(_ level: Int) -> String {
-        ["细", "中", "粗"][level - 1]
     }
 
     // MARK: - 位置（选区下方 12pt，放不下翻上方）+ spring 出场
@@ -430,9 +414,7 @@ final class ToolbarPanel: NSPanel {
         for (i, button) in colorButtons.enumerated() {
             button.setSelected(i == session.colorIndex)
         }
-        for button in widthButtons {
-            button.setSelected(button.tag == session.strokeWidth)
-        }
+        strokeWidthSlider.doubleValue = Double(session.strokeWidth)
         undoButton.isEnabled = session.store.canUndo
         redoButton.isEnabled = session.store.canRedo
         // 病例：仅靠 isEnabled 的 didSet→alphaValue 在首次 build 时可能不生效，
@@ -476,10 +458,10 @@ final class ToolbarPanel: NSPanel {
         refreshSelectionState()
     }
 
-    @objc private func strokeTapped(_ sender: NSButton) {
-        Log.event(.editor, "toolbar.stroke", ["width": "\(sender.tag)"])
-        session?.strokeWidth = sender.tag
-        refreshSelectionState()
+    @objc private func strokeSliderChanged(_ sender: NSSlider) {
+        let width = CGFloat(sender.doubleValue)
+        session?.strokeWidth = width
+        Log.event(.editor, "toolbar.stroke", ["width": String(format: "%.1f", width)])
     }
 
     @objc private func actionTapped(_ sender: NSButton) {
@@ -821,61 +803,43 @@ private final class TBColorButton: NSButton {
     }
 }
 
-// MARK: - 粗细档（26×28，横条 13pt 宽、高 2/4/6）
+// MARK: - 粗细连续滑杆（tickless + continuous，2-6pt 实时）
 
 @MainActor
-private final class TBWidthButton: TBIconButton {
-    private let bar = NSView()
-    let level: Int
-    private var isOn = false
+private final class TBStrokeSlider: NSSlider {
+    var onHover: ((Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
 
-    init(level: Int) {
-        self.level = level
-        super.init(symbol: "", fallback: "")
-        // 父类没给图：粗细档全靠横条
-        image = nil
-        title = ""
-        widthConstraint.constant = 26
-        let barHeight: CGFloat = CGFloat(level * 2)   // 2 / 4 / 6，三档一眼可分
-        bar.translatesAutoresizingMaskIntoConstraints = false
-        bar.wantsLayer = true
-        bar.layer?.cornerRadius = barHeight / 2       // 胶囊端头（CSS border-radius 3px）
-        bar.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.82).cgColor
-        addSubview(bar)
-        NSLayoutConstraint.activate([
-            bar.centerXAnchor.constraint(equalTo: centerXAnchor),
-            bar.centerYAnchor.constraint(equalTo: centerYAnchor),
-            bar.widthAnchor.constraint(equalToConstant: 13),
-            bar.heightAnchor.constraint(equalToConstant: barHeight),
-        ])
+    init(value: Double, minValue: Double, maxValue: Double, target: AnyObject?, action: Selector?) {
+        super.init(frame: .zero)   // NSSlider 的便捷初始化器不是 designated，从 frame 走
+        self.minValue = minValue
+        self.maxValue = maxValue
+        self.doubleValue = value
+        self.target = target
+        self.action = action
+        sliderType = .linear
+        isContinuous = true          // 拖动中实时回调
+        numberOfTickMarks = 0        // tickless：无刻度、无档位吸附
+        allowsTickMarkValuesOnly = false
+        controlSize = .small
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    /// ⚠️ 同颜色点：bar 子视图会吞掉 mouseDown，命中测试必须指回按钮自身
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        bounds.contains(convert(point, from: superview)) ? self : nil
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
+        addTrackingArea(area)
+        trackingArea = area
     }
 
-    override func setSelected(_ isOn: Bool) {
-        self.isOn = isOn
-        super.setSelected(isOn)
-        // 颜色跟随选中态（CSS currentColor：默认白 82%，选中/hover 白）
-        bar.layer?.backgroundColor = (isOn ? TBStyle.iconActive : TBStyle.iconIdle).cgColor
-    }
-
-    override func applyStyle() {
-        super.applyStyle()
-        if !isOn, isHot {
-            bar.layer?.backgroundColor = NSColor.white.cgColor
-        } else {
-            bar.layer?.backgroundColor = (isOn ? TBStyle.iconActive : TBStyle.iconIdle).cgColor
-        }
-    }
+    override func mouseEntered(with event: NSEvent) { onHover?(true) }
+    override func mouseExited(with event: NSEvent) { onHover?(false) }
 }
 
-// MARK: - 主按钮（#0A84FF 胶囊：图标 + 「复制」）
+// MARK: - 主按钮（#0A84FF 方形胶囊：纯图标，tooltip「复制并完成 ↩」）
 
 @MainActor
 private final class TBPrimaryButton: NSButton {
@@ -883,17 +847,16 @@ private final class TBPrimaryButton: NSButton {
     private var trackingArea: NSTrackingArea?
     private var isHot = false
 
-    init(symbol: String, title: String) {
+    init(symbol: String) {
         super.init(frame: .zero)
         isBordered = false
         bezelStyle = .regularSquare
-        self.title = title
-        font = .systemFont(ofSize: 11.5, weight: .semibold)
+        title = ""                          // 去字：纯图标（信息走 tooltip）
+        imagePosition = .imageOnly
         contentTintColor = .white
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
             self.image = image.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold))
         }
-        imagePosition = .imageLeading
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 8
@@ -905,18 +868,14 @@ private final class TBPrimaryButton: NSButton {
         highlight.autoresizingMask = [.layerWidthSizable, .layerMinYMargin]
         highlight.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor
         layer?.addSublayer(highlight)
+        // 方形胶囊（旧：文字版自适应宽 + padding 0 10）
+        widthAnchor.constraint(equalToConstant: 30).isActive = true
         applyHot(false)
         heightAnchor.constraint(equalToConstant: 28).isActive = true
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
-
-    override var intrinsicContentSize: NSSize {
-        var size = super.intrinsicContentSize
-        size.width += 20   // padding 0 10：加宽后内容居中，两侧各留 10
-        return size
-    }
 
     private func applyHot(_ hot: Bool, pressed: Bool = false) {
         isHot = hot

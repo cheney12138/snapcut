@@ -15,9 +15,10 @@ enum IconFactory {
         if let url = Bundle.main.url(forResource: "StatusMark", withExtension: "png"),
            let loaded = NSImage(contentsOf: url) {
             loaded.isTemplate = true
-            // 实验 A：注释 resize，定位启动即退（若存活 ⇒ size 重设导致 MenuBarExtra 场景失效）
-            // let ratio = pointSize / max(loaded.size.width, 1)
-            // loaded.size = NSSize(width: loaded.size.width * ratio, height: loaded.size.height * ratio)
+            // 资源是 64px 位图，不重设 point size 的话 MenuBarExtra 按位图像素当 pt
+            // 渲染（实测 54px 宽，偏大——用户二次反馈「怎么又变大了」）
+            let ratio = pointSize / max(loaded.size.width, 1)
+            loaded.size = NSSize(width: loaded.size.width * ratio, height: loaded.size.height * ratio)
             return loaded
         }
         // 兜底：资源缺失时回退代码绘制（等比缩放保证任意 pointSize 可用）

@@ -51,8 +51,12 @@ final class EditorSession {
 
     var currentTool: Tool = .arrow
     var colorIndex = 0
-    var strokeWidth = 2
+    var strokeWidth: CGFloat = 2   // 连续 2-6pt（工具栏滑杆实时调节；下一个新标注用当前值）
     var toolbarVisible = true
+
+    /// 文字工具当前档位（4 档：12/14/17/21，默认 14）
+    /// 真相源在 session：浮动字号面板（OverlayWindow）与未来的工具栏控件都读写它
+    var textFontSize: Int = 14
 
     init(baseImage: CGImage, scale: CGFloat, selectionGlobal: CGRect, screen: NSScreen) {
         self.baseImage = baseImage
