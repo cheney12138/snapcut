@@ -1,5 +1,69 @@
 # Changelog
 
+## 2026-11-14 — 功能面扩张（Snow Shot 对标）+ 六边形架构
+
+### ✅ 完成
+- **读 Snow Shot 源码**（C++/Qt/Rust）提炼 5 份功能规格（docs/research/01~05，全带 file:line 证据）
+- **核心功能约束**（docs/04）：8 项能力覆盖 80% 场景 + 接口契约 + 验收标准
+- **F2 全屏 / 窗口截图**：⌘⇧S 全屏、悬停命中窗口高亮（蓝描边 + 白底深字角标）、单击整窗、双击全屏
+- **先冻结再选区**（Snow Shot 主流程）：拍完所有显示器（~82ms）才上覆盖层 ⇒ 覆盖层结构上不可能入图；
+  松手用冻结帧本地裁剪，零延迟进编辑态
+- **选区可反复调整**：8 向手柄改尺寸、空格整体移动、方向键 1pt/Shift 10pt 微调；
+  改完从冻结帧重裁底图 + 标注平移（钉在屏幕原位置）
+- **放大镜取色**：11×11 源像素 @12×，中心像素描边 + 坐标/色值，离线采样冻结帧
+- **历史记录 / OCR 取字 / 贴图 Pin**：三个并行子模块（1065 行），按端口接线；
+  工具栏「取字 O」「贴图 P」，任何导出都写历史，托盘历史子菜单
+- **设置面板**：通用/快捷键/关于三个 tab，设置真正生效（热键解析、历史上限、默认动作）
+- **六边形架构**：Core（Domain/Ports/Shared）/ Adapters / UI / App 分层 + 7 个端口 +
+  `scripts/check-architecture.sh`（make dev 强制，破坏即失败）
+
+### 🕳️ 本轮病例（新坑）
+
+**坑 17：SCStreamConfiguration 默认输出 1920×1080 ⇒ 截图模糊（用户实报"截完变模糊/有蒙层"）**
+- 根因：SCStreamConfiguration.width/height 默认 1920/1080（SCStream.h 头文件实锤），整屏被降采样
+- 加深坑：CGDisplayPixelsWide 在缩放模式返回"当前模式像素"(1728) 而非面板物理像素(3456)
+- 修复：`config.width = screen.frame.width * backingScale`
+- 验证：导出 1400×400 vs screencapture 同区域，平均亮度差 0.0103、显著差异 1.26%
+
+**坑 18：编辑器预览底图竖向颠倒**
+- 根因：CGContext.draw 假设 Y-up，而 isFlipped 视图上下文是 Y-down ⇒ 底图二次翻转
+- 修复：局部 translate+scale(1,-1) 镜像后再 draw，且用像素尺寸矩形（NSImage.draw 会按 point 尺寸重采样 ⇒ 模糊）
+
+**坑 19：无鼠标点击的入口（⌘⇧S）App 不激活 ⇒ Enter/Esc 全丢**
+- 现象：全屏截图进编辑态后键盘彻底失效（frontmost 仍是别的 App）
+- 根因：区域路径靠真实点击激活，掩盖了 NSApp.activate 在 Carbon 热键回调里可能被忽略
+- 修复：ensureActivation() 每 60ms 重试（最多 3 次，含 NSRunningApplication.activate）
+
+**坑 20：拖手柄调整选区后 App 失去激活 ⇒ 编辑器"僵死"**
+- 修复：reclaimKeyboard()（activate + makeKey + makeFirstResponder + 端口级 ensureActivation）
+
+**坑 21：NSColor.labelColor 在 dark appearance 下解析成白色 ⇒ 白底胶囊里画白字不可读**
+- 修复：角标固定 `NSColor(calibratedWhite: 0.12, alpha: 1)`
+
+**坑 22：改用「点击时 popUp 菜单」后 buildMenu() 调用丢失 ⇒ 托盘点击毫无反应、历史菜单永远空**
+- 现象：状态栏图标点了没反应；selfTestDumpHistoryMenu 静默返回（historyMenu == nil）
+- 教训：替换 `item.menu = buildMenu()` 这类"顺带调用"时，必须显式保留副作用
+
+**坑 23：OCR 结果面板 .floating 被覆盖层（.screenSaver）压住 ⇒ 用户完全看不到识别结果**
+- 修复：同级 .screenSaver + orderFrontRegardless + makeKey
+
+**坑 24：多实例（worktree 构建）同时运行 ⇒ unified log 混流 + Carbon 热键被抢，验证结论全错**
+- 现象：明明逻辑对，Enter 就是不生效；日志里冒出没见过的事件（settings.window.open）
+- 纪律：每次真机验证前 `pkill -9 -f Snapcut`，并 `ps aux | grep Snapcut` 确认只剩一个实例
+
+**坑 25：OCR 对低对比度/深色背景文字识别率明显下降**
+- 实测：亮部文字（`cd ./snapcut && python3 - <<'PYEOF'（+88 Lines）`）一字不差；
+  暗历史行出现 `Hppwooraznacoronared` 这类误读
+- 试过无效：反相、放大 2x、automaticallyDetectsLanguage —— 无改善
+- 结论：Vision 已知特性，暂记为限制（不是管线问题，已用同区域 screencapture 对照排除）
+
+### 📌 架构与纪律增补
+- 新代码端口优先：先定义 Core/Ports，再写 Adapters，UI 只拿端口
+- 并行子任务用 worktree 隔离；**worker 不会自动 commit**，主会话需从 worktree 目录搬运文件
+- 子任务契约里要显式给 LogCategory 现有 case，否则 agent 会造垫片（已在并入时清理）
+
+---
+
 ## 2026-11-14 — v0.1 开发首日（M0 骨架 + v0.1 区域截图闭环）
 
 ### ✅ 完成

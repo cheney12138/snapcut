@@ -928,10 +928,12 @@ final class OverlayView: NSView {
         ctx.setLineWidth(borderWidth)
         ctx.stroke(selectionLocal)
 
-        // 4. 尺寸角标
+        // 4. 尺寸角标（原型样式：「452 × 323 @2x」，黑胶囊 11pt）
         if phase != .waitingForDrag {
             let scale = window?.screen?.backingScaleFactor ?? 1
-            let sizeText = "\(Int(selectionLocal.width * scale))×\(Int(selectionLocal.height * scale))"
+            let w = Int(selectionLocal.width * scale)
+            let h = Int(selectionLocal.height * scale)
+            let sizeText = "\(w) × \(h) @\(Int(scale))x"
             drawBadge(text: sizeText, below: selectionLocal)
         }
     }
@@ -1054,14 +1056,15 @@ final class OverlayView: NSView {
         )
     }
 
+    /// 尺寸角标：原型 `.size-badge`（黑 72% 胶囊 + 11pt semibold 白字）
     private func drawBadge(text: String, below rect: CGRect) {
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.white,
+            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.96),
         ]
         let textSize = (text as NSString).size(withAttributes: attributes)
-        let padding: CGFloat = 6
-        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + padding))
+        let padding: CGFloat = 7
+        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + 3))
         var origin = CGPoint(x: rect.maxX - size.width, y: min(rect.maxY + 6, bounds.height - size.height))
         if origin.y + size.height > bounds.height { origin.y = rect.minY - size.height - 6 }
         if origin.y < 0 { origin.y = 4 }
@@ -1069,7 +1072,7 @@ final class OverlayView: NSView {
         let badgeRect = CGRect(origin: origin, size: size)
         let path = CGPath(roundedRect: badgeRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
         let ctx = NSGraphicsContext.current?.cgContext
-        ctx?.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
+        ctx?.setFillColor(NSColor.black.withAlphaComponent(0.72).cgColor)
         ctx?.addPath(path)
         ctx?.fillPath()
         (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + padding / 2), withAttributes: attributes)
