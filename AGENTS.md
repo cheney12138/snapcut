@@ -39,3 +39,16 @@
 - 日志：`log stream --predicate 'subsystem == "app.snapcut"'`（或 `make tail`）。
 - "没有输出"不是证据：先确认渠道通电（同一份日志里有别的已知输出）。
 - 用户说"还是有问题"时，先捞日志/看截图，不要接着猜。
+
+## Bundle ID 纪律（2026-11-14 状态栏图标消失病例，排查 ~2h）
+
+- 现象：状态项创建成功（tray.icon.created 日志正常）但菜单栏不显示任何像素；
+  同一二进制换 bundle ID 立即恢复。
+- 根因：开发期 TCC 弹窗反复授权/撤销 + 签名身份反复变更（ad-hoc ↔ dev cert），
+  把 `com.snapcut.app` 在 LaunchServices/TCC 数据库里的注册搞脏（macOS 26）。
+- 修复：弃用脏 ID，改 `com.snapcut.desktop`。
+- 预防：① 不要在启动路径调 CGRequest（见 TCC 纪律）；② 开发签名身份从第一版起固定；
+  ③ 再遇到"状态栏不显示"先做换 bundle ID 对照实验（二进制装进最小 bundle 跑），
+  再怀疑代码——本病例里代码从头到尾是对的。
+- 排障方法论沉淀：像素簇计数（cluster）会被时钟秒数/天气小组件/录屏指示器污染，
+  不可作为证据；可信的是 on/off 像素 diff + 排除小组件区 + 换 bundle 对照实验。

@@ -23,10 +23,13 @@ targets:
       - Resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.snapcut.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.snapcut.desktop
         ENABLE_HARDENED_RUNTIME: "NO"
         DEAD_CODE_STRIPPING: "YES"
         SWIFT_STRICT_CONCURRENCY: complete
+        # ⚠️ 禁用 debug dylib（诊断 F：壳二进制+dylib 结构疑似导致状态栏窗口不落位）
+        SWIFT_ENABLE_DEBUG_DYLIB: "NO"
+        ENABLE_DEBUG_DYLIB: "NO"
     info:
       path: Resources/Info.plist
       properties:
