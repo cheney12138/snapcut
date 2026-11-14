@@ -190,6 +190,14 @@ final class StatusItemController: NSObject {
 
         menu.addItem(.separator())
 
+        let delayItem = NSMenuItem(
+            title: "延时 3 秒截图",
+            action: #selector(captureDelayed(_:)),
+            keyEquivalent: ""
+        )
+        delayItem.target = self
+        menu.addItem(delayItem)
+
         let settingsItem = NSMenuItem(
             title: "设置…",
             action: #selector(openSettings(_:)),
@@ -271,6 +279,11 @@ final class StatusItemController: NSObject {
     @objc private func captureFullScreen(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "captureFullScreen"])
         coordinator?.beginFullScreenCapture()
+    }
+
+    @objc private func captureDelayed(_ sender: Any?) {
+        Log.event(.tray, "tray.action", ["item": "captureDelayed"])
+        coordinator?.beginDelayedCapture(seconds: 3)
     }
 
     @objc private func openSettings(_ sender: Any?) {

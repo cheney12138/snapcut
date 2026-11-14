@@ -98,6 +98,10 @@ final class AppCoordinator {
         deps.hotkeys.register(keyCode: UInt32(kVK_ANSI_H), modifiers: [.option, .command]) { [weak self] in
             self?.tray.showMenuAtCursor()
         }
+        // 延时截图（默认 3 秒）：⌃⌥D
+        deps.hotkeys.register(keyCode: UInt32(kVK_ANSI_D), modifiers: [.control, .option]) { [weak self] in
+            self?.beginDelayedCapture(seconds: 3)
+        }
         // 兜底可达性：菜单栏满时托盘图标可能被系统整体隐藏（tray.hidden.overflow 病例），
         // ⌥⌘, 直接打开设置窗口，保证无图标也能进设置
         deps.hotkeys.register(
@@ -157,6 +161,21 @@ final class AppCoordinator {
         _ = exporter.quickSave(image, settings: settings)
         if settings.showCopyNotification {
             CaptureToast.show(image: image, message: "已保存到 \((settings.saveDirectoryPath as NSString).lastPathComponent)")
+        }
+    }
+
+    /// 延时截图（F8）：倒计时结束后走区域截图（屏幕在倒计时结束时才冻结）
+    func beginDelayedCapture(seconds: Int) {
+        guard state == .idle else {
+            Log.event(.app, "capture.ignored", ["state": state.rawValue])
+            return
+        }
+        CountdownHUD.start(seconds: seconds) { [weak self] in
+            Log.event(.app, "countdown.finished")
+            self?.beginRegionCapture()
+        } onCancel: { [weak self] in
+            Log.event(.app, "countdown.cancelled")
+            self?.state = .idle
         }
     }
 
