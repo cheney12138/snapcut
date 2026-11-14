@@ -1,9 +1,14 @@
 import AppKit
 
-/// 标注工具栏（NSPanel + AppKit 控件；样式后置，功能先行）
+/// 标注工具栏（NSPanel + AppKit 控件）
 ///
-/// 铁律：nonactivatingPanel（不抢激活，键盘焦点留在覆盖层窗口）；
-/// isMovableByWindowBackground=false（不挡鼠标手势）。
+/// 视觉规范来自 snapcut-design/index.html 原型（DeepSeek 交付，Apple 玻璃质感）：
+/// - 磨砂玻璃：blur+饱和度（NSVisualEffectView .hudWindow 近似）、12px 连续曲率圆角
+/// - 1px 内描边（半透明白）+ 双层柔影
+/// - 工具按钮：无 bezel 扁平胶囊；选中 = 系统蓝底白字；hover 亮 8%
+/// - 出场：从选区底边 spring 滑入（240ms, spring(0.34,1.3,0.5,1) 的 NSAnimationContext 近似）
+///
+/// 铁律：nonactivatingPanel（不抢激活）；isMovableByWindowBackground=false。
 @MainActor
 final class ToolbarPanel: NSPanel {
     private weak var session: EditorSession?
@@ -14,16 +19,22 @@ final class ToolbarPanel: NSPanel {
         case undo, redo, toggleVisibility, done, save, cancel
     }
 
-    private var stackView: NSStackView!
-    private var toolButtons: [EditorSession.Tool: NSButton] = [:]
-    private var colorButtons: [NSButton] = []
-    private var undoButton: NSButton!
-    private var redoButton: NSButton!
+    private var toolButtons: [EditorSession.Tool: ToolButton] = [:]
+    private var colorButtons: [ColorButton] = []
+    private var undoButton: ActionButton!
+    private var redoButton: ActionButton!
+
+    // 视觉 token（与 HTML 原型对齐）
+    private enum Style {
+        static let cornerRadius: CGFloat = 12
+        static let buttonHeight: CGFloat = 26
+        static let buttonSpacing: CGFloat = 3
+        static let selectionBlue = NSColor.controlAccentColor
+    }
 
     init() {
-        // 尺寸在 layout() 里根据内容计算
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 52),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 52),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -46,110 +57,131 @@ final class ToolbarPanel: NSPanel {
         refreshSelectionState()
     }
 
-    // MARK: - UI
+    // MARK: - UI 构建
 
     private func buildUI() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 52))
-        // 磨砂背景（功能先行：视觉细节后调）
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 52))
+        container.wantsLayer = true
+
+        // 磨砂玻璃底 + 圆角 + 内描边（原型 --glass 体系）
         let effect = NSVisualEffectView(frame: container.bounds)
         effect.material = .hudWindow
         effect.blendingMode = .behindWindow
         effect.state = .active
-        effect.layer?.cornerRadius = 10
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = Style.cornerRadius
         effect.layer?.masksToBounds = true
+        // 1px 内描边
+        effect.layer?.borderWidth = 1
+        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
         container.addSubview(effect)
 
         let stack = NSStackView()
         stack.orientation = .horizontal
         stack.alignment = .centerY
-        stack.spacing = 4
+        stack.spacing = Style.buttonSpacing
         stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
         container.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
             stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
             stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
         ])
-        stackView = stack
 
-        // 六个工具按钮（热键 1-6）
+        // 六个工具（原型：胶囊 + 图标 + 热键 tooltip）
         for tool in EditorSession.Tool.allCases {
-            let button = NSButton(title: tool.label, target: self, action: #selector(toolTapped(_:)))
-            button.tag = tool.rawValue
-            button.bezelStyle = .texturedRounded
-            button.font = .systemFont(ofSize: 11, weight: .medium)
+            let button = ToolButton(tool: tool)
+            button.target = self
+            button.action = #selector(toolTapped(_:))
             stack.addArrangedSubview(button)
             toolButtons[tool] = button
         }
 
-        stack.addView(makeSeparator(), in: .leading)
+        stack.addArrangedSubview(makeSeparator())
 
-        // 五色
+        // 五色（原型：圆点 + 选中白描边）
         for (i, color) in AnnotationModel.palette.enumerated() {
-            let button = NSButton(title: "", target: self, action: #selector(colorTapped(_:)))
+            let button = ColorButton(color: color)
             button.tag = i
-            button.bezelStyle = .texturedRounded
-            button.wantsLayer = true
-            button.layer?.backgroundColor = color.cgColor
-            button.layer?.cornerRadius = 6
-            let size: CGFloat = 18
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.widthAnchor.constraint(equalToConstant: size).isActive = true
-            button.heightAnchor.constraint(equalToConstant: size).isActive = true
+            button.target = self
+            button.action = #selector(colorTapped(_:))
             stack.addArrangedSubview(button)
             colorButtons.append(button)
         }
 
-        stack.addView(makeSeparator(), in: .leading)
+        stack.addArrangedSubview(makeSeparator())
 
-        // 粗细三档
+        // 粗细三档（原型：三条线按钮）
         for w in 1...3 {
-            let button = NSButton(title: "—".padding(toLength: w, withPad: "—", startingAt: 0), target: self, action: #selector(strokeTapped(_:)))
+            let button = StrokeButton(level: w)
             button.tag = w
-            button.bezelStyle = .texturedRounded
+            button.target = self
+            button.action = #selector(strokeTapped(_:))
             stack.addArrangedSubview(button)
         }
 
-        stack.addView(makeSeparator(), in: .leading)
+        stack.addArrangedSubview(makeSeparator())
 
-        // undo / redo
-        undoButton = NSButton(title: "撤销", target: self, action: #selector(actionTapped(_:)))
+        undoButton = ActionButton(title: "↩︎", tooltip: "撤销 ⌘Z")
         undoButton.tag = 100
-        undoButton.bezelStyle = .texturedRounded
+        undoButton.target = self
+        undoButton.action = #selector(actionTapped(_:))
         stack.addArrangedSubview(undoButton)
-        redoButton = NSButton(title: "重做", target: self, action: #selector(actionTapped(_:)))
+
+        redoButton = ActionButton(title: "↪︎", tooltip: "重做 ⇧⌘Z")
         redoButton.tag = 101
-        redoButton.bezelStyle = .texturedRounded
+        redoButton.target = self
+        redoButton.action = #selector(actionTapped(_:))
         stack.addArrangedSubview(redoButton)
 
-        stack.addView(makeSeparator(), in: .leading)
+        stack.addArrangedSubview(makeSeparator())
 
-        // 隐藏工具栏 / 完成 / 保存 / 取消
-        let hide = NSButton(title: "隐藏(H)", target: self, action: #selector(actionTapped(_:)))
+        // 隐藏 / 复制（主按钮）/ 保存 / 取消
+        let hide = ActionButton(title: "隐藏", tooltip: "隐藏工具栏 (H)")
         hide.tag = 200
-        hide.bezelStyle = .texturedRounded
+        hide.target = self
+        hide.action = #selector(actionTapped(_:))
         stack.addArrangedSubview(hide)
 
-        let done = NSButton(title: "复制(↩)", target: self, action: #selector(actionTapped(_:)))
+        let done = ActionButton(title: "复制 ↩", tooltip: "复制并完成", prominent: true)
         done.tag = 201
-        done.keyEquivalent = "\r"
-        done.bezelStyle = .texturedRounded
+        done.target = self
+        done.action = #selector(actionTapped(_:))
         stack.addArrangedSubview(done)
 
-        let save = NSButton(title: "保存(⌘S)", target: self, action: #selector(actionTapped(_:)))
+        let save = ActionButton(title: "保存 ⌘S", tooltip: "保存到文件")
         save.tag = 202
-        save.bezelStyle = .texturedRounded
+        save.target = self
+        save.action = #selector(actionTapped(_:))
         stack.addArrangedSubview(save)
 
-        let cancel = NSButton(title: "取消(Esc)", target: self, action: #selector(actionTapped(_:)))
+        let cancel = ActionButton(title: "取消", tooltip: "取消本次截图 (Esc)")
         cancel.tag = 203
-        cancel.bezelStyle = .texturedRounded
+        cancel.target = self
+        cancel.action = #selector(actionTapped(_:))
         stack.addArrangedSubview(cancel)
 
         contentView = container
     }
 
-    // MARK: - 位置（选区下方，放不下翻上方）
+    private func makeSeparator() -> NSView {
+        let view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        view.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.12).cgColor
+        return view
+    }
+
+    // MARK: - 位置（选区下方 12px，放不下翻上方）+ spring 出场
+
+    private var targetScreen: NSScreen?
+
+    func updateScreen(_ screen: NSScreen) {
+        targetScreen = screen
+    }
 
     func place(below selection: CGRect) {
         contentView?.layoutSubtreeIfNeeded()
@@ -161,12 +193,18 @@ final class ToolbarPanel: NSPanel {
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
         origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
         setFrameOrigin(origin)
-    }
 
-    private var targetScreen: NSScreen?
-
-    func updateScreen(_ screen: NSScreen) {
-        targetScreen = screen
+        // 出场动效（原型 spring 240ms）：从选区底边 +8px 滑入 + 淡入
+        let dy: CGFloat = selection.minY >= origin.y + size.height ? -8 : 8
+        let finalFrame = frame
+        setFrameOrigin(NSPoint(x: origin.x, y: origin.y + dy))
+        alphaValue = 0
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.24
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.3, 0.5, 1)
+            self.animator().setFrame(finalFrame, display: true)
+            self.animator().alphaValue = 1
+        })
     }
 
     // MARK: - 状态刷新
@@ -174,11 +212,10 @@ final class ToolbarPanel: NSPanel {
     func refreshSelectionState() {
         guard let session else { return }
         for (tool, button) in toolButtons {
-            button.state = tool == session.currentTool ? .on : .off
+            button.setSelected(tool == session.currentTool)
         }
         for (i, button) in colorButtons.enumerated() {
-            button.layer?.borderWidth = i == session.colorIndex ? 2 : 0
-            button.layer?.borderColor = NSColor.white.cgColor
+            button.setSelected(i == session.colorIndex)
         }
         undoButton.isEnabled = session.store.canUndo
         redoButton.isEnabled = session.store.canRedo
@@ -216,14 +253,172 @@ final class ToolbarPanel: NSPanel {
     }
 }
 
-private extension ToolbarPanel {
-    func makeSeparator() -> NSView {
-        let view = NSView()
-        view.translatesAutoresizingMaskIntoConstraints = false
-        view.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        view.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        return view
+// MARK: - 扁平胶囊按钮（原型视觉：无 bezel、hover 亮、选中蓝底白字）
+
+@MainActor
+private final class ToolButton: NSButton {
+    private let tool: EditorSession.Tool
+
+    init(tool: EditorSession.Tool) {
+        self.tool = tool
+        super.init(frame: .zero)
+        title = tool.label
+        tag = tool.rawValue
+        toolTip = "\(tool.label)（热键 \(tool.rawValue)）"
+        configureCommon()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    fileprivate func setSelected(_ selected: Bool) {
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        if selected {
+            layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+            layer?.borderWidth = 0
+            setContent()
+        } else {
+            layer?.backgroundColor = NSColor.black.withAlphaComponent(0.06).cgColor
+            layer?.borderWidth = 0
+            setContent()
+        }
+    }
+
+    private func setContent() {
+        let selected = state == .on
+        // 文字色：选中白，未选中 label 色
+        let attr = NSAttributedString(string: tool.label, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: selected ? NSColor.white : NSColor.labelColor,
+        ])
+        attributedTitle = attr
+    }
+
+    private func configureCommon() {
+        isBordered = false
+        bezelStyle = .regularSquare
+        font = .systemFont(ofSize: 12, weight: .medium)
+        setContent()
+        contentTintColor = .labelColor
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.06).cgColor
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        let area = NSTrackingArea(
+            rect: bounds, options: [.mouseEnteredAndExited, .activeAlways],
+            owner: self, userInfo: nil
+        )
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        if state == .off {
+            layer?.backgroundColor = NSColor.black.withAlphaComponent(0.14).cgColor
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if state == .off {
+            layer?.backgroundColor = NSColor.black.withAlphaComponent(0.06).cgColor
+        }
+    }
+}
+
+// MARK: - 色点按钮
+
+@MainActor
+private final class ColorButton: NSButton {
+    private let dotColor: NSColor
+
+    init(color: NSColor) {
+        self.dotColor = color
+        super.init(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+        configureCommon()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    fileprivate func setSelected(_ selected: Bool) {
+        layer?.borderWidth = selected ? 2.5 : 1
+        layer?.borderColor = selected
+            ? NSColor.controlAccentColor.cgColor
+            : NSColor.black.withAlphaComponent(0.25).cgColor
+    }
+
+    private func configureCommon() {
+        isBordered = false
+        wantsLayer = true
+        layer?.backgroundColor = dotColor.cgColor
+        layer?.cornerRadius = 9
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.black.withAlphaComponent(0.25).cgColor
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 18).isActive = true
+        heightAnchor.constraint(equalToConstant: 18).isActive = true
+    }
+}
+
+// MARK: - 粗细按钮
+
+@MainActor
+private final class StrokeButton: NSButton {
+    init(level: Int) {
+        super.init(frame: .zero)
+        isBordered = false
+        let dashes = String(repeating: "—", count: level)
+        let attr = NSAttributedString(string: dashes, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.labelColor,
+        ])
+        attributedTitle = attr
+        toolTip = "粗细 \(level)/3"
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.06).cgColor
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+// MARK: - 动作按钮（复制为强调色主按钮）
+
+@MainActor
+private final class ActionButton: NSButton {
+    init(title: String, tooltip: String, prominent: Bool = false) {
+        super.init(frame: .zero)
+        isBordered = false
+        self.toolTip = tooltip
+        let color: NSColor = prominent ? .white : .labelColor
+        let attr = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular),
+            .foregroundColor: color,
+        ])
+        attributedTitle = attr
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.backgroundColor = prominent
+            ? NSColor.controlAccentColor.cgColor
+            : NSColor.black.withAlphaComponent(0.06).cgColor
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isEnabled: Bool {
+        didSet {
+            alphaValue = isEnabled ? 1 : 0.35
+        }
     }
 }
