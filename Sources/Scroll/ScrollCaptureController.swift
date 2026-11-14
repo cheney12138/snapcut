@@ -167,6 +167,14 @@ enum ScrollFrameGrabber {
         // ⚠️ 默认 .nominal 会返回降采样图（逻辑分辨率），坐标按物理像素裁剪就会越界
         // （病例：屏幕下方选区 pxH=80 而非 500）。.exact = 显示器原生像素。
         config.captureResolution = .best
+        // ⚠️ SCStreamConfiguration 默认输出 1920×1080（宽高以像素计，头文件实锤）——
+        // 这就是「截图变模糊」的根因。CGDisplayPixelsWide 在缩放模式下返回的是
+        // 当前模式像素（1728）而非面板物理像素（3456）——必须用 frame × backingScale。
+        let physical = NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
+        }
+        config.width = Int((physical?.frame.width ?? 1728) * (physical?.backingScaleFactor ?? 2))
+        config.height = Int((physical?.frame.height ?? 1117) * (physical?.backingScaleFactor ?? 2))
         config.showsCursor = false
         config.scalesToFit = false
         let full = try await SCScreenshotManager.captureImage(

@@ -210,6 +210,11 @@ final class OverlayView: NSView {
             }
             phase = .confirmed
             needsDisplay = true
+            // 松手即激活：capture 冻结 ~100-200ms 期间用户可能已按键，
+            // 未激活 App 的键盘事件全给前台 App（用户实报：Enter/Esc 无响应）
+            NSApp.activate(ignoringOtherApps: true)
+            window?.makeKeyAndOrderFront(nil)
+            window?.makeFirstResponder(self)
             let globalRect = convertToGlobalRect(selectionLocal)
             let screen = window?.screen ?? NSScreen.main!
             controller.didSelect(rect: globalRect, on: screen)
@@ -577,9 +582,16 @@ final class OverlayView: NSView {
         ctx.fill(editorRectLocal)
         ctx.restoreGState()
 
-        // 2. 冻结底图（像素 → point 直绘；isFlipped 上下文 Y 向下 ✓）
+        // 2. 冻结底图：像素精确 1:1 绘制（不重采样不模糊）。
+        // 坐标处理：CGContext.draw 假设 Y-up；本视图 Y-down ⇒ 局部翻转一次
+        // 再 draw，方向即正确（病例三连：①不翻=倒置 ②NSImage.draw 按 point
+        // size 重采样=模糊+错位 ③正确解=显式翻转+像素尺寸矩形）
         ctx.saveGState()
         ctx.clip(to: editorRectLocal)
+        ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.translateBy(x: -editorRectLocal.minX, y: -editorRectLocal.minY)
+        ctx.interpolationQuality = .none
         ctx.draw(session.baseImage, in: editorRectLocal)
         // 3. 标注层（同一渲染器 = 导出所见）
         let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
