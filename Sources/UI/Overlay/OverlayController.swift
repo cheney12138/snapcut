@@ -155,6 +155,8 @@ final class OverlayController {
         editorSession = nil
         toolbar?.orderOut(nil)
         toolbar = nil
+        ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
+        ocrCloseObserver = nil
         unregisterScrollHotKeys()
         scrollTimer?.invalidate()
         scrollTimer = nil
@@ -361,10 +363,16 @@ final class OverlayController {
             session.store.undo()
             toolbar?.refreshSelectionState()
             editorWindow()?.contentView?.needsDisplay = true
+            Log.event(.editor, "annotate.undo", [
+                "canUndo": "\(session.store.canUndo)", "canRedo": "\(session.store.canRedo)",
+            ])
         case .redo:
             session.store.redo()
             toolbar?.refreshSelectionState()
             editorWindow()?.contentView?.needsDisplay = true
+            Log.event(.editor, "annotate.redo", [
+                "canUndo": "\(session.store.canUndo)", "canRedo": "\(session.store.canRedo)",
+            ])
         case .toggleVisibility:
             session.toolbarVisible.toggle()
             if session.toolbarVisible {
@@ -372,6 +380,8 @@ final class OverlayController {
             } else {
                 toolbar?.orderOut(nil)
             }
+            // 显隐按钮图标同步：隐藏态 = eye.slash，再次点/按 H 唤回时表达「当前收起」
+            toolbar?.setToolbarHidden(!session.toolbarVisible)
             Log.event(.editor, "editor.toolbar.\(session.toolbarVisible ? "show" : "hide")")
         case .done:
             perform(action: .copy)
@@ -404,7 +414,43 @@ final class OverlayController {
             let text = (try? await recognizer.recognize(image)) ?? ""
             clipboard.map { _ in () }
             OCRResultPanel.present(text: text, nearGlobalRect: rect, on: screen)
+            restoreEditorFocusAfterOCRPanelCloses()
             Log.event(.ocr, "ocr.present", ["chars": "\(text.count)"])
+        }
+    }
+
+    /// OCR 浮层 makeKey 会拿走编辑器的键盘焦点；浮层关闭（Enter 复制/Esc/orderOut）后
+    /// 必须把 key 还给编辑画布，否则随后的 Enter 复制可能失效。
+    /// ⚠️ OCR 面板 close() 走 orderOut，不触发 willCloseNotification（只在 NSWindow.close()
+    /// 才发），所以监听 didResignKey + isVisible 判断「面板真的收走了」。
+    private var ocrCloseObserver: Any?
+
+    private func restoreEditorFocusAfterOCRPanelCloses() {
+        ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
+        ocrCloseObserver = nil
+        guard let editorWin = editorWindow() else { return }
+        guard let ocrPanel = NSApp.keyWindow, ocrPanel !== editorWin else {
+            Log.event(.editor, "editor.focus.ocrNoPanel")
+            return
+        }
+        ocrCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification, object: ocrPanel, queue: .main
+        ) { [weak self, weak ocrPanel] _ in
+            MainActor.assumeIsolated {
+                // 只有面板真正收走（orderOut / close）时才把焦点还给编辑器；
+                // 面板只是暂时失去 key（如用户点了别的窗口）不动作
+                guard let panel = ocrPanel, !panel.isVisible else { return }
+                guard let self, let win = self.editorWindow() else { return }
+                self.ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
+                self.ocrCloseObserver = nil
+                win.makeKeyAndOrderFront(nil)
+                if let contentView = win.contentView {
+                    _ = win.makeFirstResponder(contentView)
+                }
+                Log.event(.editor, "editor.focus.restored", [
+                    "keyWin": "\(win.isKeyWindow)", "from": "ocr.close",
+                ])
+            }
         }
     }
 

@@ -59,6 +59,7 @@ final class ToolbarPanel: NSPanel {
     private var widthButtons: [TBWidthButton] = []
     private var undoButton: TBIconButton!
     private var redoButton: TBIconButton!
+    private var eyeButton: TBIconButton?
     private var tooltip: ToolbarTooltipWindow?
 
     init() {
@@ -234,6 +235,7 @@ final class ToolbarPanel: NSPanel {
 
         let eye = TBIconButton(symbol: "eye", fallback: "眼")
         eye.tag = 200
+        eyeButton = eye
         eye.target = self
         eye.action = #selector(actionTapped(_:))
         eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 H") }
@@ -424,6 +426,16 @@ final class ToolbarPanel: NSPanel {
         }
         undoButton.isEnabled = session.store.canUndo
         redoButton.isEnabled = session.store.canRedo
+        // 病例：仅靠 isEnabled 的 didSet→alphaValue 在首次 build 时可能不生效，
+        // 这里显式再刷一次，保证「有标注变亮 / 无标注置灰」在视觉上确定
+        undoButton.alphaValue = session.store.canUndo ? 1 : 0.35
+        redoButton.alphaValue = session.store.canRedo ? 1 : 0.35
+    }
+
+    /// 工具栏显隐态图标（隐藏时 eye.slash）
+    func setToolbarHidden(_ hidden: Bool) {
+        eyeButton?.setSymbol(hidden ? "eye.slash" : "eye", fallback: "眼")
+        Log.event(.editor, "toolbar.eye.icon", ["state": hidden ? "hidden" : "visible"])
     }
 
     // MARK: - 悬停提示
@@ -594,6 +606,18 @@ class TBIconButton: NSButton {
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
         layer.transform = lifted ? CATransform3DMakeTranslation(0, -2, 0) : CATransform3DIdentity
         CATransaction.commit()
+    }
+
+    /// 换图标（眼睛显隐态用）
+    func setSymbol(_ symbol: String, fallback: String) {
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            self.image = image.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 17, weight: .regular)
+            )
+        } else {
+            title = fallback
+            font = .systemFont(ofSize: 13, weight: .medium)
+        }
     }
 
     func setSelected(_ selected: Bool) {

@@ -12,6 +12,85 @@ enum CaptureToast {
     private static var current: NSPanel?
     private static var dismissWork: DispatchWorkItem?
 
+    /// 纯文案 toast（无缩略图）：系统级提示用（如菜单栏溢出告知）。
+    /// 同样不抢焦点，2.5 秒自动消失。
+    static func show(message: String) {
+        dismissWork?.cancel()
+        current?.orderOut(nil)
+        current = nil
+
+        guard let screen = NSScreen.main else { return }
+        let visible = screen.visibleFrame
+
+        // 宽度随文案自适应（上限屏宽 - 40），避免长文案被裁切
+        let probe = NSTextField(labelWithString: message)
+        probe.font = .systemFont(ofSize: 12, weight: .medium)
+        let textWidth = probe.intrinsicContentSize.width + 32
+        let width = min(max(180, textWidth), visible.width - 40)
+        let height: CGFloat = 40
+
+        let panel = ToastPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+
+        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        effect.material = .hudWindow
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 10
+        effect.layer?.masksToBounds = true
+        effect.layer?.borderWidth = 0.5
+        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+
+        let label = NSTextField(labelWithString: message)
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .white
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: effect.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: effect.centerYAnchor),
+        ])
+        panel.contentView = effect
+
+        let restOrigin = CGPoint(x: visible.maxX - width - 20, y: visible.minY + 20)
+        panel.setFrameOrigin(CGPoint(x: restOrigin.x, y: restOrigin.y - 12))
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.3, 0.5, 1)
+            panel.animator().alphaValue = 1
+            panel.animator().setFrameOrigin(restOrigin)
+        }
+        current = panel
+
+        let work = DispatchWorkItem {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.20
+                panel.animator().alphaValue = 0
+            } completionHandler: {
+                panel.orderOut(nil)
+                if current === panel { current = nil }
+            }
+        }
+        dismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+        Log.event(.app, "toast.show", ["kind": "text", "msg": message])
+    }
+
     static func show(image: CGImage, message: String = "已复制到剪贴板") {
         // 连续截图：先关旧的，避免堆叠
         dismissWork?.cancel()

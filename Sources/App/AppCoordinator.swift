@@ -93,6 +93,14 @@ final class AppCoordinator {
         deps.hotkeys.register(keyCode: full.keyCode, modifiers: full.modifiers) { [weak self] in
             self?.beginFullScreenCapture()
         }
+        // 兜底可达性：菜单栏满时托盘图标可能被系统整体隐藏（tray.hidden.overflow 病例），
+        // ⌥⌘, 直接打开设置窗口，保证无图标也能进设置
+        deps.hotkeys.register(
+            keyCode: UInt32(kVK_ANSI_Comma), modifiers: [.option, .command]
+        ) {
+            Log.event(.hotkey, "hotkey.settings", ["key": "opt-cmd-comma"])
+            SettingsWindowController.shared.show(store: UserDefaultsSettingsStore())
+        }
     }
 
     func teardown() {
