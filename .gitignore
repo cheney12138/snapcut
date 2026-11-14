@@ -1,0 +1,7 @@
+# Snapcut 构建产物
+build/
+DerivedData/
+Snapcut.xcodeproj
+*.xcodeproj
+.DS_Store
+.swiftpm
