@@ -29,16 +29,34 @@ final class AppCoordinator {
     private let exporter = ExportCoordinator()
     private var overlayController: OverlayController?
 
+    /// 用户设置（设置面板写入 UserDefaults，启动时读取；改动需重启生效）
+    private(set) var settings: AppSettings = AppSettings.defaultSettings
+
     func start() {
         AppCoordinatorShared.coordinator = self
         AppCoordinatorShared.deps = deps
         TCCPermission.preflight()
+        settings = UserDefaultsSettingsStore().load()
+        HistoryStore.shared.maxItems = max(1, settings.historyLimit)
+        Log.event(.app, "settings.applied", [
+            "afterCapture": settings.afterCapture.rawValue,
+            "historyLimit": "\(settings.historyLimit)",
+            "hotkeyRegion": settings.hotkeyRegion,
+            "hotkeyFullScreen": settings.hotkeyFullScreen,
+        ])
         scheduleSelfTestIfRequested()
         tray.setup(coordinator: self)
-        hotkeyCenter.register(keyCode: kVK_ANSI_A, modifiers: [.command, .shift]) { [weak self] in
+        registerCaptureHotkeys()
+    }
+
+    /// 按用户设置注册两个截图热键（解析失败回落默认 ⌘⇧A / ⌘⇧S）
+    private func registerCaptureHotkeys() {
+        let region = HotkeySpec.parse(settings.hotkeyRegion) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_A), modifiers: [.command, .shift])
+        let full = HotkeySpec.parse(settings.hotkeyFullScreen) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_S), modifiers: [.command, .shift])
+        deps.hotkeys.register(keyCode: region.keyCode, modifiers: region.modifiers) { [weak self] in
             self?.beginRegionCapture()
         }
-        hotkeyCenter.register(keyCode: kVK_ANSI_S, modifiers: [.command, .shift]) { [weak self] in
+        deps.hotkeys.register(keyCode: full.keyCode, modifiers: full.modifiers) { [weak self] in
             self?.beginFullScreenCapture()
         }
     }
@@ -64,7 +82,11 @@ final class AppCoordinator {
             switch result {
             case .copy(let image):
                 self.state = .exporting
-                self.exporter.copyToClipboard(image)
+                if self.settings.afterCapture == .save {
+                    self.exporter.savePanel(image)
+                } else {
+                    self.exporter.copyToClipboard(image)
+                }
             case .save(let image):
                 self.state = .exporting
                 self.exporter.savePanel(image)
@@ -119,6 +141,19 @@ extension AppCoordinator {
     /// 流程：启动 2s 后自动开始选区会话 → 模拟拖选主屏 (100,100)-(500,400) → 1s 后 Enter
     /// 全链路真实（SCK 截屏 + 剪贴板写入），结束后记录焦点状态供日志验证。
     fileprivate func scheduleSelfTestIfRequested() {
+        if CommandLine.arguments.contains("--selftest-settings") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                Log.event(.app, "selftest.settings")
+                SettingsWindowController.shared.show(store: UserDefaultsSettingsStore())
+            }
+            return
+        }
+        if CommandLine.arguments.contains("--selftest-tray") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                self?.tray.selfTestDumpHistoryMenu()
+            }
+            return
+        }
         guard CommandLine.arguments.contains("--selftest") else { return }
         Log.event(.app, "selftest.requested")
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in

@@ -46,7 +46,8 @@ final class HistoryStore {
     }
 
     /// 保留上限，超出删最旧（PNG 与索引条目一起删）
-    static let maxItems = 30
+    /// 保留条数（由设置面板配置，默认 30）
+    var maxItems = 30
 
     /// 内存索引（新 → 旧），MainActor 独占
     private var itemsCache: [Item] = []
@@ -58,7 +59,7 @@ final class HistoryStore {
     private var indexWriteTask: Task<Void, Never>?
 
     private init() {
-        thumbnailCache.countLimit = Self.maxItems
+        thumbnailCache.countLimit = maxItems
         if let entries = Self.readIndexEntries() {
             // 索引可用：≤30 条的小 JSON，同步读保证 items() 首次调用即有数据；
             // png 已被用户手动删掉的条目直接丢弃并回写索引
@@ -204,7 +205,7 @@ final class HistoryStore {
     /// 超出保留上限删最旧（只摘内存条目，文件删除交给 deleteFiles）
     private func pruneIfNeeded() -> [URL] {
         var evicted: [URL] = []
-        while itemsCache.count > Self.maxItems {
+        while itemsCache.count > maxItems {
             evicted.append(itemsCache.removeLast().url)
         }
         return evicted

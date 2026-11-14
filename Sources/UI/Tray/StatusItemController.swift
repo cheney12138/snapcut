@@ -23,6 +23,9 @@ final class StatusItemController: NSObject {
             button.target = self
             button.action = #selector(statusItemClicked(_:))
         }
+        // ⚠️ 必须显式构建：改用「点击时 popUp」后不再有 item.menu = buildMenu()，
+        // 少了这行 rootMenu/historyMenu 全为 nil（病例：托盘点击无反应、历史菜单空）
+        _ = buildMenu()
         statusItem = item
         Log.event(.tray, "tray.icon.created", ["src": "mark-silhouette"])
     }
@@ -67,6 +70,15 @@ final class StatusItemController: NSObject {
 
         menu.addItem(.separator())
 
+        let settingsItem = NSMenuItem(
+            title: "设置…",
+            action: #selector(openSettings(_:)),
+            keyEquivalent: ","
+        )
+        settingsItem.keyEquivalentModifierMask = [.command]
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let permissionItem = NSMenuItem(
             title: "屏幕录制权限…",
             action: #selector(openPermissionSettings(_:)),
@@ -100,6 +112,16 @@ final class StatusItemController: NSObject {
         coordinator?.beginRegionCapture()
     }
 
+    /// 自测：重建历史子菜单并回报条目（不弹菜单）——验证接线用
+    func selfTestDumpHistoryMenu() {
+        guard let historyMenu else { return }
+        rebuildHistoryMenu(historyMenu)
+        Log.event(.tray, "tray.history.dump", [
+            "count": "\(historyMenu.items.count)",
+            "first": historyMenu.items.first?.title ?? "-",
+        ])
+    }
+
     @objc private func copyHistoryItem(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String,
               let item = HistoryStore.shared.items().first(where: { $0.id == id }) else { return }
@@ -115,6 +137,11 @@ final class StatusItemController: NSObject {
     @objc private func captureFullScreen(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "captureFullScreen"])
         coordinator?.beginFullScreenCapture()
+    }
+
+    @objc private func openSettings(_ sender: Any?) {
+        Log.event(.tray, "tray.action", ["item": "openSettings"])
+        SettingsWindowController.shared.show(store: UserDefaultsSettingsStore())
     }
 
     @objc private func openPermissionSettings(_ sender: Any?) {
@@ -146,6 +173,7 @@ private func rebuildHistoryMenu(_ menu: NSMenu) {
     }
     let formatter = DateFormatter()
     formatter.dateFormat = "MM-dd HH:mm:ss"
+    Log.event(.tray, "tray.history.menu", ["count": "\(items.count)"])
     for item in items.prefix(30) {
         let size = "\(Int(item.pixelSize.width))×\(Int(item.pixelSize.height))"
         let menuItem = NSMenuItem(
