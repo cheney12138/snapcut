@@ -8,6 +8,8 @@ final class DragSourceCoordinator: NSObject {
 
     /// 拖拽进行中标记（浮窗 tick 据此冻结一切重定位与消失）
     var isDragging = false
+    /// 拖放结束回调（浮窗据此切换「已添加，重启生效」提示；主线程）
+    var onDragEnd: (() -> Void)?
 }
 
 // NSDraggingSource 的一致性实现：回调都在主线程，用 assumeIsolated 桥接
@@ -37,6 +39,9 @@ extension DragSourceCoordinator: NSDraggingSource {
         MainActor.assumeIsolated {
             isDragging = false
             Log.event(.permission, "drag.end", ["op": "\(operation.rawValue)"])
+            if operation != [] {
+                onDragEnd?()
+            }
         }
     }
 }
@@ -99,6 +104,8 @@ final class DraggableAppIconView: NSImageView {
 @MainActor
 final class PanelContentView: NSView {
     private unowned let overlay: PermissionDragOverlay
+    private var title: NSTextField!
+    private var subtitle: NSTextField!
 
     init(frame frameRect: NSRect, overlay: PermissionDragOverlay) {
         self.overlay = overlay
@@ -130,14 +137,16 @@ final class PanelContentView: NSView {
 
         // 文案（右侧）
         let textX: CGFloat = 76
-        let title = NSTextField(labelWithString: "拖我到「屏幕录制」列表")
+        let titleLabel = NSTextField(labelWithString: "拖我到「屏幕录制」列表")
         title.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         title.textColor = .labelColor
+        title = titleLabel
         title.frame = NSRect(x: textX, y: bounds.midY + 2, width: bounds.width - textX - 24, height: 16)
         title.lineBreakMode = .byWordWrapping
         addSubview(title)
 
-        let subtitle = NSTextField(labelWithString: "松手即完成授权")
+        let subtitleLabel = NSTextField(labelWithString: "松手即完成授权")
+        subtitle = subtitleLabel
         subtitle.font = NSFont.systemFont(ofSize: 10)
         subtitle.textColor = .secondaryLabelColor
         subtitle.frame = NSRect(x: textX, y: bounds.midY - 14, width: bounds.width - textX - 24, height: 13)
@@ -157,5 +166,12 @@ final class PanelContentView: NSView {
 
     @objc private func closeTapped() {
         overlay.dismiss()
+    }
+
+    /// 拖放完成：切换成「已添加，重启生效」提示（App 图标变对勾态）
+    func updateForDropped() {
+        subtitle.stringValue = "已添加 ✓ 重启 Snapcut 后生效"
+        subtitle.textColor = .systemGreen
+        title.stringValue = "权限已添加，重启即完成"
     }
 }

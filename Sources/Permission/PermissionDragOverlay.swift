@@ -35,6 +35,9 @@ final class PermissionDragOverlay {
     private var targetGoneSince: Date?
 
     private var isShown = false
+    /// 用户已把 App 拖进权限列表（等待重启生效）——浮窗切换「已添加」文案
+    private var droppedInList = false
+    private var dismissTimer: Timer?
 
     // MARK: - 对外接口
 
@@ -42,7 +45,16 @@ final class PermissionDragOverlay {
     func show() {
         guard !isShown else { return }
         isShown = true
+        droppedInList = false
         targetGoneSince = nil
+        // 拖放进列表后：屏幕录制 TCC 需重启本进程才生效，轮询 preflight
+        // 永远看不到 granted=true（Glance 辅助功能是即时生效，这里是特例）
+        // → 监听 drag.end 切换「已添加，重启生效」态 + 定时退场
+        DragSourceCoordinator.shared.onDragEnd = { [weak self] in
+            MainActor.assumeIsolated {
+                self?.markDropped()
+            }
+        }
 
         let panel = makePanel()
         self.panel = panel
@@ -67,12 +79,29 @@ final class PermissionDragOverlay {
         isShown = false
         tickTimer?.invalidate()
         pollTimer?.invalidate()
+        dismissTimer?.invalidate()
         tickTimer = nil
         pollTimer = nil
+        dismissTimer = nil
+        DragSourceCoordinator.shared.onDragEnd = nil
         panel?.orderOut(nil)
         panel = nil
         targetGoneSince = nil
         Log.event(.permission, "dragOverlay.dismiss")
+    }
+
+    /// 用户完成了一次拖放（drag.end）：切换提示并定时退场
+    private func markDropped() {
+        guard isShown, !droppedInList else { return }
+        droppedInList = true
+        (panel?.contentView as? PanelContentView)?.updateForDropped()
+        Log.event(.permission, "dragOverlay.droppedInList")
+        dismissTimer?.invalidate()
+        dismissTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.dismiss()
+            }
+        }
     }
 
     // MARK: - 窗体
@@ -184,6 +213,7 @@ final class PermissionDragOverlay {
 
     private func pollPermission() {
         guard isShown else { return }
+        // 免重启生效的兜底（多数情况下屏幕录制需要 relaunch）
         if CGPreflightScreenCaptureAccess() {
             Log.event(.permission, "dragOverlay.granted")
             dismiss()
