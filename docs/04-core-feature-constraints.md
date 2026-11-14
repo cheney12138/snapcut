@@ -179,7 +179,10 @@ enum TextRecognizer {
 | 设置面板 | ✅ | 通用页控件渲染；`defaults` 注入后 `settings.applied` + 热键实际注册 ⌘⇧D |
 | 工具栏视觉对齐原型 | 🔨 | 子任务进行中（SF Symbols + 玻璃胶囊） |
 | 复制反馈通知（toast） | ⬜ | 原型右下角卡片，未做 |
-| 快速保存（免面板） | ⬜ | 设置里已有「保存到文件」动作，快速保存目录待接 |
+| 快速保存（免面板 ⌘⌥S） | ✅ | `/tmp/quicksave/2026-11-14_21-46-17.png` |
+| 延时截图（⌃⌥D） | ✅ | 3→2→1→0 → `overlay.open freezeMs=93`；Esc → `countdown.cancelled` |
+| 首次运行引导（权限前置） | ✅ | `onboarding.show granted=true` + 实拍卡片 |
+| 复制反馈 toast | ✅ | 导出后 `toast.show`，右下角卡片 2s 淡出 |
 
 ---
 
