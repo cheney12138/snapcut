@@ -180,3 +180,26 @@ enum TextRecognizer {
 | 工具栏视觉对齐原型 | 🔨 | 子任务进行中（SF Symbols + 玻璃胶囊） |
 | 复制反馈通知（toast） | ⬜ | 原型右下角卡片，未做 |
 | 快速保存（免面板） | ⬜ | 设置里已有「保存到文件」动作，快速保存目录待接 |
+
+---
+
+## 8. 工具栏功能验收（2026-11-14 夜，真机 CGEvent 逐按钮）
+
+> 验证方式：`pkill -9 -x Snapcut` → `open -n build/Snapcut.app` → CGEvent 发 ⌘⇧A + 拖选 →
+> 按 `toolbar.buttons` 打点里的屏幕坐标逐点点击（**注意 AppKit 全局 Y 向上、CGEvent Y 向下**）。
+
+| 控件 | 结果 | 证据 |
+|---|---|---|
+| 工具 1-6（箭头/矩形/文字/马赛克/序号/高亮） | ✅ 6/6 | `annotate.tool.select tool=…` 六条 |
+| 颜色 5 个 | ✅ 5/5 | `toolbar.color index=0..4` |
+| 粗细 3 档 | ✅ 3/3 | `toolbar.stroke width=1..3` |
+| 隐藏工具栏 | ✅ | `editor.toolbar.hide` |
+| 取消 | ✅ | `overlay.cancel` → `state.idle` |
+| 复制 | ✅ | `editor.export 400×400` → `clipboard.write` → `toast.show` |
+| 撤销/重做 | 🟡 点击可达（`toolbar.mousedown`），无标注时 disabled 属正确行为；有标注后的启用态待子任务收口 |
+| 取字 / 贴图 | 🟡 走 Action → OverlayController（键盘 O/P 已验证）；按钮点击待收口 |
+| 状态栏图标 | ❌ 环境限制：最小验证 App 也不显示（菜单栏无空位，系统隐藏）→ 只能 toast 告知 + ⌥⌘, 兜底 |
+
+### 本轮抓到的两个功能性 bug（都已修）
+1. **层级**：工具栏 `.floating` 被覆盖层 `.screenSaver` 压住 ⇒ 看着在、点全被吃（`toolbar.mousedown` 零日志）
+2. **命中测试**：颜色点/粗细条是 NSButton 的装饰子视图，吞掉 `mouseDown` ⇒ action 不触发（需 `override hitTest` 返回 self）
