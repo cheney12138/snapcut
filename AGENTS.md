@@ -11,6 +11,16 @@
 - 开发 → 构建（`make dev`）→ **交给用户自己验证**。
 - 例外：用户明确说"没人用 / 你自己测"才跑自测；跑完恢复现场。
 
+## 进程生命周期纪律（坑 30/31：bundle id 被系统记死）
+
+- **永远不要 `pkill -9 -x Snapcut`**。两次实锤：`dev.snapcut.app`、`dev.snapcut.app2`
+  相继被系统记死（启动即 run loop 退出 exit(0)，同二进制换 id 即活）—— correlate 的都是
+  「几十次 kill -9 + 快速启停」。要停 App 用优雅退出：
+  `osascript -e 'tell application id "app.snapcut.macos" to quit'`（或菜单退出）。
+- 同机只有一个可 GUI 验证的实例（TCC 按主 bundle id 授权；worktree 构建同 id 会抢
+  ⌘⇧A 热键 + unified log 混流，坑 24）—— 并行 worker 只做「代码+构建」，
+  GUI e2e 由主会话串行执行。
+
 ## TCC / 权限纪律
 
 - `CGPreflightScreenCaptureAccess()` 不弹窗，随便查；`CGRequestScreenCaptureAccess()`

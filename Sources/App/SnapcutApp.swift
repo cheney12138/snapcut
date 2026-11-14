@@ -22,8 +22,9 @@ struct SnapcutApp: App {
         MenuBarExtra {
             TrayMenuContent()
         } label: {
-            // 品牌标记剪影（IconFactory 同源，template 渲染 = 跟随菜单栏明暗）
-            Image(nsImage: IconFactory.statusIcon())
+            // 品牌标记剪影（IconFactory 同源，template 渲染 = 跟随菜单栏明暗；
+            // 15pt = 比系统默认 18 略小一圈，视觉与相邻系统图标更协调）
+            Image(nsImage: IconFactory.statusIcon(pointSize: 15))
         }
         .menuBarExtraStyle(.menu)
     }

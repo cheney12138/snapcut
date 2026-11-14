@@ -30,6 +30,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private let generalPane = NSView()
     private let hotkeyPane = NSView()
     private let aboutPane = NSView()
+    private var permBox: NSBox?
+    private var permStatusDot: NSView?
+    private var permStatusLabel: NSTextField?
 
     // 通用 tab 控件
     private var afterCapturePopup: NSPopUpButton!
@@ -438,12 +441,77 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         stack.alignment = .centerX
         stack.spacing = 8
         stack.setCustomSpacing(4, after: versionLabel)
+        stack.setCustomSpacing(20, after: tagline)
         stack.translatesAutoresizingMaskIntoConstraints = false
         aboutPane.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: aboutPane.centerXAnchor),
             stack.centerYAnchor.constraint(equalTo: aboutPane.centerYAnchor),
         ])
+
+        // 权限状态卡片（用户裁定：权限情况放这里，不放托盘菜单）
+        let permCard = NSBox()
+        permCard.title = "屏幕录制权限"
+        permCard.titlePosition = .noTitle
+        permBox = permCard
+        let permRow = NSStackView(views: [])
+        permRow.orientation = .horizontal
+        permRow.spacing = 10
+        permRow.alignment = .centerY
+
+        let statusDot = NSView(frame: NSRect(x: 0, y: 0, width: 8, height: 8))
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 4
+        permStatusDot = statusDot
+        permRow.addArrangedSubview(statusDot)
+
+        let statusLabel = NSTextField(labelWithString: "检查中…")
+        statusLabel.font = .systemFont(ofSize: 12)
+        permStatusLabel = statusLabel
+        permRow.addArrangedSubview(statusLabel)
+
+        let permButton = NSButton(title: "去授权…", target: self, action: #selector(openPermissionSettings))
+        permButton.bezelStyle = .rounded
+        permButton.controlSize = .regular
+        permRow.addArrangedSubview(permButton)
+
+        let permHint = NSTextField(labelWithString: "无权限时无法截屏；授权后需重启 Snapcut")
+        permHint.font = .systemFont(ofSize: 10.5)
+        permHint.textColor = .secondaryLabelColor
+
+        let permStack = NSStackView(views: [permRow, permHint])
+        permStack.orientation = .vertical
+        permStack.alignment = .leading
+        permStack.spacing = 6
+        permStack.translatesAutoresizingMaskIntoConstraints = false
+        permCard.contentView = permStack
+        permCard.translatesAutoresizingMaskIntoConstraints = false
+        aboutPane.addSubview(permCard)
+        NSLayoutConstraint.activate([
+            permCard.topAnchor.constraint(equalTo: stack.bottomAnchor, constant: 16),
+            permCard.centerXAnchor.constraint(equalTo: aboutPane.centerXAnchor),
+            permCard.widthAnchor.constraint(equalToConstant: 300),
+        ])
+        refreshPermissionStatus()
+    }
+
+    /// 权限状态刷新（打开窗口 / 每次 buildAbout 时调用）
+    @MainActor
+    private func refreshPermissionStatus() {
+        let granted = AppCoordinatorShared.deps?.permission.isGranted() ?? false
+        if granted {
+            permStatusDot?.layer?.backgroundColor = NSColor.systemGreen.cgColor
+            permStatusLabel?.stringValue = "已授权"
+            Log.event(.app, "settings.permission", ["state": "granted"])
+        } else {
+            permStatusDot?.layer?.backgroundColor = NSColor.systemOrange.cgColor
+            permStatusLabel?.stringValue = "未授权（截屏不可用）"
+            Log.event(.app, "settings.permission", ["state": "denied"])
+        }
+    }
+
+    @objc private func openPermissionSettings() {
+        TCCPermission.openSystemSettings()
     }
 
     // MARK: - 刷新（打开窗口时从设置回填控件）

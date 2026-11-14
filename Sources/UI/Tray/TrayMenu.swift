@@ -59,11 +59,6 @@ struct TrayMenuContent: View {
         }
         .keyboardShortcut(",", modifiers: [.command])
 
-        Button("屏幕录制权限…") {
-            Log.event(.tray, "tray.action", ["item": "openPermission"])
-            TCCPermission.openSystemSettings()
-        }
-
         Divider()
 
         Button("退出 Snapcut") {

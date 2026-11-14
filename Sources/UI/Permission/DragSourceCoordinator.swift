@@ -54,7 +54,8 @@ final class DraggableAppIconView: NSImageView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        image = IconFactory.appIcon(pointSize: min(frameRect.width, frameRect.height))
+        // 品牌真源：AppIcon.icns（系统自动套 squircle 圆角）
+        image = NSApp.applicationIconImage
         imageScaling = .scaleProportionallyUpOrDown
         // ⚠️ 不用 isEnabled=false 隔离事件（NSImageView 会画淡化态），也不设 isEditable
     }
@@ -94,7 +95,9 @@ final class DraggableAppIconView: NSImageView {
         // 拖拽影像 = 图标本身，热点居中
         item.setDraggingFrame(
             NSRect(origin: CGPoint(x: -iconSize.width / 2, y: -iconSize.height / 2), size: iconSize),
-            contents: IconFactory.appIcon(pointSize: min(iconSize.width, iconSize.height))
+            // 品牌真源：直接用 AppIcon.icns（蓝底折叠剪刀 logo），
+            // 旧代码绘制四角括号图形与品牌不一致（用户实报「浮窗图标还没改」）
+            contents: NSApp.applicationIconImage
         )
         beginDraggingSession(with: [item], event: event, source: DragSourceCoordinator.shared)
     }

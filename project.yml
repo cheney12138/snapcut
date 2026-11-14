@@ -23,7 +23,7 @@ targets:
       - Resources
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.snapcut.app2
+        PRODUCT_BUNDLE_IDENTIFIER: app.snapcut.macos
         ENABLE_HARDENED_RUNTIME: "NO"
         DEAD_CODE_STRIPPING: "YES"
         SWIFT_STRICT_CONCURRENCY: complete

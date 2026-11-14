@@ -77,14 +77,6 @@ final class StatusItemController: NSObject {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
-        let permissionItem = NSMenuItem(
-            title: "屏幕录制权限…",
-            action: #selector(openPermissionSettings(_:)),
-            keyEquivalent: ""
-        )
-        permissionItem.target = self
-        menu.addItem(permissionItem)
-
         menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "退出 Snapcut",
@@ -153,11 +145,6 @@ final class StatusItemController: NSObject {
     @objc private func openSettings(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "openSettings"])
         SettingsWindowController.shared.show(store: UserDefaultsSettingsStore())
-    }
-
-    @objc private func openPermissionSettings(_ sender: Any?) {
-        Log.event(.tray, "tray.action", ["item": "openPermission"])
-        TCCPermission.openSystemSettings()
     }
 
     @objc private func quit(_ sender: Any?) {
