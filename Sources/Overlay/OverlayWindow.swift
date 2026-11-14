@@ -45,6 +45,11 @@ final class OverlayWindow: NSWindow {
     func exitScrollMode() {
         (contentView as? OverlayView)?.exitScrollMode()
     }
+
+    /// 外部入口：整屏截图（⌘⇧S / 托盘菜单）
+    func pickFullDisplay() {
+        (contentView as? OverlayView)?.pickFullDisplayExternally()
+    }
 }
 
 /// 覆盖层视图：蒙层 / 橡皮筋选框 / 尺寸角标 + 编辑态（冻结底图 + 标注 + 手势）
@@ -79,6 +84,15 @@ final class OverlayView: NSView {
 
     /// 文字输入框（text 工具）
     private var textField: NSTextField?
+
+    /// 悬停命中的窗口（窗口截图预览 + 单击整窗）
+    private var hovered: HoveredWindow?
+    private var hoveredLocalRect: CGRect?
+    private var hoverProbePoint: CGPoint = .zero
+    private var hoverProbeTime: CFTimeInterval = 0
+    /// 单击整窗的延迟任务（220ms 双击宽限：双击=全屏，单击=整窗）
+    private var pendingWindowCapture: DispatchWorkItem?
+    private var trackingAreaRef: NSTrackingArea?
 
     // 视觉常量
     private let dimAlpha: CGFloat = 0.25
@@ -141,6 +155,62 @@ final class OverlayView: NSView {
         needsDisplay = true
     }
 
+    // MARK: - 悬停跟踪（窗口高亮）
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = trackingAreaRef { removeTrackingArea(existing) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingAreaRef = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        guard phase == .waitingForDrag, !scrollMode else { return }
+        updateHover(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        guard hovered != nil else { return }
+        clearHover()
+    }
+
+    /// 鼠标位置的窗口探测（50ms 节流：窗口枚举有成本）
+    private func updateHover(at local: CGPoint) {
+        let now = CACurrentMediaTime()
+        let moved = abs(local.x - hoverProbePoint.x) > 1.5 || abs(local.y - hoverProbePoint.y) > 1.5
+        guard moved || now - hoverProbeTime > 0.08 else { return }
+        hoverProbePoint = local
+        hoverProbeTime = now
+        guard let frame = window?.frame else { return }
+        let global = CGPoint(x: frame.minX + local.x, y: frame.maxY - local.y)
+        let found = WindowLocator.window(atGlobalPoint: global, excludingPID: getpid())
+        guard found != hovered else { return }
+        hovered = found
+        hoveredLocalRect = found.map {
+            CGRect(
+                x: $0.rectGlobal.minX - frame.minX,
+                y: frame.maxY - $0.rectGlobal.maxY,
+                width: $0.rectGlobal.width,
+                height: $0.rectGlobal.height
+            )
+        }
+        needsDisplay = true
+    }
+
+    private func clearHover() {
+        hovered = nil
+        hoveredLocalRect = nil
+        needsDisplay = true
+    }
+
     // MARK: - 光标
 
     override func resetCursorRects() {
@@ -160,6 +230,13 @@ final class OverlayView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         switch phase {
         case .waitingForDrag:
+            // 双击 = 当前显示器全屏截图（与单击整窗共用鼠标时靠宽限区分）
+            if event.clickCount >= 2 {
+                pendingWindowCapture?.cancel()
+                pendingWindowCapture = nil
+                pickFullDisplay()
+                return
+            }
             phase = .dragging(start: point)
             selectionLocal = CGRect(origin: point, size: .zero)
             window?.makeKey()
@@ -206,6 +283,11 @@ final class OverlayView: NSView {
                 phase = .waitingForDrag
                 selectionLocal = .zero
                 needsDisplay = true
+                // 单击（未拖动）：命中窗口 → 220ms 宽限后整窗截图
+                // （宽限是为了让双击能被识别为全屏，见 mouseDown clickCount>=2）
+                if let target = hovered {
+                    scheduleWindowCapture(target)
+                }
                 return
             }
             phase = .confirmed
@@ -223,6 +305,62 @@ final class OverlayView: NSView {
         default:
             break
         }
+    }
+
+    // MARK: - 整窗 / 全屏采集
+
+    private func scheduleWindowCapture(_ target: HoveredWindow) {
+        pendingWindowCapture?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.phase == .waitingForDrag else { return }
+            self.pickWindow(target)
+        }
+        pendingWindowCapture = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+    }
+
+    private func pickWindow(_ target: HoveredWindow) {
+        guard let screen = window?.screen else { return }
+        pendingWindowCapture = nil
+        if let frame = window?.frame {
+            selectionLocal = CGRect(
+                x: target.rectGlobal.minX - frame.minX,
+                y: frame.maxY - target.rectGlobal.maxY,
+                width: target.rectGlobal.width,
+                height: target.rectGlobal.height
+            )
+        }
+        phase = .confirmed
+        needsDisplay = true
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
+        Log.event(.overlay, "overlay.pick.window", [
+            "owner": target.ownerName,
+            "title": target.title,
+            "size": "\(Int(target.rectGlobal.width))x\(Int(target.rectGlobal.height))",
+        ])
+        controller.didSelect(rect: target.rectGlobal, on: screen)
+    }
+
+    private func pickFullDisplay() {
+        guard let screen = window?.screen else { return }
+        selectionLocal = bounds
+        phase = .confirmed
+        needsDisplay = true
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
+        Log.event(.overlay, "overlay.pick.fullscreen", [
+            "screen": "\(Int(screen.frame.width))x\(Int(screen.frame.height))",
+        ])
+        controller.didSelect(rect: screen.frame, on: screen)
+    }
+
+    /// 外部入口（热键 ⌘⇧S / 托盘菜单）：直接整屏
+    func pickFullDisplayExternally() {
+        guard phase == .waitingForDrag else { return }
+        pickFullDisplay()
     }
 
     // MARK: - 编辑态手势（标注绘制）
@@ -543,11 +681,26 @@ final class OverlayView: NSView {
         (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 4), withAttributes: attributes)
     }
 
-    /// 选区阶段：蒙层 + 橡皮筋 + 角标 + 提示
+    /// 选区阶段：蒙层 + 橡皮筋 + 角标 + 窗口悬停高亮
     private func drawSelection(ctx: CGContext) {
         // 1. 蒙层
         ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
         ctx.fill(bounds)
+
+        // 1.5 窗口悬停高亮：挖出该窗口区域（提亮）+ 系统蓝描边 + 应用名角标
+        let selectionEmpty = selectionLocal.width <= 0 && selectionLocal.height <= 0
+        if selectionEmpty, let rect = hoveredLocalRect, let target = hovered {
+            ctx.saveGState()
+            ctx.setBlendMode(.clear)
+            ctx.fill(rect)
+            ctx.restoreGState()
+            ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.95).cgColor)
+            ctx.setLineWidth(2)
+            ctx.stroke(rect.insetBy(dx: 1, dy: 1))
+            let label = target.title.isEmpty ? target.ownerName : "\(target.ownerName) · \(target.title)"
+            drawWindowBadge(text: label, below: rect)
+            return
+        }
 
         guard selectionLocal.width > 0 || selectionLocal.height > 0 else { return }
 
@@ -607,6 +760,32 @@ final class OverlayView: NSView {
         if session.store.annotations.isEmpty && pendingAnnotation == nil && textField == nil {
             drawHintText("Snapcut · 框选完成，可直接标注 · 1-6 切工具 · H 藏工具栏 · Enter 复制 · Esc 取消")
         }
+    }
+
+    /// 窗口名角标（白底深字胶囊，贴窗口左上角内侧）
+    ///
+    /// ⚠️ 不能写 `NSColor.labelColor`：本覆盖层是 dark appearance，labelColor 解析成
+    /// 白色 ⇒ 白底白字不可读（实拍病例）。固定深色文字 + 白底。
+    private func drawWindowBadge(text: String, below rect: CGRect) {
+        let maxChars = 42
+        let shown = text.count > maxChars ? String(text.prefix(maxChars)) + "…" : text
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor(calibratedWhite: 0.12, alpha: 1),
+        ]
+        let textSize = (shown as NSString).size(withAttributes: attributes)
+        let padding: CGFloat = 6
+        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + 4))
+        // 贴在窗口内侧左上（外侧会压到菜单栏）
+        var origin = CGPoint(x: rect.minX + 8, y: rect.minY + 8)
+        origin.x = min(max(origin.x, 4), bounds.width - size.width - 4)
+        let badgeRect = CGRect(origin: origin, size: size)
+        let path = CGPath(roundedRect: badgeRect, cornerWidth: 5, cornerHeight: 5, transform: nil)
+        let ctx = NSGraphicsContext.current?.cgContext
+        ctx?.setFillColor(NSColor.white.withAlphaComponent(0.94).cgColor)
+        ctx?.addPath(path)
+        ctx?.fillPath()
+        (shown as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 2), withAttributes: attributes)
     }
 
     private func drawBadge(text: String, below rect: CGRect) {

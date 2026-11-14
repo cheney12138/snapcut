@@ -56,6 +56,7 @@ final class OverlayController {
         let start = DispatchTime.now()
         // 激活 App：保证覆盖层可靠接收键盘（Enter/Esc）与点击拖拽
         // （点击激活竞争对未激活窗口不可靠；结束时 restoreFocus 归还）
+        ensureActivation(reason: "overlay.begin")
         NSApp.activate(ignoringOtherApps: true)
         for screen in NSScreen.screens {
             let window = OverlayWindow(screen: screen, controller: self)
@@ -69,6 +70,26 @@ final class OverlayController {
         Log.event(.overlay, "overlay.open", [
             "screens": "\(NSScreen.screens.count)",
             "ms": "\(elapsedMs)",
+        ])
+    }
+
+    /// 全屏截图入口（⌘⇧S / 托盘「截取全屏」）：覆盖层一出现就命中鼠标所在显示器整屏
+    func beginFullScreen(completion: @escaping (Result) -> Void) {
+        begin(completion: completion)
+        let mouse = NSEvent.mouseLocation
+        let target = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        guard let target else { return }
+        for window in windows where window.owningScreen == target {
+            window.pickFullDisplay()
+        }
+        // 其他屏的蒙层立刻撤掉（全屏会话只覆盖一块屏）
+        for window in windows where window.owningScreen != target {
+            window.orderOut(nil)
+            window.close()
+        }
+        windows.removeAll { $0.owningScreen != target }
+        Log.event(.overlay, "overlay.fullscreen.begin", [
+            "screen": "\(Int(target.frame.width))x\(Int(target.frame.height))",
         ])
     }
 
@@ -186,9 +207,33 @@ final class OverlayController {
                   let editorView = editorWindow.contentView else { return }
             // 病例（e2e 实测）：ToolbarPanel 创建后 App key 状态丢失且 appActive=false，
             // 无激活态的窗口无法成为 key ⇒ Enter/Esc 键盘事件全部丢失。activate+makeKey 夺回。
-            NSApp.activate(ignoringOtherApps: true)
+            self.ensureActivation(reason: "editor.enter")
             editorWindow.makeKeyAndOrderFront(nil)
             _ = editorWindow.makeFirstResponder(editorView)
+            let keyOK = editorWindow.isKeyWindow
+            let active = NSApp.isActive
+            Log.event(.editor, "editor.focus", [
+                "keyWin": "\(keyOK)", "active": "\(active)",
+            ])
+        }
+    }
+
+    /// 激活保障（病例：⌘⇧S 全屏路径**没有真实鼠标点击**触发激活，
+    /// `NSApp.activate` 在 Carbon 热键回调里可能被系统忽略 ⇒ frontmost 仍是
+    /// Chrome ⇒ Enter/Esc 全送给了 Chrome，编辑器僵死。区域路径靠点击掩盖了这个 bug）
+    func ensureActivation(reason: String, attempt: Int = 0) {
+        guard NSApp.isActive == false else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        if attempt == 0 {
+            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
+        }
+        guard attempt < 3 else {
+            Log.error(.app, "activate.fail", ["reason": reason])
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self, !NSApp.isActive else { return }
+            self.ensureActivation(reason: reason, attempt: attempt + 1)
         }
     }
 

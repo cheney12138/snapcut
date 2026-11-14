@@ -33,6 +33,9 @@ final class AppCoordinator {
         hotkeyCenter.register(keyCode: kVK_ANSI_A, modifiers: [.command, .shift]) { [weak self] in
             self?.beginRegionCapture()
         }
+        hotkeyCenter.register(keyCode: kVK_ANSI_S, modifiers: [.command, .shift]) { [weak self] in
+            self?.beginFullScreenCapture()
+        }
     }
 
     func teardown() {
@@ -68,6 +71,32 @@ final class AppCoordinator {
         let elapsedMs = Int(Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000)
         if elapsedMs > 50 {
             Log.error(.overlay, "overlay.open.slow", ["ms": "\(elapsedMs)"])
+        }
+    }
+
+    /// 全屏截图（⌘⇧S）：不做选区，直接整屏进编辑态
+    func beginFullScreenCapture() {
+        guard state == .idle else {
+            Log.event(.app, "capture.ignored", ["state": state.rawValue])
+            return
+        }
+        state = .overlay
+        if overlayController == nil {
+            overlayController = OverlayController()
+        }
+        overlayController?.beginFullScreen { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .copy(let image):
+                self.state = .exporting
+                self.exporter.copyToClipboard(image)
+            case .save(let image):
+                self.state = .exporting
+                self.exporter.savePanel(image)
+            case .cancelled:
+                break
+            }
+            self.state = .idle
         }
     }
 

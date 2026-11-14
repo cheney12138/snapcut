@@ -40,6 +40,15 @@ final class StatusItemController {
         captureItem.target = self
         menu.addItem(captureItem)
 
+        let fullScreenItem = NSMenuItem(
+            title: "截取全屏",
+            action: #selector(captureFullScreen(_:)),
+            keyEquivalent: "s"
+        )
+        fullScreenItem.keyEquivalentModifierMask = [.command, .shift]
+        fullScreenItem.target = self
+        menu.addItem(fullScreenItem)
+
         let permissionItem = NSMenuItem(
             title: "屏幕录制权限…",
             action: #selector(openPermissionSettings(_:)),
@@ -64,6 +73,11 @@ final class StatusItemController {
     @objc private func captureRegion(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "captureRegion"])
         coordinator?.beginRegionCapture()
+    }
+
+    @objc private func captureFullScreen(_ sender: Any?) {
+        Log.event(.tray, "tray.action", ["item": "captureFullScreen"])
+        coordinator?.beginFullScreenCapture()
     }
 
     @objc private func openPermissionSettings(_ sender: Any?) {
