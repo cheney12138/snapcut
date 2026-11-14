@@ -898,7 +898,14 @@ private final class TBPrimaryButton: NSButton {
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.backgroundColor = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1).cgColor
-        applyShadow(hot: false)
+        // 原型 .tb-primary：inset 0 1px 0 rgba(255,255,255,.28) —— 顶部 1px 高光线
+        // 让蓝色胶囊有「玻璃立体感」，否则是一块死平的饱和色（用户实评「丑」的差距点）
+        let highlight = CALayer()
+        highlight.frame = CGRect(x: 1, y: 1, width: 0, height: 1)
+        highlight.autoresizingMask = [.layerWidthSizable, .layerMinYMargin]
+        highlight.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor
+        layer?.addSublayer(highlight)
+        applyHot(false)
         heightAnchor.constraint(equalToConstant: 28).isActive = true
     }
 
@@ -911,8 +918,16 @@ private final class TBPrimaryButton: NSButton {
         return size
     }
 
-    private func applyShadow(hot: Bool) {
-        // 静止：0 3px 10px rgba(10,132,255,.38)；hover：0 6px 16px rgba(10,132,255,.45)
+    private func applyHot(_ hot: Bool, pressed: Bool = false) {
+        isHot = hot
+        // 原型 .tb-primary:hover —— 背景 #1a8cff + 上浮 2px + 投影加深；
+        // :active —— 回落 1px + scale(.97)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(
+            srgbRed: hot ? 0.102 : 0.039, green: hot ? 0.549 : 0.518,
+            blue: 1.0, alpha: 1
+        ).cgColor
+        layer?.transform = CATransform3DMakeTranslation(0, hot && !pressed ? 2 : 0, 0)
         layer?.shadowColor = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0,
                                      alpha: hot ? 0.45 : 0.38).cgColor
         layer?.shadowOpacity = 1
@@ -920,11 +935,12 @@ private final class TBPrimaryButton: NSButton {
         layer?.shadowOffset = CGSize(width: 0, height: hot ? -6 : -3)
         layer?.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
                                    cornerWidth: 8, cornerHeight: 8, transform: nil)
+        layer?.removeAnimation(forKey: "hot")
     }
 
     override func layout() {
         super.layout()
-        applyShadow(hot: isHot)
+        applyHot(isHot)
     }
 
     override func updateTrackingAreas() {
@@ -944,7 +960,7 @@ private final class TBPrimaryButton: NSButton {
         layer?.backgroundColor = NSColor(srgbRed: 0.102, green: 0.549, blue: 1.0, alpha: 1).cgColor
         layer?.transform = CATransform3DMakeTranslation(0, -2, 0)
         CATransaction.commit()
-        applyShadow(hot: true)
+        applyHot(true)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -955,7 +971,7 @@ private final class TBPrimaryButton: NSButton {
         layer?.backgroundColor = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1).cgColor
         layer?.transform = CATransform3DIdentity
         CATransaction.commit()
-        applyShadow(hot: false)
+        applyHot(false)
     }
 }
 

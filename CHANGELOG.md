@@ -82,7 +82,36 @@
 - 现象：明明逻辑对，Enter 就是不生效；日志里冒出没见过的事件（settings.window.open）
 - 纪律：每次真机验证前 `pkill -9 -f Snapcut`，并 `ps aux | grep Snapcut` 确认只剩一个实例
 
-**坑 25：OCR 对低对比度/深色背景文字识别率明显下降**
+**坑 26：标注层画进了「图像翻转 gstate」⇒ 矩形画了但屏幕零像素（用户实报「画不出任何东西」）**
+- 病例：`shape.commit`/`editor.draw count=1` 日志全在，但选区内像素级扫红 = 0。
+  drawEditor 把 CGRenderer.render 放在「为 Y-up 位图准备的绝对坐标翻转 CTM」里，
+  而标注几何是选区局部坐标 → 画出来必然被 clip 裁光
+- 修复：标注层移出图像翻转 gstate，独立 gstate（clip 选区 + 平移原点），视图原生 Y-down CTM 直画
+
+**坑 27：unionRect 增量迭代语义漂移 ⇒ 拖 150pt 只画出 75pt 宽**
+- 病例：每次 mouseDragged 拿「上一帧 rect」再算 `abs(point - (minX+w))`，w 变了之后
+  算出的宽越来越偏。修成 `rectFromPoints`（起点锚定，两点定形）
+
+**坑 28：CGEvent 注入残留 Shift flag ⇒ e2e 选区被 1:1 锁成正方形（200×200）**
+- 病例：keyDown 注入后 hid modifier state 残留，后续 mouseDragged 全带 .shift →
+  选区锁 1:1。e2e 脚本所有鼠标事件必须显式 `flags = []`
+
+**坑 29：字典字面量重复 key ⇒ mouseDragged 运行时 trap，事件流「神秘消失」**
+- 病例：补丁套补丁把 viewId 写了两遍，`Dictionary.init(dictionaryLiteral:)` 断言崩溃，
+  表现为「window 收到事件、view 一条日志没有、进程无声消失」。诊断日志本身引入的崩溃，
+  crash report（Dictionary literal + mouseDragged 栈）定位
+
+**坑 30：bundle id `dev.snapcut.app` 被系统记死 ⇒ SwiftUI 启动即 exit(0) / NSStatusItem 永远隐藏**
+- 病例链（对照实验全做齐）：
+  ① 手写 NSStatusItem 永远停 x=1690 虚拟停车位（onScreen=false），20 行最小 App 复现
+  ② killall ControlCenter、全新 autosaveName、新 autosaveName + isVisible 重试：全无效
+  ③ SwiftUI MenuBarExtra 测试 App（同机）正常显示 → 托盘路径切 MenuBarExtra
+  ④ 同二进制换 plist bundleId → 存活 + 图标显示；不换 → run loop 直接退出 exit(0)
+- 根因：NSStatusItem 时代几十次 pkill-9 + 快速启停，把 LS/TCC/CC 的 per-app 状态写坏
+  （坑 4 的 LS 损坏换 id 病例二次复发，这次更彻底）
+- 修复：bundle id 换 `dev.snapcut.app2` + 托盘切 SwiftUI MenuBarExtra（glance 同款路径），
+  NSMenu 保留在 StatusItemController 服务 ⌥⌘H 光标兜底
+- 代价：TCC 屏幕录制权限需重新授权一次（onboarding 会引导）
 - 实测：亮部文字（`cd ./snapcut && python3 - <<'PYEOF'（+88 Lines）`）一字不差；
   暗历史行出现 `Hppwooraznacoronared` 这类误读
 - 试过无效：反相、放大 2x、automaticallyDetectsLanguage —— 无改善

@@ -32,6 +32,22 @@ final class OverlayWindow: NSWindow {
         contentView = view
     }
 
+    /// 诊断：窗口层事件流总闸（定位鼠标事件在哪一层被吞）
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown, .leftMouseUp, .leftMouseDragged:
+            Log.event(.overlay, "win.event", [
+                "type": "\(event.type == .leftMouseDown ? "down" : (event.type == .leftMouseUp ? "up" : "drag"))",
+                "winId": "\(Unmanaged.passUnretained(self).toOpaque())",
+                "keyWin": "\(isKeyWindow)",
+                "appKey": "\(NSApp.keyWindow.map { String(describing: type(of: $0)) } ?? "nil")",
+                "active": "\(NSApp.isActive)",
+            ])
+        default: break
+        }
+        super.sendEvent(event)
+    }
+
     /// 选区所在屏进入编辑模式（显示冻结底图 + 标注交互）
     func enterEditorMode(session: EditorSession) {
         (contentView as? OverlayView)?.enterEditorMode(session: session)
@@ -100,6 +116,7 @@ final class OverlayView: NSView {
         case move(startRect: CGRect, startPoint: CGPoint)
     }
     private var editGesture: EditGesture = .none
+    private var draggedEventCount = 0
     /// 空格按下（临时切「整体移动」）
     private var spacePressed = false
     /// 悬停中的手柄（绘制手柄高亮 + 光标反馈）
@@ -292,6 +309,9 @@ final class OverlayView: NSView {
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
         let point = convert(event.locationInWindow, from: nil)
+        Log.event(.overlay, "overlay.mousedown", [
+            "phase": phaseLabel, "pt": "\(Int(point.x)),\(Int(point.y))",
+        ])
         switch phase {
         case .waitingForDrag:
             // 双击 = 当前显示器全屏截图（与单击整窗共用鼠标时靠宽限区分）
@@ -318,6 +338,14 @@ final class OverlayView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         super.mouseDragged(with: event)
+        draggedEventCount += 1
+        Log.event(.overlay, "overlay.dragged", [
+            "n": "\(draggedEventCount)",
+            "pt": "\(Int(event.locationInWindow.x)),\(Int(event.locationInWindow.y))",
+            "key": "\(window?.isKeyWindow ?? false)",
+            "viewId": "\(Unmanaged.passUnretained(self).toOpaque())",
+            "sel": "\(Int(selectionLocal.width))x\(Int(selectionLocal.height))",
+        ])
         switch phase {
         case .dragging(let start):
             let point = convert(event.locationInWindow, from: nil)
@@ -354,6 +382,11 @@ final class OverlayView: NSView {
         super.mouseUp(with: event)
         switch phase {
         case .dragging:
+            Log.event(.overlay, "overlay.mouseup", [
+                "sel": "\(Int(selectionLocal.minX)),\(Int(selectionLocal.minY)),\(Int(selectionLocal.width)),\(Int(selectionLocal.height))",
+                "phase": phaseLabel,
+                "objId": "\(Unmanaged.passUnretained(self).toOpaque())",
+            ])
             if selectionLocal.width < minSelectionSize || selectionLocal.height < minSelectionSize {
                 phase = .waitingForDrag
                 selectionLocal = .zero
@@ -441,6 +474,12 @@ final class OverlayView: NSView {
     // MARK: - 编辑态手势（标注绘制）
 
     private func handleEditorMouseDown(_ point: CGPoint, event: NSEvent) {
+        Log.event(.editor, "editor.mousedown", [
+            "pt": "\(Int(point.x)),\(Int(point.y))",
+            "tool": editorSession?.currentTool.label ?? "none",
+            "contains": "\(editorRectLocal.contains(point))",
+            "clicks": "\(event.clickCount)",
+        ])
         guard let session = editorSession else { return }
 
         // 1) 手柄优先：拖手柄改选区（Snow Shot 同款「快速选区修改」）
@@ -476,6 +515,11 @@ final class OverlayView: NSView {
                 colorIndex: session.colorIndex, strokeWidth: session.strokeWidth, text: nil, index: nil
             )
         case .rect, .mosaic:
+            Log.event(.editor, "editor.shape.begin", [
+            "tool": session.currentTool.label,
+            "a0": "\(localToAnnotation(point))",
+            "erl": "\(Int(editorRectLocal.minX)),\(Int(editorRectLocal.minY)),\(Int(editorRectLocal.width)),\(Int(editorRectLocal.height))",
+        ])
             pendingStartPoint = localToAnnotation(point)
             let startRect = CGRect(origin: point, size: .zero)
             pendingAnnotation = AnnotationModel(
@@ -513,15 +557,20 @@ final class OverlayView: NSView {
 
         guard var pending = pendingAnnotation else { return }
         let a = localToAnnotation(point)
+        Log.event(.editor, "editor.drag", [
+            "pt": "\(Int(point.x)),\(Int(point.y))",
+            "a": "\(Int(a.x)),\(Int(a.y))",
+            "erl": "\(Int(editorRectLocal.minX)),\(Int(editorRectLocal.minY)),\(Int(editorRectLocal.width)),\(Int(editorRectLocal.height))",
+        ])
         switch pending.shape {
         case .arrow(_, _):
             pending.shape = .arrow(from: pendingStartPoint ?? a, to: a)
         case .highlight(let from, _):
             pending.shape = .highlight(from: from, to: a)
-        case .rect(let r):
-            pending.shape = .rect(unionRect(r, a))
-        case .mosaic(let r):
-            pending.shape = .mosaic(unionRect(r, a))
+        case .rect:
+            pending.shape = .rect(rectFromPoints(pendingStartPoint ?? a, a))
+        case .mosaic:
+            pending.shape = .mosaic(rectFromPoints(pendingStartPoint ?? a, a))
         default:
             break
         }
@@ -639,16 +688,19 @@ final class OverlayView: NSView {
         case .highlight(let from, _):
             if hypot(a.x - from.x, a.y - from.y) < 4 { pendingAnnotation = nil; needsDisplay = true; return }
             final.shape = .highlight(from: from, to: a)
-        case .rect(let r):
-            let rect = unionRect(r, a)
+        case .rect:
+            let rect = rectFromPoints(pendingStartPoint ?? a, a)
             if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return }
             final.shape = .rect(rect)
-        case .mosaic(let r):
-            let rect = unionRect(r, a)
+        case .mosaic:
+            let rect = rectFromPoints(pendingStartPoint ?? a, a)
             if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return }
             final.shape = .mosaic(rect)
         default: break
         }
+        Log.event(.editor, "editor.shape.commit", [
+            "shape": "\(final.shape)", "color": "\(final.color)",
+        ])
         controller.addAnnotation(final)
         pendingAnnotation = nil
         pendingStartPoint = nil
@@ -860,10 +912,15 @@ final class OverlayView: NSView {
         )
     }
 
-    private func unionRect(_ r: CGRect, _ point: CGPoint) -> CGRect {
+    /// 两点 → 矩形（起点锚定，非增量 union）
+    ///
+    /// ⚠️ 病例：旧实现 `abs(point - (minX + width))` 在增量迭代下语义漂移——
+    /// 每次 drag 都拿「上一帧 rect」再算，w 变了之后算出的宽越来越偏（拖 150pt
+    /// 只得 75pt）。矩形/马赛克这类「两点定形」必须始终用固定起点做锚。
+    private func rectFromPoints(_ start: CGPoint, _ point: CGPoint) -> CGRect {
         CGRect(
-            x: min(r.minX, point.x), y: min(r.minY, point.y),
-            width: abs(point.x - (r.minX + r.width)) , height: abs(point.y - (r.minY + r.height))
+            x: min(start.x, point.x), y: min(start.y, point.y),
+            width: abs(point.x - start.x), height: abs(point.y - start.y)
         )
     }
 
@@ -1007,8 +1064,20 @@ final class OverlayView: NSView {
         ctx.translateBy(x: -editorRectLocal.minX, y: -editorRectLocal.minY)
         ctx.interpolationQuality = .none
         ctx.draw(session.baseImage, in: editorRectLocal)
+        ctx.restoreGState()
+
         // 3. 标注层（同一渲染器 = 导出所见）
+        // ⚠️ 病例：不能放在上面的「图像翻转 gstate」里画——那个 CTM 是为 Y-up 位图
+        // 准备的绝对坐标翻转，标注却是选区局部坐标 → 画出来必然被 clip 裁光
+        // （用户实报：矩形工具画不出任何东西；log 里 shape.commit 都在，屏幕零像素）。
+        // 正确姿势：回到视图原生 Y-down CTM，clip 选区 + 平移原点即可。
         let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
+        Log.event(.editor, "editor.draw", [
+            "count": "\(annotations.count)", "shapes": annotations.map { "\($0.shape)" }.joined(separator: "|"),
+        ])
+        ctx.saveGState()
+        ctx.clip(to: editorRectLocal)
+        ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.minY)
         CGRenderer.render(annotations: annotations, in: editorRectLocal.size, context: ctx, contextIsYDown: true)
         ctx.restoreGState()
 
