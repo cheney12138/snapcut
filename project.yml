@@ -35,6 +35,7 @@ targets:
       properties:
         CFBundleDisplayName: Snapcut
         CFBundleName: Snapcut
+        CFBundleIconFile: AppIcon
         CFBundleShortVersionString: "0.1.0"
         LSUIElement: true
         NSHighResolutionCapable: true
