@@ -76,7 +76,7 @@ private final class OCRPanelController {
 
         // 顶部提示行
         let hintHeight: CGFloat = 24
-        let hint = NSTextField(labelWithString: "识别结果 · ⌘C 复制 · Esc 关闭")
+        let hint = NSTextField(labelWithString: "识别结果 · ↩ 复制并关闭 · ⌘C 仅复制 · Esc 关闭")
         hint.isEditable = false
         hint.isBordered = false
         hint.drawsBackground = false
@@ -159,6 +159,11 @@ private final class OCRPanelController {
             if event.modifierFlags.contains(.command),
                event.charactersIgnoringModifiers == "c" {
                 self.copyText(closeAfter: false)
+                return nil
+            }
+            // Enter / 小键盘 Enter = 复制并关窗（约定：Enter 是「拿走结果」的终态动作）
+            if event.keyCode == 36 || event.keyCode == 76 {
+                self.copyAndClose()
                 return nil
             }
             return event
