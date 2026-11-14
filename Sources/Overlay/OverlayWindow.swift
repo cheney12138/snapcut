@@ -243,6 +243,15 @@ final class OverlayView: NSView {
 
     private var pendingStartPoint: CGPoint?
 
+    private var phaseLabel: String {
+        switch phase {
+        case .waitingForDrag: return "wait"
+        case .dragging: return "drag"
+        case .confirmed: return "confirm"
+        case .editing: return "edit"
+        }
+    }
+
     private func handleEditorMouseUp(_ point: CGPoint) {
         guard let pending = pendingAnnotation, let session = editorSession else { return }
         let a = localToAnnotation(point)
@@ -325,6 +334,7 @@ final class OverlayView: NSView {
     // MARK: - 键盘
 
     override func keyDown(with event: NSEvent) {
+        Log.logger(.overlay).debug("evt=overlay.keyDown key=\(event.keyCode, privacy: .public) phase=\(phaseLabel, privacy: .public)")
         // 文字输入态：普通键给输入框（first responder 已是 field，事件不会到这）
         switch Int(event.keyCode) {
         case kVK_Escape:

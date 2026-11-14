@@ -42,9 +42,13 @@ final class OverlayController {
         toolbar = nil
         dismissAll()
         let start = DispatchTime.now()
+        // 激活 App：保证覆盖层可靠接收键盘（Enter/Esc）与点击拖拽
+        // （点击激活竞争对未激活窗口不可靠；结束时 restoreFocus 归还）
+        NSApp.activate(ignoringOtherApps: true)
         for screen in NSScreen.screens {
             let window = OverlayWindow(screen: screen, controller: self)
             window.orderFrontRegardless()
+            window.makeKey()
             windows.append(window)
         }
         let elapsedMs = Int(
@@ -144,6 +148,19 @@ final class OverlayController {
         toolbar.orderFrontRegardless()
         self.toolbar = toolbar
         Log.event(.editor, "editor.enter", ["pxW": "\(base.width)", "pxH": "\(base.height)"])
+        // 确保编辑画布是 first responder（键盘路由确定性）。
+        // ⚠️ ToolbarPanel 创建/orderFront 会让窗口 key 状态失效（病例：editor.focus
+        // makeKey=false 且注入键盘事件丢失），延后一个 runloop tick 再夺回 key。
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.editorSession != nil,
+                  let editorWindow = self.editorWindow(),
+                  let editorView = editorWindow.contentView else { return }
+            // 病例（e2e 实测）：ToolbarPanel 创建后 App key 状态丢失且 appActive=false，
+            // 无激活态的窗口无法成为 key ⇒ Enter/Esc 键盘事件全部丢失。activate+makeKey 夺回。
+            NSApp.activate(ignoringOtherApps: true)
+            editorWindow.makeKeyAndOrderFront(nil)
+            _ = editorWindow.makeFirstResponder(editorView)
+        }
     }
 
     private func editorWindow() -> OverlayWindow? {
