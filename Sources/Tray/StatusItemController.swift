@@ -10,12 +10,21 @@ final class StatusItemController {
         self.coordinator = coordinator
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "Snapcut")
+            var icon = NSImage(named: "StatusIcon")
+            let source: String
+            if icon == nil {
+                icon = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "Snapcut")
+                source = "sf-symbol-fallback"
+            } else {
+                source = "asset"
+            }
+            icon?.isTemplate = true // 模板图标：自动适配深浅色菜单栏
+            button.image = icon
             button.imageScaling = .scaleProportionallyDown
+            Log.event(.tray, "tray.icon.created", ["src": source, "nil": "\(icon == nil)"])
         }
         item.menu = buildMenu()
         statusItem = item
-        Log.event(.tray, "tray.icon.created")
     }
 
     private func buildMenu() -> NSMenu {

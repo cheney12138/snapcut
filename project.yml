@@ -19,6 +19,7 @@ targets:
     platform: macOS
     sources:
       - Sources
+      - Resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.snapcut.app
