@@ -32,6 +32,14 @@ final class OverlayController {
     /// 编辑会话（编辑态非空）
     private(set) var editorSession: EditorSession?
     private var toolbar: ToolbarPanel?
+    /// 冻结帧（每显示器一张，截图时刻的静态画面）
+    ///
+    /// 架构决策（照 Snow Shot 主流程，docs/research/01-capture.md）：
+    /// **先冻结整屏 → 再在静态帧上选区/标注**。收益：
+    /// ① 选区期间内容不跳动（视频/动画/光标）；② 覆盖层永不可能入图（拍完才显示窗口）；
+    /// ③ 选区调整/重拍/放大镜/取色全部离线可做；④ 松手进编辑态变零延迟（本地裁剪）。
+    private(set) var frozenImages: [CGDirectDisplayID: CGImage] = [:]
+
     /// 滚动截图会话（S 键触发；非空时覆盖层显示滚动 HUD）
     private(set) var scrollFrames: [CGImage] = []
     private var scrollController: ScrollCaptureController?
@@ -46,51 +54,99 @@ final class OverlayController {
 
     // MARK: - 会话
 
-    func begin(completion: @escaping (Result) -> Void) {
+    func begin(completion: @escaping (Result) -> Void, onShown: (() -> Void)? = nil) {
         self.completion = completion
         previousApp = NSWorkspace.shared.frontmostApplication
         editorSession = nil
         toolbar?.orderOut(nil)
         toolbar = nil
         dismissAll()
-        let start = DispatchTime.now()
+        frozenImages.removeAll()
         // 激活 App：保证覆盖层可靠接收键盘（Enter/Esc）与点击拖拽
         // （点击激活竞争对未激活窗口不可靠；结束时 restoreFocus 归还）
         ensureActivation(reason: "overlay.begin")
         NSApp.activate(ignoringOtherApps: true)
+
+        // 冻结优先：窗口先不上屏（此刻若有窗口会被自己拍进去），
+        // 全屏拍完再盖上去。单屏实测 ~90ms，符合「触发到冻结 ≤500ms」。
+        Task { [weak self] in
+            guard let self else { return }
+            let start = DispatchTime.now()
+            var frames: [CGDirectDisplayID: CGImage] = [:]
+            await withTaskGroup(of: (CGDirectDisplayID, CGImage?).self) { group in
+                for screen in NSScreen.screens {
+                    guard let displayID = DisplayRegistry.displayID(of: screen) else { continue }
+                    group.addTask {
+                        let image = try? await SCKCapture.shared.captureDisplay(displayID: displayID)
+                        return (displayID, image)
+                    }
+                }
+                for await (displayID, image) in group {
+                    if let image { frames[displayID] = image }
+                }
+            }
+            self.frozenImages = frames
+            let freezeMs = Int(
+                Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+            )
+            self.showOverlayWindows()
+            let elapsedMs = Int(
+                Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+            )
+            Log.event(.overlay, "overlay.open", [
+                "screens": "\(NSScreen.screens.count)",
+                "ms": "\(elapsedMs)",
+                "freezeMs": "\(freezeMs)",
+                "frozen": "\(frames.count)",
+            ])
+            onShown?()
+        }
+    }
+
+    /// 上屏：每屏一窗，带冻结帧的窗直接把静态画面铺满（用户看到"屏幕定住"）
+    private func showOverlayWindows() {
         for screen in NSScreen.screens {
             let window = OverlayWindow(screen: screen, controller: self)
+            if let displayID = DisplayRegistry.displayID(of: screen),
+               let frozen = frozenImages[displayID] {
+                window.installFrozenImage(frozen)
+            }
             window.orderFrontRegardless()
             window.makeKey()
             windows.append(window)
         }
-        let elapsedMs = Int(
-            Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+    }
+
+    /// 从冻结帧本地裁剪（零延迟、零二次屏捕）
+    func cropFrozenImage(selection: CGRect, screen: NSScreen) -> CGImage? {
+        guard let displayID = DisplayRegistry.displayID(of: screen),
+              let frozen = frozenImages[displayID] else { return nil }
+        let px = CoordinateConverter.pixelRect(
+            selection: selection, onScreen: screen,
+            imageWidth: frozen.width, imageHeight: frozen.height
         )
-        Log.event(.overlay, "overlay.open", [
-            "screens": "\(NSScreen.screens.count)",
-            "ms": "\(elapsedMs)",
-        ])
+        return frozen.cropping(to: px)
     }
 
     /// 全屏截图入口（⌘⇧S / 托盘「截取全屏」）：覆盖层一出现就命中鼠标所在显示器整屏
     func beginFullScreen(completion: @escaping (Result) -> Void) {
-        begin(completion: completion)
         let mouse = NSEvent.mouseLocation
         let target = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
-        guard let target else { return }
-        for window in windows where window.owningScreen == target {
-            window.pickFullDisplay()
+        begin(completion: completion) { [weak self] in
+            guard let self, let target else { return }
+            for window in self.windows where window.owningScreen == target {
+                window.pickFullDisplay()
+            }
+            // 其他屏的蒙层立刻撤掉（全屏会话只覆盖一块屏）
+            for window in self.windows where window.owningScreen != target {
+                window.orderOut(nil)
+                window.close()
+            }
+            self.windows.removeAll { $0.owningScreen != target }
+            Log.event(.overlay, "overlay.fullscreen.begin", [
+                "screen": "\(Int(target.frame.width))x\(Int(target.frame.height))",
+            ])
         }
-        // 其他屏的蒙层立刻撤掉（全屏会话只覆盖一块屏）
-        for window in windows where window.owningScreen != target {
-            window.orderOut(nil)
-            window.close()
-        }
-        windows.removeAll { $0.owningScreen != target }
-        Log.event(.overlay, "overlay.fullscreen.begin", [
-            "screen": "\(Int(target.frame.width))x\(Int(target.frame.height))",
-        ])
     }
 
     func end() {
@@ -153,7 +209,15 @@ final class OverlayController {
         ])
         AppCoordinatorShared.didEnterConfirm()
 
-        // ⚡ 底图冻结：此刻工具栏还没出现 —— 编辑 UI 永不入图的关键
+        // ⚡ 底图来源：优先用会话开始时冻结的整屏帧**本地裁剪**（零延迟，
+        // 且保证用户看到的内容 = 截到的内容）；缺失时回退实时屏捕
+        if let frozen = cropFrozenImage(selection: rect, screen: screen) {
+            Log.event(.overlay, "overlay.commit.frozen", [
+                "pxW": "\(frozen.width)", "pxH": "\(frozen.height)",
+            ])
+            enterEditor(base: frozen, selection: rect, screen: screen)
+            return
+        }
         Task { [weak self] in
             guard let self else { return }
             do {

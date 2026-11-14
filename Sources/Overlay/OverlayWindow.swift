@@ -46,6 +46,11 @@ final class OverlayWindow: NSWindow {
         (contentView as? OverlayView)?.exitScrollMode()
     }
 
+    /// 安装冻结帧（会话开始时的整屏静态图）
+    func installFrozenImage(_ image: CGImage) {
+        (contentView as? OverlayView)?.installFrozenImage(image)
+    }
+
     /// 外部入口：整屏截图（⌘⇧S / 托盘菜单）
     func pickFullDisplay() {
         (contentView as? OverlayView)?.pickFullDisplayExternally()
@@ -84,6 +89,9 @@ final class OverlayView: NSView {
 
     /// 文字输入框（text 工具）
     private var textField: NSTextField?
+
+    /// 冻结帧（会话开始时的整屏静态画面；有它就不再实时看桌面）
+    private var frozenImage: CGImage?
 
     /// 悬停命中的窗口（窗口截图预览 + 单击整窗）
     private var hovered: HoveredWindow?
@@ -152,6 +160,12 @@ final class OverlayView: NSView {
         scrollMode = false
         window?.ignoresMouseEvents = false
         scrollRectLocal = nil
+        needsDisplay = true
+    }
+
+    /// 安装冻结帧并重绘（"屏幕定住"效果的唯一来源）
+    func installFrozenImage(_ image: CGImage) {
+        frozenImage = image
         needsDisplay = true
     }
 
@@ -681,8 +695,17 @@ final class OverlayView: NSView {
         (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 4), withAttributes: attributes)
     }
 
-    /// 选区阶段：蒙层 + 橡皮筋 + 角标 + 窗口悬停高亮
+    /// 选区阶段：冻结帧 + 蒙层 + 橡皮筋 + 角标 + 窗口悬停高亮
     private func drawSelection(ctx: CGContext) {
+        // 0. 冻结帧铺满（与编辑器同样的翻转处理：Y-down 上下文需镜像一次）
+        if let frozen = frozenImage {
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: bounds.height)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.interpolationQuality = .none
+            ctx.draw(frozen, in: CGRect(origin: .zero, size: bounds.size))
+            ctx.restoreGState()
+        }
         // 1. 蒙层
         ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
         ctx.fill(bounds)
