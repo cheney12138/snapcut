@@ -20,6 +20,7 @@ final class OverlayController {
     enum Action {
         case copy
         case save
+        case quickSave
         case cancel
     }
 
@@ -500,7 +501,7 @@ final class OverlayController {
                 self.end()
                 self.completion = nil
                 switch action {
-                case .save: completion?(.save(result.image))
+                case .save, .quickSave: completion?(.save(result.image))
                 case .cancel: break
                 case .copy: completion?(.copy(result.image))
                 }
@@ -515,7 +516,7 @@ final class OverlayController {
                     self.completion = nil
                     Log.event(.scroll, "scroll.fallback", ["mode": "firstFrame"])
                     switch action {
-                    case .save: completion?(.save(frames[0]))
+                    case .save, .quickSave: completion?(.save(frames[0]))
                     case .cancel: break
                     case .copy: completion?(.copy(frames[0]))
                     }
@@ -566,7 +567,7 @@ final class OverlayController {
             end()
             completion?(.cancelled)
             self.completion = nil
-        case .copy, .save:
+        case .copy, .save, .quickSave:
             guard let session = editorSession else {
                 // 无编辑会话（还在拖选/确认阶段）：直接按选区导出
                 guard let rect = selectionRectGlobal, let screen = selectionScreen else {
@@ -585,7 +586,7 @@ final class OverlayController {
                         let image = try await CaptureService.captureRegion(rect, on: screen)
                         switch action {
                         case .copy: completion?(.copy(image))
-                        case .save: completion?(.save(image))
+                        case .save, .quickSave: completion?(.save(image))
                         case .cancel: break
                         }
                     } catch {
@@ -607,13 +608,21 @@ final class OverlayController {
                 "pxH": "\(finalImage.height)",
             ])
             AppCoordinatorShared.deps?.history.record(finalImage)   // 任何导出都写历史
+            if case .quickSave = action {
+                AppCoordinatorShared.coordinator?.quickSave(image: finalImage)
+                let completion = self.completion
+                end()
+                self.completion = nil
+                completion?(.cancelled)
+                return
+            }
             let completion = self.completion
             end()
             self.completion = nil
             switch action {
             case .copy: completion?(.copy(finalImage))
             case .save: completion?(.save(finalImage))
-            case .cancel: break
+            case .quickSave, .cancel: break
             }
         }
     }

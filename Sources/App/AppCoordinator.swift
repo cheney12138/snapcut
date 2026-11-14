@@ -105,6 +105,14 @@ final class AppCoordinator {
         }
     }
 
+    /// 快速保存（编辑器内 ⌘⌥S）：按设置的目录与文件名规则直接落盘
+    func quickSave(image: CGImage) {
+        _ = exporter.quickSave(image, settings: settings)
+        if settings.showCopyNotification {
+            CaptureToast.show(image: image, message: "已保存到 \((settings.saveDirectoryPath as NSString).lastPathComponent)")
+        }
+    }
+
     /// 全屏截图（⌘⇧S）：不做选区，直接整屏进编辑态
     func beginFullScreenCapture() {
         guard state == .idle else {

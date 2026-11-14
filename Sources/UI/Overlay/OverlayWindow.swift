@@ -774,6 +774,11 @@ final class OverlayView: NSView {
                 controller.perform(action: .copy)
             }
         case kVK_ANSI_S:
+            if event.modifierFlags.contains(.command), event.modifierFlags.contains(.option),
+               phase == .editing || phase == .confirmed {
+                controller.perform(action: .quickSave)
+                return
+            }
             if event.modifierFlags.contains(.command), phase == .editing || phase == .confirmed {
                 controller.perform(action: .save)
             } else if phase == .editing, !event.modifierFlags.contains(.command) {
