@@ -5,6 +5,8 @@ import CoreGraphics
 /// 覆盖层窗口：无边框、透明、screenSaver 层级、全屏盖住单台显示器（docs/03 §3）
 @MainActor
 final class OverlayWindow: NSWindow {
+    // 无边框窗口默认 canBecomeKey=false，必须显式允许才能接收 Enter/Esc 键盘事件
+    override var canBecomeKey: Bool { true }
     init(screen: NSScreen, controller: OverlayController) {
         super.init(
             contentRect: screen.frame,

@@ -19,13 +19,22 @@ final class ExportCoordinator {
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else {
                 Log.event(.export, "export.save.cancelled")
+                self?.releaseFocus()
                 return
             }
             self?.writePNG(image, to: url)
+            self?.releaseFocus()
         }
     }
 
     // MARK: - 私有
+
+    /// 保存面板关闭后把激活权还给原 App（同 overlay.end 的焦点归还逻辑）
+    private func releaseFocus() {
+        guard NSApp.isActive else { return }
+        NSApp.deactivate()
+        Log.event(.app, "focus.deactivated")
+    }
 
     private func defaultFileName() -> String {
         let formatter = DateFormatter()

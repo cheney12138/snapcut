@@ -20,10 +20,14 @@ final class OverlayController {
     private var completion: ((Result) -> Void)?
     private var selectionScreen: NSScreen?
     private var selectionRectGlobal: CGRect?
+    /// 会话开始时的前台 App（结束时把激活权还给它 —— 否则无窗口的激活态会吞掉
+    /// 全局键盘事件，用户实报：截图完别的按键都没反应）
+    private var previousApp: NSRunningApplication?
 
     /// 开始一次选区会话
     func begin(completion: @escaping (Result) -> Void) {
         self.completion = completion
+        previousApp = NSWorkspace.shared.frontmostApplication
         dismissAll()
         let start = DispatchTime.now()
         for screen in NSScreen.screens {
@@ -41,9 +45,24 @@ final class OverlayController {
         ])
     }
 
-    /// 结束会话（无论结果如何，清掉所有窗口）
+    /// 结束会话（清窗口 + 把键盘焦点还给原 App）
     func end() {
         dismissAll()
+        restoreFocus()
+    }
+
+    /// 焦点归还：accessory App 若保持激活却无任何窗口，系统键盘事件会被它吞掉
+    private func restoreFocus() {
+        guard NSApp.isActive else { return }
+        let front = NSWorkspace.shared.frontmostApplication
+        if let prev = previousApp, !prev.isTerminated,
+           prev.processIdentifier != NSRunningApplication.current.processIdentifier {
+            NSApp.yieldActivation(to: prev)
+            Log.event(.app, "focus.restored", ["to": prev.bundleIdentifier ?? "?"])
+        } else if front == nil || front?.processIdentifier == NSRunningApplication.current.processIdentifier {
+            NSApp.deactivate()
+            Log.event(.app, "focus.deactivated")
+        }
     }
 
     private func dismissAll() {
@@ -116,5 +135,20 @@ enum AppCoordinatorShared {
     static weak var coordinator: AppCoordinator?
     static func didEnterConfirm() {
         coordinator?.didEnterConfirm()
+    }
+}
+
+
+// MARK: - 自测入口（真实管线，仅供 --selftest 驱动）
+
+extension OverlayController {
+    /// 模拟一次拖选完成（走与真实 mouseUp 相同的 didSelect 管线）
+    func simulateSelection(rect: CGRect, on screen: NSScreen) {
+        Log.event(.app, "selftest.simulateSelection")
+        didSelect(rect: rect, on: screen)
+    }
+
+    func performForSelfTest(_ action: Action) {
+        perform(action: action)
     }
 }
