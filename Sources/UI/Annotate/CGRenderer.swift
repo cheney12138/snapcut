@@ -172,19 +172,27 @@ enum CGRenderer {
                 .withAlphaComponent(0.55).cgColor)
             context.setLineWidth(1.5)
             context.strokeEllipse(in: circle)
-            // 数字居中：水平用光学宽度，垂直按行高带（基线落在中心 + 半行高处）
+            // 数字水平居中；垂直由下方 baseline 公式处理（Y-down 语义）
             origin = CGPoint(
                 x: anchor.x - lineBounds.width / 2,
-                y: anchor.y - lineBounds.height / 2
+                y: anchor.y
             )
         }
-        // 文字局部翻转：只有 Y-up（导出路径，render 入口已统一翻转到 Y-down）
-        // 需要再翻一次；编辑器画布（isFlipped）本来就是 Y-down，再翻就倒置
+        // CoreText 假设 Y-up 上下文；两种调用方都必须局部翻成 Y-up 画字：
+        // - yDown（编辑器画布，isFlipped）：上下文是 Y-down ⇒ 必须翻，不翻则字形倒置
+        //   且基线语义错乱（实拍病例：badge 数字完全没画进圆里，圆内白色像素≈0）
+        // - !yDown（导出 composite，标注层已整体翻成 Y-down 同一约定）⇒ 同样翻
+        // 基线取「anchor 向下半行高」（Y-down 语义），翻转后字形 [0, ascent] 恰好
+        // 以 anchor 为视觉中心。
         context.saveGState()
-        context.translateBy(x: origin.x, y: origin.y + lineBounds.height)
-        if !yDown {
-            context.scaleBy(x: 1, y: -1)
+        let baseline: CGFloat
+        if badge {
+            baseline = origin.y + lineBounds.height / 2 + font.descender
+        } else {
+            baseline = origin.y
         }
+        context.translateBy(x: origin.x, y: baseline)
+        context.scaleBy(x: 1, y: -1)
         CTLineDraw(line, context)
         context.restoreGState()
     }
