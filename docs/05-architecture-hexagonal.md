@@ -87,10 +87,11 @@ Sources/
 | 目录分层 | ✅ | Core / Adapters / UI / App |
 | Core 纯净性守卫 | ✅ | `scripts/check-architecture.sh`，`make dev` 强制 |
 | 端口协议 | ✅ | 7 个端口 + `Dependencies` |
-| 适配器 conformance | 🟡 | 采集/剪贴板/热键/权限已包；History/OCR/Pin 并行产出后接线 |
-| 合成根注入 | 🟡 | `AppCoordinator` 仍是「单例 + 直连」；下一步改为持有 `Dependencies` 并向下传 |
-| UI 只依赖端口 | 🟡 | 覆盖层仍直接调 `SCKCapture`（经 `CaptureService`）；下一步删除直连 |
+| 适配器 conformance | ✅ | 采集/剪贴板/热键/权限/历史/OCR/贴图 全部 conform，`Dependencies.live()` 统一合成 |
+| 合成根注入 | ✅ | `AppCoordinator.deps` 持有 `Dependencies`，经 `AppCoordinatorShared.deps` 供 UI 只读使用 |
+| UI 只依赖端口 | 🟡 | OCR/贴图/历史/设置已走端口；覆盖层仍经 `CaptureService` 直连 SCK，待收敛 |
 | 用例层（UseCases） | ⬜ | 目前用例逻辑在 `OverlayController`/`EditorSession` 里，随功能增长再抽 |
+| 设置（Settings） | ✅ | Core/Domain `AppSettings` + `HotkeySpec`、Core/Ports `SettingsStoring`、Adapters `UserDefaultsSettingsStore`、UI `SettingsWindowController` |
 
 **不追求一次改完**：每次动到一个文件，就把它顺手按方向归位；新代码必须端口优先。
 
