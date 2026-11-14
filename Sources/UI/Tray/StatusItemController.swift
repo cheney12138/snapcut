@@ -7,6 +7,8 @@ final class StatusItemController: NSObject {
     private weak var coordinator: AppCoordinator?
     private var rootMenu: NSMenu?
     private var historyMenu: NSMenu?
+    /// 「菜单栏已满被挤掉」提示只弹一次（每次启动最多提醒，不轮播）
+    private var overflowToastShown = false
 
     override init() {
         super.init()
@@ -46,15 +48,11 @@ final class StatusItemController: NSObject {
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
-            if let frame = item.button?.window?.frame {
-                Log.event(.tray, "tray.button.frame", [
-                    "x": "\(Int(frame.minX))", "y": "\(Int(frame.minY))",
-                    "w": "\(Int(frame.width))", "h": "\(Int(frame.height))",
-                    "onScreen": "\(NSScreen.screens.contains { $0.frame.intersects(frame) })",
-                ])
-            } else {
-                Log.error(.tray, "tray.button.noframe")
-            }
+            self.checkTrayVisibility(reason: "t2.4")
+        }
+        // 布局再稳定一轮后复检（菜单栏 item 增删会触发重排）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+            self.checkTrayVisibility(reason: "t6.0")
         }
         Log.event(.tray, "tray.icon.created", [
             "src": "mark-silhouette",
@@ -62,6 +60,93 @@ final class StatusItemController: NSObject {
             "visible": "\(item.button?.isHidden == false)",
             "length": "\(item.length)",
         ])
+    }
+
+    /// 判定「图标是否真正可见」：窗口 frame 落到屏幕最右（时钟区）即被系统挤入不可见区。
+    /// 病例：菜单栏拥挤时 button.window.frame = x:1690 w:38 ⇒ maxX 贴住屏幕右缘，图标不可见。
+    /// 判定口径（任一命中即隐藏）：
+    /// 1. frame.maxX > screen.maxX - 40（贴住右缘，压进时钟区）
+    /// 2. frame 与时钟区域（右缘 130pt × 菜单栏条带）重叠
+    /// 命中时：Log.error(.tray, "tray.hidden.overflow") + 一次性 CaptureToast 提示。
+    /// ⌘⇧A / ⌘⇧S 走 Carbon 热键（AppCoordinator.registerHotkeys），不依赖托盘，始终可用。
+    func checkTrayVisibility(reason: String) {
+        guard let item = statusItem, let button = item.button else {
+            Log.error(.tray, "tray.hidden.nobutton", ["reason": reason])
+            return
+        }
+        guard let window = button.window else {
+            Log.error(.tray, "tray.hidden.nowindow", ["reason": reason])
+            return
+        }
+        let frame = window.frame
+        let screen = window.screen ?? NSScreen.main
+        guard let screen else { return }
+        let nearRightEdge = frame.maxX > screen.frame.maxX - 40
+        let menuBarStrip = CGRect(x: screen.frame.maxX - 130, y: screen.frame.maxY - 24,
+                                  width: 130, height: 24)
+        let overlapsClock = menuBarStrip.intersects(frame)
+        // 诊断打点（保留原 frame 日志语义）
+        Log.event(.tray, "tray.button.frame", [
+            "reason": reason,
+            "x": "\(Int(frame.minX))", "y": "\(Int(frame.minY))",
+            "w": "\(Int(frame.width))", "h": "\(Int(frame.height))",
+            "maxX": "\(Int(frame.maxX))", "screenMaxX": "\(Int(screen.frame.maxX))",
+        ])
+        guard nearRightEdge || overlapsClock else {
+            if overflowToastShown {
+                // 之前被判隐藏，现在恢复正常（例如用户清理了菜单栏）
+                overflowToastShown = false
+                Log.event(.tray, "tray.visible.recovered", ["reason": reason])
+            }
+            return
+        }
+        Log.error(.tray, "tray.hidden.overflow", [
+            "reason": reason,
+            "nearRightEdge": "\(nearRightEdge)", "overlapsClock": "\(overlapsClock)",
+        ])
+        // 尝试自救：重新断言可见性 + 重设图标，让系统重排一次
+        item.isVisible = true
+        button.image = IconFactory.statusIcon()
+        button.imageScaling = .scaleProportionallyDown
+        button.needsDisplay = true
+        // 一次性兜底提示：图标可能已被系统挤掉，但热键仍可用
+        if !overflowToastShown {
+            overflowToastShown = true
+            CaptureToast.show(
+                image: Self.placeholderThumb(),
+                message: "菜单栏已满，Snapcut 图标被系统隐藏；⌘⇧A 仍可用"
+            )
+        }
+    }
+
+    /// CaptureToast 需要一张 CGImage 缩略图：画一张品牌色圆角占位块
+    private static func placeholderThumb() -> CGImage {
+        let size = NSSize(width: 72, height: 46)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        let rect = NSRect(origin: .zero, size: size)
+        NSBezierPath(roundedRect: rect.insetBy(dx: 4, dy: 4), xRadius: 8, yRadius: 8).addClip()
+        NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 0.9).setFill()
+        rect.fill()
+        let mark = NSAttributedString(
+            string: "S",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 26, weight: .bold),
+                .foregroundColor: NSColor.white,
+            ]
+        )
+        let markSize = mark.size()
+        mark.draw(at: NSPoint(x: (size.width - markSize.width) / 2,
+                              y: (size.height - markSize.height) / 2))
+        image.unlockFocus()
+        let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        if let cg { return cg }
+        // 兜底：1×1 黑像素（几乎不可能走到）
+        var pixel: [UInt8] = [0, 0, 0, 255]
+        let ctx = CGContext(data: &pixel, width: 1, height: 1, bitsPerComponent: 8,
+                            bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        return ctx.makeImage()!
     }
 
     private func buildMenu() -> NSMenu {
