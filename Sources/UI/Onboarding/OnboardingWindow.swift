@@ -32,6 +32,10 @@ final class OnboardingWindow: NSPanel {
         hasShadow = true
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // 病例（用户实报「这个窗怎么拖不动」）：borderless 窗口默认不可拖，
+        // 必须显式允许「背景拖拽」。卡片是 NSVisualEffectView 背景，会命中。
+        // 控件（按钮/文字）不受影响——hitTest 优先给控件，拖不动的地方只是空白背景。
+        isMovableByWindowBackground = true
         buildUI(size: size, permissionGranted: permissionGranted)
     }
 
