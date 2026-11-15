@@ -103,6 +103,28 @@ final class AppCoordinator {
                 onPermissionTap: { [weak self] in
                     self?.deps.permission.request()
                     Log.event(.app, "onboarding.permissionTap")
+                    // 去授权后引导卡已让位（orderOut）；轮询授权结果：
+                    // granted → 自动完成引导（用户不用再点「开始使用」——
+                    // 隐藏中的卡对用户是「点完就没了」的轻体验）；
+                    // 注意屏幕录制授权需重启进程才生效，轮询到的是 request()
+                    // 触发的 TCC 判定（未重启恒 false）→ 90s 未变即停轮询，
+                    // 下次启动引导卡会再出现（glance 式）提示重启生效。
+                    var tick = 0
+                    Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { t in
+                        MainActor.assumeIsolated {
+                            tick += 1
+                            guard let self else { t.invalidate(); return }
+                            if self.deps.permission.isGranted() {
+                                t.invalidate()
+                                UserDefaults.standard.set(true, forKey: Self.onboardingKey)
+                                self.onboardingWindow?.orderOut(nil)
+                                self.onboardingWindow = nil
+                                Log.event(.app, "onboarding.finish", ["granted": "true", "via": "poll"])
+                            } else if tick > 45 {
+                                t.invalidate()
+                            }
+                        }
+                    }
                 },
                 onFinish: { [weak self] in
                     UserDefaults.standard.set(true, forKey: Self.onboardingKey)

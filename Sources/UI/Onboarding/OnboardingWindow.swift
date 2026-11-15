@@ -208,6 +208,10 @@ final class OnboardingWindow: NSPanel {
     }
 
     @objc private func permissionTapped() {
+        // 病例（用户实报「点了去授权窗口不消失很烦人」）：点完引导卡要让位——
+        // TCC 确认框/系统设置会立刻弹出，引导卡挡在最前面挡住授权流程。
+        // 隐藏而非关闭：权限轮询 granted 后由 controller 恢复或走完成。
+        orderOut(nil)
         onPermissionTap()
     }
 
