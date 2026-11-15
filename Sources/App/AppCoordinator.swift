@@ -33,10 +33,22 @@ final class AppCoordinator {
     /// 设置（启动加载 + 面板保存后回写；引导窗/托盘读它显示实际快捷键）
     private(set) var settings: AppSettings = AppSettings.defaultSettings
 
+    /// 权限门禁镜像到 UserDefaults（@AppStorage 桥）：Tahoe MenuBarExtra .menu
+    /// content 是快照，只有 @AppStorage 写入能触发菜单重建。翻转时才写。
+    private func syncPermissionMirror() {
+        let g = deps.permission.isGranted()
+        if UserDefaults.standard.bool(forKey: "app.perm.granted") != g {
+            UserDefaults.standard.set(g, forKey: "app.perm.granted")
+            Log.event(.permission, "permission.mirror", ["granted": "\(g)"])
+        }
+    }
+
     func start() {
         AppCoordinatorShared.coordinator = self
         AppCoordinatorShared.deps = deps
         TCCPermission.preflight()
+        // 菜单门禁初值（@AppStorage 桥；翻转时写 → 菜单重建）
+        syncPermissionMirror()
         settings = UserDefaultsSettingsStore().load()
         HistoryStore.shared.maxItems = max(1, settings.historyLimit)
         Log.event(.app, "settings.applied", [
@@ -189,7 +201,10 @@ final class AppCoordinator {
         // 「去授权」才是唯一的授权入口）——而不是唤起选区面板再让 SCK
         // 在半路弹 TCC 框（用户实报「快捷键唤起了面板、TCC 框又弹」）。
         let granted = deps.permission.isGranted()
-        if granted { return true }
+        if granted {
+            syncPermissionMirror()
+            return true
+        }
 
         // 系统设置里已开但进程未重启：提示重启（防 TCC 重弹）
         if permissionPromptWindowActive {
