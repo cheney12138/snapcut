@@ -42,6 +42,18 @@ final class OnboardingWindow: NSPanel {
         buildUI(size: size, permissionGranted: permissionGranted)
     }
 
+    /// 毛玻璃圆角遮罩：黑底白形（maskImage 语义：不透明处保留）
+    private static func roundedMask(size: NSSize, radius: CGFloat) -> NSImage {
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size),
+                     xRadius: radius, yRadius: radius).setClip()
+        NSColor.black.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        image.unlockFocus()
+        return image
+    }
+
     private func buildUI(size: NSSize, permissionGranted: Bool) {
         // 玻璃卡（原型：radius 16 / padding 22 / .5pt 白 16% / 深影）
         let card = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
@@ -50,6 +62,11 @@ final class OnboardingWindow: NSPanel {
         card.blendingMode = .behindWindow
         card.state = .active
         card.wantsLayer = true
+        // 病例（用户实报「四周有白色角」）：NSVisualEffectView + layer.cornerRadius
+        // 的模糊采样在圆角外溢出白边（材质缓冲不受 masksToBounds 完整裁剪，
+        // 浅色内容上四角尤其明显）。maskImage 是 effect view 的官方圆角通道，
+        // 按 alpha 轮廓真正裁掉模糊缓冲；描边/背景色走同层不受影响。
+        card.maskImage = Self.roundedMask(size: size, radius: 16)
         card.layer?.cornerRadius = 16
         card.layer?.masksToBounds = true
         card.layer?.borderWidth = 0.5
