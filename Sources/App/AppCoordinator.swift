@@ -83,6 +83,7 @@ final class AppCoordinator {
     // MARK: - 首次运行引导（权限前置）
 
     private var onboardingWindow: OnboardingWindow?
+    private var onboardingPollTimer: Timer?
     private static let onboardingKey = "onboarding.completed"
 
     /// 首启或权限缺失时展示引导卡：把「授权」放在用户第一次想截图之前
@@ -110,21 +111,25 @@ final class AppCoordinator {
                     // 触发的 TCC 判定（未重启恒 false）→ 90s 未变即停轮询，
                     // 下次启动引导卡会再出现（glance 式）提示重启生效。
                     var tick = 0
-                    Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { t in
+                    let pollTimer = Timer(timeInterval: 2.0, repeats: true) { _ in
                         MainActor.assumeIsolated {
                             tick += 1
-                            guard let self else { t.invalidate(); return }
+                            guard let self, let t = self.onboardingPollTimer else { return }
                             if self.deps.permission.isGranted() {
                                 t.invalidate()
+                                self.onboardingPollTimer = nil
                                 UserDefaults.standard.set(true, forKey: Self.onboardingKey)
                                 self.onboardingWindow?.orderOut(nil)
                                 self.onboardingWindow = nil
                                 Log.event(.app, "onboarding.finish", ["granted": "true", "via": "poll"])
                             } else if tick > 45 {
                                 t.invalidate()
+                                self.onboardingPollTimer = nil
                             }
                         }
                     }
+                    RunLoop.main.add(pollTimer, forMode: .common)
+                    self?.onboardingPollTimer = pollTimer
                 },
                 onFinish: { [weak self] in
                     UserDefaults.standard.set(true, forKey: Self.onboardingKey)
@@ -175,11 +180,42 @@ final class AppCoordinator {
 
     // MARK: - 截图入口（热键 / 托盘菜单共用）
 
+    /// TCC 防重弹闸（用户实报「点打开系统设置后框还要弹 1-2 次」）：
+    /// 授权后未重启进程期间，再触发截图会让 SCK/WindowServer 再次请求录屏
+    /// 权限 → TCC 又弹一次。此时直接用系统通知提示重启，不进截图流程。
+    private func ensureCaptureReadiness() -> Bool {
+        let granted = deps.permission.isGranted()
+        guard !granted else { return true }
+        // 进程未持有：区分「从未授权」与「系统已授权但需重启」——
+        // 后者表现为 TCC 数据库已允许而本进程 preflight 仍 false
+        // （tccd 判定 Allowed (System Set) 后 CGPreflight 仍 false 的窗口期）。
+        // 简化：未授权一律放行（首次授权流程需要弹框）——只在「本会话内
+        // 出现过 permission.request 弹框」后 5 分钟内的触发改为提示重启。
+        if permissionPromptWindowActive {
+            Log.event(.app, "capture.blocked.pendingRestart")
+            let notif = NSUserNotification()
+            notif.title = "Snapcut"
+            notif.informativeText = "权限已开启，重启 Snapcut 后生效"
+            return false
+        }
+        return true
+    }
+
+    private var permissionPromptWindowActive = false
+    /// 由 permission.request 路径调用：标记 TCC 弹框窗口期（5 分钟）
+    func markPermissionPromptShown() {
+        permissionPromptWindowActive = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300) { [weak self] in
+            self?.permissionPromptWindowActive = false
+        }
+    }
+
     func beginRegionCapture() {
         guard state == .idle else {
             Log.event(.app, "capture.ignored", ["state": state.rawValue])
             return
         }
+        guard ensureCaptureReadiness() else { return }
         state = .overlay
         if overlayController == nil {
             overlayController = OverlayController()
@@ -252,6 +288,7 @@ final class AppCoordinator {
             Log.event(.app, "capture.ignored", ["state": state.rawValue])
             return
         }
+        guard ensureCaptureReadiness() else { return }
         state = .overlay
         if overlayController == nil {
             overlayController = OverlayController()

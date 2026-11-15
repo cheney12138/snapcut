@@ -69,7 +69,10 @@ extension CarbonHotKeyCenter: HotkeyRegistering {
 @MainActor
 final class ScreenPermissionAdapter: ScreenPermissionChecking {
     func isGranted() -> Bool { TCCPermission.preflight() }
-    func request() { TCCPermission.requestSystemPrompt() }
+    func request() {
+        TCCPermission.requestSystemPrompt()
+        AppCoordinatorShared.coordinator?.markPermissionPromptShown()
+    }
     func openSettings() { TCCPermission.openSystemSettings() }
 }
 
