@@ -29,6 +29,9 @@ final class OnboardingWindow: NSPanel {
         level = .screenSaver
         isOpaque = false
         backgroundColor = .clear
+        // 病例（用户实报「透明有问题」）：浅色系统主题下 .hudWindow 解析成亮灰
+        // 材质——和 ToolbarPanel/Settings 同源的坑，窗口+材质都钉暗色外观
+        appearance = NSAppearance(named: .darkAqua)
         hasShadow = true
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -43,6 +46,7 @@ final class OnboardingWindow: NSPanel {
         // 玻璃卡（原型：radius 16 / padding 22 / .5pt 白 16% / 深影）
         let card = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
         card.material = .hudWindow
+        card.appearance = NSAppearance(named: .darkAqua)
         card.blendingMode = .behindWindow
         card.state = .active
         card.wantsLayer = true
