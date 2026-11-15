@@ -27,5 +27,15 @@ struct SnapcutApp: App {
             Image(nsImage: IconFactory.statusIcon(pointSize: 15))
         }
         .menuBarExtraStyle(.menu)
+
+        // 坑 33（启动即退·第四形态实锤）：MenuBarExtra-only + LSUIElement 的
+        // SwiftUI App 无窗口场景时 run loop 自动结束（对照：mb2 demo 与本 App
+        // 在同一时间一起死，同新 id 的 mb6 活——并非 id 记死，是场景生命周期）。
+        // glance 同机常活的场景结构 = MenuBarExtra + 常驻 Window 场景。
+        // 这枚窗口永不显示，只为让 SwiftUI 场景组保持「有潜在窗口」。
+        Window("Snapcut", id: "keepalive") {
+            EmptyView()
+        }
+        .windowResizability(.contentSize)
     }
 }

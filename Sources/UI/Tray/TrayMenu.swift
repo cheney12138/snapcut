@@ -66,7 +66,7 @@ struct TrayMenuContent: View {
 
         Button("退出 Snapcut") {
             Log.event(.tray, "tray.action", ["item": "quit"])
-            NSApp.terminate(nil)
+            SnapcutQuitController.quit()
         }
         .keyboardShortcut("q", modifiers: [.command])
         .onAppear {

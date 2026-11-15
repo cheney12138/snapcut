@@ -149,7 +149,7 @@ final class StatusItemController: NSObject {
 
     @objc private func quit(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "quit"])
-        NSApp.terminate(nil)
+        SnapcutQuitController.quit()
     }
 }
 

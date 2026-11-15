@@ -26,8 +26,10 @@ status() {
 
 quit_gracefully() {
     if pgrep -x Snapcut >/dev/null 2>&1; then
-        echo "→ 优雅退出旧实例..."
-        osascript -e "tell application id \"$BUNDLE_ID\" to quit" 2>/dev/null || true
+        echo "→ 退出旧实例（SIGTERM；坑 33 拦截 osascript quit 后的退出路径）..."
+        # 坑 33 的 terminate 拦截会拦掉 Apple event quit；SIGTERM 直达（干净走
+        # applicationWillTerminate），且绝非 -9
+        kill $(pgrep -x Snapcut) 2>/dev/null || true
         # 等它退干净（最多 5s，不带 -9）
         for _ in $(seq 1 20); do
             pgrep -x Snapcut >/dev/null 2>&1 || break
@@ -52,6 +54,13 @@ esac
 
 quit_gracefully
 echo "→ 启动 $BUNDLE..."
-open -n "$BUNDLE"
+# ⚠️ 不用 open（坑 33）：LaunchServices 对同一 bundle id 记录了多个路径副本
+# （xcodebuild 注册 DerivedData 产物 + rsync 拷贝的 build/Snapcut.app），
+# open 可能解析到 DerivedData 原始路径——tccd 按 binary_path 判定身份，
+# 两个路径=授权记录对不上=「授权了还说未授权」。直接执行二进制，
+# 启动的永远是本路径副本。
+# 直接执行二进制会退出（SwiftUI+LSUIElement 需要 LS 启动，坑 31 结论）；
+# open 传绝对路径而非让 LS 按 bundle id 解析（避免跳 DerivedData 副本）
+open -n "$(pwd)/$BUNDLE"
 sleep 2
 status

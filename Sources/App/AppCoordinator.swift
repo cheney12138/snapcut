@@ -49,6 +49,35 @@ final class AppCoordinator {
         tray.setup(coordinator: self)
         registerCaptureHotkeys()
         presentOnboardingIfNeeded()
+        ensureKeepAlive()
+        // 坑 33 终极形态：AppKit「StatusBar 0 terminating on removal」——MenuBarExtra
+        // 的 status item 被 ControlCenter 驱逐（assertion invalidated）时，AppKit
+        // 走 sudden termination 路径自动终止 App。ProcessInfo 禁用后，即使 item
+        // 被逐，App 持续运行，item 通常会被 CC 重新接纳（assertion 重建）。
+        ProcessInfo.processInfo.disableSuddenTermination()
+        ProcessInfo.processInfo.disableAutomaticTermination("snapcut-menubar")
+    }
+
+    /// 坑 33（启动即退·第三形态）：MenuBarExtra-only + LSUIElement 的 SwiftUI App，
+    /// 在「无可见窗口」（权限已 granted、引导跳过）时 run loop 自动结束退出——
+    /// 之前所有"活着"的实例都是因为碰巧有引导窗/设置窗挂着。
+    /// 解法：常驻一枚 1×1 全透明工具窗（不抢焦点、不进任务切换）钉住 run loop。
+    private var keepAliveWindow: NSWindow?
+    private func ensureKeepAlive() {
+        guard keepAliveWindow == nil else { return }
+        let w = NSWindow(
+            contentRect: NSRect(x: -10, y: -10, width: 1, height: 1),
+            styleMask: [.borderless], backing: .buffered, defer: false
+        )
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.alphaValue = 0
+        w.level = .floating
+        w.ignoresMouseEvents = true
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        w.orderFrontRegardless()
+        keepAliveWindow = w
+        Log.event(.app, "app.keepAlive")
     }
 
     // MARK: - 首次运行引导（权限前置）
