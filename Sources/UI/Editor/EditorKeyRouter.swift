@@ -17,6 +17,7 @@ enum EditorKeyRouter {
         var save: () -> Void = {}
         var done: () -> Void = {}
         var cancel: () -> Void = {}
+        var scroll: () -> Void = {}
         var selectTool: (EditorSession.Tool) -> Void = { _ in }
 
         init(
@@ -28,6 +29,7 @@ enum EditorKeyRouter {
             save: @escaping () -> Void = {},
             done: @escaping () -> Void = {},
             cancel: @escaping () -> Void = {},
+            scroll: @escaping () -> Void = {},
             selectTool: @escaping (EditorSession.Tool) -> Void = { _ in }
         ) {
             self.undo = undo
@@ -38,22 +40,26 @@ enum EditorKeyRouter {
             self.save = save
             self.done = done
             self.cancel = cancel
+            self.scroll = scroll
             self.selectTool = selectTool
         }
     }
 
     /// event → 组合串 → settings.editorHotkeys 反查 action key。
     /// 文字输入态的键必须给输入框（调用方自行 guard，同原实现）。
-    static func matchHotkey(_ event: NSEvent) -> String? {
+    /// 拼贴编辑器宿主用 matchHotkey(ignoringScroll: true)：滚动截图是截图编辑器
+    /// 专属语义，合成编辑窗里 S 仍当普通键（不吞）。
+    static func matchHotkey(_ event: NSEvent, ignoringScroll: Bool = false) -> String? {
         let settings = AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
         guard let combo = HotkeySpec.combo(
             fromkeyCode: UInt32(event.keyCode),
             modifiers: event.modifierFlags.hotkeyModifiers
         ) else { return nil }
         for (actionKey, stored) in settings.editorHotkeys {
+            if ignoringScroll, actionKey == "scroll" { continue }
             let effective = stored.isEmpty ? (AppSettings.defaultEditorHotkeys[actionKey] ?? "") : stored
             guard !effective.isEmpty else { continue }
-            // 撞内置键（滚动 S / 快存 ⌘⌥S / 文字态 Esc/Return——调用方已挡）：
+            // 撞内置键（快存 ⌘⌥S / 文字态 Esc/Return——调用方已挡）：
             // 组合一致时让内置语义先行（设置页有冲突提示）
             if HotkeySpec.parse(effective, allowBare: true)?.keyCode == HotkeySpec.parse(combo)?.keyCode,
                effective == combo { return actionKey }
@@ -73,8 +79,19 @@ enum EditorKeyRouter {
         case "save": actions.save()
         case "done": actions.done()
         case "cancel": actions.cancel()
+        case "scroll": actions.scroll()
         default: break
         }
+    }
+
+    /// HotkeyModifiers（Core 纯数据）→ NSEvent.ModifierFlags（Carbon 注册用，UI 层桥）
+    static func nsEventFlags(_ mods: HotkeyModifiers) -> NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        if mods.contains(.command) { flags.insert(.command) }
+        if mods.contains(.shift) { flags.insert(.shift) }
+        if mods.contains(.option) { flags.insert(.option) }
+        if mods.contains(.control) { flags.insert(.control) }
+        return flags
     }
 
     /// 热键 1-6 直选工具（R6）

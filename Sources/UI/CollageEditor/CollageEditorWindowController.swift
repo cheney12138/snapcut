@@ -34,8 +34,8 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
     }
 
     /// 入口：PinMagnetRegistry.assemble 合成后调用
-    static func present(composite: CGImage) {
-        guard let controller = CollageEditorWindowController(composite: composite) else {
+    static func present(composite: CGImage, pxScale: CGFloat) {
+        guard let controller = CollageEditorWindowController(composite: composite, pxScale: pxScale) else {
             Log.error(.editor, "collage.editor.fail", ["reason": "init"])
             return
         }
@@ -47,10 +47,10 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
         ])
     }
 
-    private init?(composite: CGImage) {
-        // 像素 → point：PinAssembleEngine 用屏 backingScaleFactor 合成（2x 屏 = scale 2）
+    private init?(composite: CGImage, pxScale: CGFloat) {
+        // 像素 → point：pxScale 由烤图方透传（union 所在屏的 backingScaleFactor，
+        // 多屏时与 NSScreen.main 不同——错猜会让标注/马赛克整体错位）
         let screen = NSScreen.main
-        let pxScale = screen?.backingScaleFactor ?? 2
         let ptSize = CGSize(
             width: CGFloat(composite.width) / pxScale,
             height: CGFloat(composite.height) / pxScale
@@ -172,6 +172,9 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
             runOCR()
         case .pin:
             pinComposite()
+        case .scroll:
+            // 滚动截图是截图编辑器专属语义，拼贴编辑器无此动作（按钮不出现在此场景）
+            break
         }
     }
 
@@ -237,9 +240,10 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
         let image = session.renderFinalImage()
         AppCoordinatorShared.deps?.history.record(image)
         guard let window, let view = editorView else { return }
-        let rect = window.convertToScreen(view.convert(view.bounds, to: nil))
-        let screen = window.screen ?? NSScreen.main
-        guard let screen else { return }
+        let screenRect = window.convertToScreen(view.convert(view.bounds, to: nil))
+        // reviewer 补丁：pin 契约是 rect.size × backingScale == 像素尺寸——
+        // 显示可能整体缩小（displayScale<1），按图像 point 尺寸落位才 1:1
+        let rect = CGRect(origin: screenRect.origin, size: imagePtSize)
         AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: rect)
         Log.event(.pin, "collage.editor.pin", [
             "pxW": "\(image.width)", "pxH": "\(image.height)",
@@ -507,8 +511,9 @@ final class CollageEditorContentView: NSView {
     // MARK: - 键盘（共享 EditorKeyRouter + 本宿主内置键序）
 
     override func keyDown(with event: NSEvent) {
-        // 编辑器自定义热键（⌘Z/H/O/P…）：共享分发逻辑（OverlayWindow 同源）
-        if textField == nil, let actionKey = EditorKeyRouter.matchHotkey(event) {
+        // 编辑器自定义热键（⌘Z/H/O/P…）：共享分发逻辑（OverlayWindow 同源）。
+        // 滚动截图是截图编辑器专属语义：这里忽略 scroll 键，S 仍当普通键。
+        if textField == nil, let actionKey = EditorKeyRouter.matchHotkey(event, ignoringScroll: true) {
             EditorKeyRouter.perform(actionKey, actions: controller?.keyActions
                 ?? EditorKeyRouter.Actions())
             return

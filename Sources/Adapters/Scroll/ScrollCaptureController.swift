@@ -83,7 +83,10 @@ final class ScrollCaptureController {
         let interval = config.captureInterval
         isRunning = true
         deliveredFrameCount = 0
-        print("[ScrollCapture] start: region=\(region), displayID=\(displayID), scale=\(scale), interval=\(interval)s")
+        Log.event(.scroll, "scroll.sampler.start", [
+            "region": "\(Int(region.width))x\(Int(region.height))",
+            "display": "\(displayID)", "interval": "\(interval)",
+        ])
 
         task = Task { [weak self] in
             while !Task.isCancelled {
@@ -96,7 +99,7 @@ final class ScrollCaptureController {
                     }
                 } catch {
                     // 单帧失败（权限抖动 / 显示器热插拔等）打日志继续重试，不中断采集
-                    print("[ScrollCapture] 抓帧失败，跳过本帧: \(error.localizedDescription)")
+                    Log.error(.scroll, "scroll.frame.grab.fail", ["err": "\(error.localizedDescription)"])
                 }
                 try? await Task.sleep(for: .seconds(interval))
             }
@@ -111,7 +114,7 @@ final class ScrollCaptureController {
         task?.cancel()
         task = nil
         isRunning = false
-        print("[ScrollCapture] stop: delivered=\(deliveredFrameCount) frames")
+        Log.event(.scroll, "scroll.sampler.stop", ["delivered": "\(deliveredFrameCount)"])
         onStop?(deliveredFrameCount)
     }
 

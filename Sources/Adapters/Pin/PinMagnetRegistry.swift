@@ -153,11 +153,12 @@ final class PinMagnetRegistry {
             closePanel(gid)
             return
         }
-        guard members.count >= 2, borderDrag?.groupID != gid else {
-            // 只剩 1 张（或正在被框拖动的组被摘空）：解散
-            if members.count < 2 {
-                dissolve(groupID: gid, members: members)
-            }
+        // reviewer 修正 2026-11-15：原 guard 含 borderDrag?.groupID != gid——
+        // 拖组框路径（borderDragMoved 末尾显式调本方法）正撞短路，虚线框/徽标/
+        // 合成键永远留在原地不跟随。改为纯成员数判断（borderDrag 期间成员只经
+        // setFrameOrigin 落位、不触发 notifyLayoutChanged，安全）。
+        guard members.count >= 2 else {
+            dissolve(groupID: gid, members: members)
             return
         }
         for member in members { member.setInGroup(true) }
@@ -256,7 +257,10 @@ final class PinMagnetRegistry {
                 "via": "border",
             ])
             // 整组吸到对方：leader 取组内任一成员做 union
-            if let leader = groups[state.groupID]?.first {
+            // reviewer 补丁：partner 可能在拖动中途被 Esc 关掉（僵尸引用）——
+            // union 前校验存活，避免把已关窗塞回组
+            if let leader = groups[state.groupID]?.first,
+               PinWindowController.livePins.contains(where: { $0 === snap.partner }) {
                 union(leader, snap.partner)
             }
         }
@@ -267,10 +271,11 @@ final class PinMagnetRegistry {
     func assemble(groupID gid: Int) {
         guard let members = groups[gid], members.count >= 2 else { return }
         let items = members.map { (image: $0.image, frame: $0.windowFrame) }
-        guard let composite = PinAssembleEngine.compose(members: items) else {
+        guard let composited = PinAssembleEngine.compose(members: items) else {
             Log.error(.pin, "collage.assemble.fail", ["reason": "compose"])
             return
         }
+        let composite = composited.image
         Log.event(.export, "collage.assemble", [
             "members": "\(members.count)",
             "pxW": "\(composite.width)",
@@ -283,7 +288,9 @@ final class PinMagnetRegistry {
         groups[gid] = nil
         closePanel(gid)
         for pin in pins { pin.close() }
-        CollageEditorWindowController.present(composite: composite)
+        // pxScale 透传（reviewer 补丁：多屏 pin 时 NSScreen.main 猜的 scale 会错
+        // → 编辑器 ptSize/标注/马赛克整体错位；用烤图时的真实 scale）
+        CollageEditorWindowController.present(composite: composite, pxScale: composited.pxScale)
     }
 }
 

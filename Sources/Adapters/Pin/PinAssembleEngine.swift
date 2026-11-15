@@ -25,7 +25,7 @@ enum PinAssembleEngine {
     static func compose(
         members: [(image: CGImage, frame: CGRect)],
         background: Background = .white
-    ) -> CGImage? {
+    ) -> (image: CGImage, pxScale: CGFloat)? {
         guard !members.isEmpty else { return nil }
         let union = MagnetGroup.unionRect(members.map(\.frame))
         guard union.width >= 1, union.height >= 1 else { return nil }
@@ -58,10 +58,11 @@ enum PinAssembleEngine {
             ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         }
 
-        // 全局 Y-up → 组本地 Y-down（与 CGRenderer.composite 的翻转处理同构）
+        // 坐标系（reviewer 实证修正 2026-11-15）：CGBitmapContext 的用户空间
+        // 是 Y-up，AppKit 全局 frame 也是 Y-up——直接 scale + 平移即正立；
+        // 原实现外层翻 Y + 成员内层再翻一次 = 净翻一次（合成图垂直镜像）。
         ctx.saveGState()
-        ctx.translateBy(x: 0, y: CGFloat(height))
-        ctx.scaleBy(x: scale, y: -scale)
+        ctx.scaleBy(x: scale, y: scale)
         ctx.translateBy(x: -union.minX, y: -union.minY)
 
         for member in members {
@@ -77,7 +78,7 @@ enum PinAssembleEngine {
             ctx.setFillColor(CGColor(gray: 1, alpha: 1))
             ctx.fillPath()
 
-            // 图像：框内缩 9pt（pad 8 + border 1），圆角 6 裁切，Y-down 局部镜像后 draw
+            // 图像：框内缩 9pt（pad 8 + border 1），圆角 6 裁切
             let imageRect = frame.insetBy(
                 dx: PinWindowController.groupPadTotal, dy: PinWindowController.groupPadTotal
             )
@@ -87,9 +88,7 @@ enum PinAssembleEngine {
                 cornerHeight: PinContentView.cornerRadius, transform: nil
             ))
             ctx.clip()
-            ctx.translateBy(x: imageRect.midX, y: imageRect.midY)
-            ctx.scaleBy(x: 1, y: -1)
-            ctx.translateBy(x: -imageRect.midX, y: -imageRect.midY)
+            // Y-up 上下文直接 draw 即正立（勿加局部镜像——见顶部坐标系注释）
             ctx.interpolationQuality = .none
             ctx.draw(member.image, in: imageRect)
             ctx.restoreGState()
@@ -108,6 +107,7 @@ enum PinAssembleEngine {
         }
         ctx.restoreGState()
 
-        return ctx.makeImage()
+        guard let image = ctx.makeImage() else { return nil }
+        return (image, scale)
     }
 }

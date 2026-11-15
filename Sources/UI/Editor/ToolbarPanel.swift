@@ -1,29 +1,27 @@
 import AppKit
 import CoreGraphics
 
-/// 标注工具栏（原型 scene 03 的 1:1 移植）
+/// 标注工具栏（重设计 scene 01 的 1:1 移植）
 ///
-/// 视觉真源：`html-pages/snapcut-design/index.html` 第 7 节 `.toolbar / .tb-btn /
-/// .tb-colors / .tb-widths / .tb-primary`。逐条对齐（CSS px = pt）：
-/// - 面板：padding 8/8（v0.4 呼吸感，8pt 栅格）、radius 12、rgba(38,38,43,.60) + blur(.hudWindow)、
-///   border 0.5pt 白 16%、inset 高光 0 1px 0 白 14%、
-///   双层投影 0 14px 34px -8px rgba(0,0,0,.55) + 0 2px 6px rgba(0,0,0,.30)
-///   （⚠️ 原型 .toolbar 的真实投影就是这两层；任务简报里的「0 8 20 rgba(0,0,0,.4)」
-///   实为原型 .showbar（index.html 643-646 行）的值，不是工具栏容器）
-/// - 玻璃（v0.5 重做）：NSVisualEffectView(.hudWindow/.behindWindow/.active) 之上叠
-///   60% 深色着色 ⇒ 真实毛玻璃，能透出冻结画面；⚠️ 必须把窗口 appearance 钉死
-///   darkAqua——否则系统浅色模式下 .hudWindow 解析成浅色材质，60% 深色叠上去
-///   变成一坨不透明中灰（用户实报「不透明深灰」的根因之一）
-/// - 按钮：28×28、radius 8、图标 17pt、默认白 82%、hover 白 12% + 上移 2pt，
-///   选中 #0A84FF + inset 白高光 0 1px 0 白 30% + 蓝色外发光 0 2px 8px rgba(10,132,255,.42)
-/// - 颜色点 15px（选中：白 1.5px 环 + 外圈 3px 黑 32% 环）、间距 8
-/// - 主按钮「复制」纯图标方形胶囊 30×28（tooltip「复制并完成 ↩」保留）
-/// - 粗细：连续滑杆 2-6pt（tickless + continuous，实时生效；下一个新标注用当前值）
-/// - 分隔线 0.5×17、左右各 8pt（叠加栈间距 8 ⇒ 线到内容 16pt）
-/// - 悬停提示：深色胶囊（10.5pt，上方 8pt，阴影 0 6px 16px 黑 35%）
+/// 视觉真源：`html-pages/snapcut-design-redesign/index.html` scene 01 `.toolbar`；
+/// 施工图：同目录 tokens.md §2/§5/§9。所有 token 从 DesignTokens.swift 取值。
+/// 逐条对齐（CSS px = pt）：
+/// - 面板：padding 10（内容高 56）、radius 14、
+///   mat.hud（hudWindow 钉暗，**不再叠 60% 深色着色**——材质本身已够暗）、
+///   border 0.5pt stroke（白 .14）、inset.hi 顶缘内高光 白 .10、
+///   shadow.float 双层投影（radius 15 offset(0,10) α.50 / radius 32 offset(0,28) α.55）
+/// - 按钮：28×28、radius 7、图标 16pt（SF Symbol pointSize 14/medium）、默认白 85%、
+///   hover fill.hover（灰 α.36）**不上移**；选中 accent 实心 + 白图标 + inset.hi.strong，
+///   **删除蓝色外发光**
+/// - 颜色点 14pt（选中：内环 1.5pt 白 .85 @−4.5 + 外环 1.5pt 白 .28 @−8）、间距 6
+/// - 主动作「复制」28×28 纯图标 accent 实心键（唯一彩色 accent，与保存/取消同构）
+/// - 粗细：连续滑杆 2-6pt（tickless + continuous，实时生效）76×20
+/// - 分组：工具(6+滚动截图) | 属性(5色+滑杆) | 历史(撤销/重做/取字/贴图/显隐) | 输出(复制/保存/取消)，
+///   组间 hairline 分隔（白 .12 × 高 20，两侧各 4 ⇒ 线到内容 12）
+/// - 悬停提示：深色胶囊（caption 10.5，上方 8pt，阴影 0 6px 16px 黑 35%）
 ///
-/// 结构要点：按钮的蓝色发光与 hover 态不能被裁剪 ⇒ 栈不放进 effect view
-/// （其 layer.masksToBounds=true 会裁掉子视图阴影），而是放在无裁剪的根视图上。
+/// 结构要点：按钮的选中态/悬停态不能被裁剪 ⇒ 栈不放进 effect view
+/// （其 layer.masksToBounds=true 会裁掉子视图），而是放在无裁剪的根视图上。
 ///
 /// 投影（v0.5 修复）：窗口四周留 shadowMargin 空白，投影图层铺在面板本体四周，
 /// 溢出面板边界的阴影画在留白区里；留白区 hitTest 穿透（不挡下层编辑画布）。
@@ -32,31 +30,31 @@ import CoreGraphics
 ///
 /// 铁律：nonactivatingPanel（不抢激活）；点击不 makeKey。
 
-/// 视觉 token（原型 CSS 为基线 + 8pt 栅格拉档，单位 pt；px == pt）——文件级私有，按钮类共用
-/// 呼吸感改造（v0.4）：栈间距 1→8、面板 padding 5/6→8/8（面板高 38→44）、
-/// 分区之间分隔线左右各 8（叠加栈间距 8 ⇒ 线到内容 16pt），色点间距 5→8
+/// 视觉 token：全部从 DesignTokens 取值（单一真源）；此处只留工具栏专属布局量
+@MainActor
 private enum TBStyle {
-    static let paddingH: CGFloat = 8
-    static let paddingV: CGFloat = 8
-    static let cornerRadius: CGFloat = 12
-    static let buttonSide: CGFloat = 28
-    static let buttonRadius: CGFloat = 8
-    static let iconSize: CGFloat = 17
+    static let paddingH: CGFloat = DesignTokens.Toolbar.padding      // 10
+    static let paddingV: CGFloat = DesignTokens.Toolbar.padding
+    static let cornerRadius: CGFloat = DesignTokens.Radius.xl        // 14
+    static let buttonSide: CGFloat = DesignTokens.Control.h          // 28
+    static let buttonRadius: CGFloat = DesignTokens.Radius.md        // 7
+    static let iconPointSize: CGFloat = 14                           // 视觉高 ≈16（icon.s）
+    static let iconWeight = NSFont.Weight.medium
     static let separatorWidth: CGFloat = 0.5
-    static let separatorHeight: CGFloat = 17
-    static let separatorMargin: CGFloat = 8
+    static let separatorHeight: CGFloat = DesignTokens.Toolbar.separatorHeight // 20
+    static let separatorMargin: CGFloat = DesignTokens.Toolbar.separatorMargin // 4
     /// 窗口四周投影留白：NSWindow 会把 contentView 外的绘制裁掉，
     /// 面板投影要溢出面板边界就得多给窗口留画布；留白区 hitTest 穿透。
-    /// 尺寸校验：底部阴影最远 ~ spread 8 + blur 17 + offset 14 = 39pt
+    /// 尺寸校验：底部阴影最远 ~ offset 28 + radius 32 − spread 24 = 36pt
     static let shadowMargin: CGFloat = 40
-    static let dotSide: CGFloat = 15
-    static let dotGap: CGFloat = 8
-    static let sliderWidth: CGFloat = 88
-    static let accent = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1)        // #0A84FF
-    static let accentHover = NSColor(srgbRed: 0.102, green: 0.549, blue: 1.0, alpha: 1)   // #1A8CFF
-    static let accentGlow = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 0.42) // rgba(10,132,255,.42)
-    static let iconIdle = NSColor.white.withAlphaComponent(0.82)
-    static let iconActive = NSColor.white
+    static let dotSide: CGFloat = DesignTokens.Toolbar.dotSide       // 14
+    static let dotGap: CGFloat = DesignTokens.Toolbar.dotGap         // 6
+    static let sliderWidth: CGFloat = DesignTokens.Control.sliderWidth // 76
+    static let accent = DesignTokens.accent
+    static let accentHover = DesignTokens.accentHover
+    static let iconIdle = NSColor.white.withAlphaComponent(DesignTokens.Toolbar.iconIdleAlpha)
+    static let iconActive = DesignTokens.labelOnAccent
+    static let iconDisabledAlpha = DesignTokens.Toolbar.iconDisabledAlpha
 }
 
 /// 窗口 contentView：比面板本体大 2×shadowMargin，专供投影溢出绘制；
@@ -80,7 +78,7 @@ final class ToolbarPanel: NSPanel {
     private var onAction: (Action) -> Void = { _ in }
 
     enum Action {
-        case undo, redo, toggleVisibility, done, save, cancel, ocr, pin
+        case undo, redo, toggleVisibility, done, save, cancel, ocr, pin, scroll
     }
 
     // 视图
@@ -98,7 +96,7 @@ final class ToolbarPanel: NSPanel {
     init() {
         let m = TBStyle.shadowMargin
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 520 + m * 2, height: 44 + m * 2),
+            contentRect: NSRect(x: 0, y: 0, width: 560 + m * 2, height: DesignTokens.Toolbar.height + m * 2),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -152,13 +150,13 @@ final class ToolbarPanel: NSPanel {
             root.bottomAnchor.constraint(equalTo: outer.bottomAnchor, constant: -m),
         ])
 
-        // 1) 面板投影（两层，照 CSS box-shadow 顺序画在最底）
-        //    0 14px 34px -8px rgba(0,0,0,.55) → offset(0,-14) blur→radius 17 spread→path 内缩 8
-        let shadowFar = makeShadowView(radius: 17, offset: CGSize(width: 0, height: -14),
-                                       alpha: 0.55, spread: 8)
-        //    0 2px 6px rgba(0,0,0,.30) → offset(0,-2) radius 3
-        let shadowNear = makeShadowView(radius: 3, offset: CGSize(width: 0, height: -2),
-                                        alpha: 0.30, spread: 0)
+        // 1) 面板投影（shadow.float 双层，照 tokens.md 顺序画在最底）
+        //    0 10 30 −8 .50 → radius 15 offset(0,-10) spread 8
+        let shadowFar = makeShadowView(radius: 15, offset: CGSize(width: 0, height: -10),
+                                       alpha: 0.50, spread: 8)
+        //    0 28 64 −24 .55 → radius 32 offset(0,-28) spread 24
+        let shadowNear = makeShadowView(radius: 32, offset: CGSize(width: 0, height: -28),
+                                        alpha: 0.55, spread: 24)
         root.addSubview(shadowFar)
         root.addSubview(shadowNear)
         // ⚠️ 旧版病例：投影视图只创建没加约束（frame 恒为 0），且窗口=面板大小，
@@ -175,10 +173,10 @@ final class ToolbarPanel: NSPanel {
             shadowNear.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
 
-        // 2) 玻璃容器（hudWindow 磨砂 + 60% 深色着色，等价原型的 rgba(38,38,43,.60)）；
+        // 2) 玻璃容器（mat.hud：hudWindow 磨砂，**不再叠深色着色**——材质本身已够暗）；
         //    窗口 appearance 已钉死 darkAqua（见 init），浅色系统下也能出暗玻璃
         let effect = NSVisualEffectView()
-        effect.material = .hudWindow
+        effect.material = DesignTokens.Mat.hud
         effect.blendingMode = .behindWindow
         effect.state = .active
         effect.wantsLayer = true
@@ -186,16 +184,15 @@ final class ToolbarPanel: NSPanel {
         effect.layer?.cornerRadius = TBStyle.cornerRadius
         effect.layer?.masksToBounds = true      // 只裁自己的材质/描边，按钮不在它里面
         effect.layer?.borderWidth = 0.5
-        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
-        effect.layer?.backgroundColor = NSColor(srgbRed: 0.149, green: 0.149, blue: 0.169, alpha: 0.60).cgColor
+        effect.layer?.borderColor = DesignTokens.stroke.cgColor
         root.addSubview(effect)
 
-        // 2b) 面板 inset 高光：0 1px 0 rgba(255,255,255,.14) inset → 顶部 1pt 白 14% 条
-        //     （放在 effect 内部，被圆角裁剪，贴着描边下沿）
+        // 2b) 面板 inset 高光：inset.hi（顶缘 1pt 白 .10，贴描边下沿，被圆角裁剪）
+        //     （tokens.md 允许「或 layer 内阴影替代」，此处用 1pt 条实现）
         let insetHighlight = NSView()
         insetHighlight.wantsLayer = true
         insetHighlight.translatesAutoresizingMaskIntoConstraints = false
-        insetHighlight.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        insetHighlight.layer?.backgroundColor = NSColor.white.withAlphaComponent(DesignTokens.Inset.hiAlpha.0).cgColor
         effect.addSubview(insetHighlight)
 
         // 3) 内容栈（在 effect 之上、根视图之下 ⇒ 按钮发光不被裁）
@@ -224,7 +221,8 @@ final class ToolbarPanel: NSPanel {
         ])
         rootStack = stack
 
-        // 1) 6 个绘图工具
+        // 1) 6 个绘图工具 + 滚动截图入口（用户裁定：进工具组，R6 六工具不破——
+        //    滚动是动作不是标注工具，不占 EditorSession.Tool 序号，tag 206）
         for tool in EditorSession.Tool.allCases {
             let button = TBToolButton(tool: tool)
             button.target = self
@@ -233,10 +231,16 @@ final class ToolbarPanel: NSPanel {
             toolButtons[tool] = button
             stack.addArrangedSubview(button)
         }
+        let scrollButton = TBIconButton(symbol: "arrow.down.to.line", fallback: "滚")
+        scrollButton.tag = 206
+        scrollButton.target = self
+        scrollButton.action = #selector(toolTapped(_:))
+        scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 S") }
+        stack.addArrangedSubview(scrollButton)
 
         stack.addArrangedSubview(makeSeparator())
 
-        // 2) 五色（.tb-colors：gap 5 + padding 0 1）
+        // 2) 五色（.tb-dots：gap 6）
         let colorsGroup = NSStackView(views: [])
         colorsGroup.orientation = .horizontal
         colorsGroup.alignment = .centerY
@@ -314,7 +318,10 @@ final class ToolbarPanel: NSPanel {
         eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 H") }
         stack.addArrangedSubview(eye)
 
-        // 6) 主按钮「复制」（纯图标方形胶囊 30×28，tooltip 保留）+ 保存 + 关闭
+        stack.addArrangedSubview(makeSeparator())
+
+        // 6) 主按钮「复制」（28×28 纯图标 accent 实心键，唯一彩色 accent；tooltip 保留）
+        //    + 保存 + 取消（同构，无彩）
         let copy = TBPrimaryButton(symbol: "doc.on.doc")
         copy.tag = 201
         copy.target = self
@@ -378,11 +385,11 @@ final class ToolbarPanel: NSPanel {
     }
 
     private func makeSeparator() -> NSView {
-        // .tb-sep：0.5×17、margin 0 5px（栈间距 1 ⇒ 按钮边到分隔线 6pt）
+        // .tb-sep：0.5×20、margin 0 4（栈间距 8 ⇒ 线到内容 12）
         let view = NSView()
         view.translatesAutoresizingMaskIntoConstraints = false
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        view.layer?.backgroundColor = DesignTokens.hair.cgColor
         let wrapper = NSView()
         wrapper.translatesAutoresizingMaskIntoConstraints = false
         wrapper.addSubview(view)
@@ -551,6 +558,12 @@ final class ToolbarPanel: NSPanel {
     // MARK: - 事件
 
     @objc private func toolTapped(_ sender: NSButton) {
+        // 滚动截图入口（用户裁定：进工具组，tag 206 = 新值）
+        if sender.tag == 206 {
+            tooltip?.hide()
+            onAction(.scroll)
+            return
+        }
         guard let tool = EditorSession.Tool(rawValue: sender.tag) else { return }
         session?.currentTool = tool
         Log.event(.editor, "annotate.tool.select", ["tool": tool.label])
@@ -586,7 +599,7 @@ final class ToolbarPanel: NSPanel {
     }
 }
 
-// MARK: - 按钮选中/悬停共通态（.tb-btn 三态 + hover 上移 2pt + 按下 0.96）
+// MARK: - 按钮选中/悬停共通态（.tb-btn 三态；hover 只换 fill 底，不上移；选中无发光）
 
 @MainActor
 class TBIconButton: NSButton {
@@ -597,7 +610,7 @@ class TBIconButton: NSButton {
     /// 固定宽约束（粗细档要改成 26）；setupCommon 里创建真约束（空约束 isActive 会抛异常）
     private(set) var widthConstraint = NSLayoutConstraint()
     private var selectedState = false
-    /// 选中态的 inset 白高光（CSS 0 1px 0 rgba(255,255,255,.30) inset）
+    /// 选中态的 inset 白高光（inset.hi.strong：顶缘白 .16 渐隐）
     private let highlightGradient = CAGradientLayer()
     private var highlightInstalled = false
 
@@ -609,7 +622,7 @@ class TBIconButton: NSButton {
         imagePosition = .imageOnly
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
             self.image = image.withSymbolConfiguration(
-                NSImage.SymbolConfiguration(pointSize: 17, weight: .regular)
+                NSImage.SymbolConfiguration(pointSize: TBStyle.iconPointSize, weight: TBStyle.iconWeight)
             )
         } else {
             title = fallback
@@ -640,14 +653,14 @@ class TBIconButton: NSButton {
     private func setupCommon() {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 8
-        widthConstraint = widthAnchor.constraint(equalToConstant: 28)
+        layer?.cornerRadius = TBStyle.buttonRadius
+        widthConstraint = widthAnchor.constraint(equalToConstant: TBStyle.buttonSide)
         widthConstraint.isActive = true
-        heightAnchor.constraint(equalToConstant: 28).isActive = true
+        heightAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
         contentTintColor = TBStyle.iconIdle
-        // inset 白高光：顶部白 30% → 透明的渐变，mask 到圆角矩形
+        // inset.hi.strong：顶部白 .16 → 透明的渐变，mask 到圆角矩形
         highlightGradient.colors = [
-            NSColor.white.withAlphaComponent(0.30).cgColor,
+            NSColor.white.withAlphaComponent(DesignTokens.Inset.strongAlpha).cgColor,
             NSColor.white.withAlphaComponent(0.0).cgColor,
         ]
         highlightGradient.startPoint = CGPoint(x: 0.5, y: 0)
@@ -660,7 +673,9 @@ class TBIconButton: NSButton {
     override func layout() {
         super.layout()
         // 渐变 mask 跟随 bounds
-        let path = CGPath(roundedRect: bounds, cornerWidth: 8, cornerHeight: 8, transform: nil)
+        let path = CGPath(roundedRect: bounds,
+                          cornerWidth: TBStyle.buttonRadius, cornerHeight: TBStyle.buttonRadius,
+                          transform: nil)
         let mask = CAShapeLayer()
         mask.path = path
         highlightGradient.frame = bounds
@@ -668,10 +683,6 @@ class TBIconButton: NSButton {
         if selectedState, !highlightInstalled, let layer {
             layer.addSublayer(highlightGradient)
             highlightInstalled = true
-        }
-        if selectedState {
-            layer?.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                       cornerWidth: 8, cornerHeight: 8, transform: nil)
         }
     }
 
@@ -695,21 +706,11 @@ class TBIconButton: NSButton {
         onHover?(false)
     }
 
-    /// hover 上移 2pt（CSS translateY(-2px)）；AppKit 图层 y 向下为正 ⇒ y=-2 向上
-    private func setLifted(_ lifted: Bool) {
-        guard let layer else { return }
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.16)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
-        layer.transform = lifted ? CATransform3DMakeTranslation(0, -2, 0) : CATransform3DIdentity
-        CATransaction.commit()
-    }
-
     /// 换图标（眼睛显隐态用）
     func setSymbol(_ symbol: String, fallback: String) {
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
             self.image = image.withSymbolConfiguration(
-                NSImage.SymbolConfiguration(pointSize: 17, weight: .regular)
+                NSImage.SymbolConfiguration(pointSize: TBStyle.iconPointSize, weight: TBStyle.iconWeight)
             )
         } else {
             title = fallback
@@ -726,21 +727,15 @@ class TBIconButton: NSButton {
         applyStyle()
     }
 
+    /// 选中 = accent 实心 + 白图标 + 顶缘内高光；不再发光（删蓝色 glow）、不再上移
     func applyStyle() {
         let selected = selectedState
-        setLifted(isHot)
         if selected {
             layer?.backgroundColor = (isHot ? TBStyle.accentHover : TBStyle.accent).cgColor
             contentTintColor = TBStyle.iconActive
-            // 蓝色外发光：0 2px 8px rgba(10,132,255,.42) → radius 4 / offset -2（向下）
-            layer?.shadowColor = TBStyle.accentGlow.cgColor
-            layer?.shadowOpacity = 1
-            layer?.shadowRadius = 4
-            layer?.shadowOffset = CGSize(width: 0, height: -2)
-            layer?.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                       cornerWidth: 8, cornerHeight: 8, transform: nil)
+            layer?.shadowOpacity = 0
         } else if isHot {
-            layer?.backgroundColor = NSColor.white.withAlphaComponent(0.12).cgColor
+            layer?.backgroundColor = DesignTokens.fillHover.cgColor
             contentTintColor = TBStyle.iconActive
             layer?.shadowOpacity = 0
         } else {
@@ -750,22 +745,7 @@ class TBIconButton: NSButton {
         }
     }
 
-    override func mouseDown(with event: NSEvent) {
-        // :active → scale(.96)
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.1)
-        layer?.transform = CATransform3DMakeScale(0.96, 0.96, 1)
-        CATransaction.commit()
-        super.mouseDown(with: event)
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.12)
-        setLifted(isHot)
-        CATransaction.commit()
-    }
-
-    override var isEnabled: Bool {
-        didSet { alphaValue = isEnabled ? 1 : 0.35 }
-    }
+    override var isEnabled: Bool { didSet { alphaValue = isEnabled ? 1 : TBStyle.iconDisabledAlpha } }
 }
 
 /// 工具按钮：图标 + 数字热键语义（tooltip 由 ToolbarPanel 统一弹）
@@ -810,13 +790,15 @@ private final class TBToolButton: TBIconButton {
     }
 }
 
-// MARK: - 颜色点（15×15，选中白环 + 外圈黑环）
+// MARK: - 颜色点（14×14，选中：内环 1.5pt 白 .85 @−4.5 + 外环 1.5pt 白 .28 @−8）
 
 @MainActor
 private final class TBColorButton: NSButton {
     var onHover: ((Bool) -> Void)?
     private let dot = NSView()
-    /// 选中态外圈：0 0 0 3px rgba(0,0,0,.32)
+    /// 选中态内环：白 .85，比 dot 大 4.5pt（CSS .dot.on::after inset −4.5）
+    private let innerRing = CAShapeLayer()
+    /// 选中态外环：白 .28，比 dot 大 8pt（CSS .dot.on::before inset −8）
     private let outerRing = CAShapeLayer()
     private var trackingArea: NSTrackingArea?
     private var selected = false
@@ -829,26 +811,29 @@ private final class TBColorButton: NSButton {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         // 命中区 = 色点本身（原型 .dot 无 hover 底色，只有 scale 1.18）
-        widthAnchor.constraint(equalToConstant: 15).isActive = true
-        heightAnchor.constraint(equalToConstant: 28).isActive = true
+        widthAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
+        heightAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
 
         dot.translatesAutoresizingMaskIntoConstraints = false
         dot.wantsLayer = true
-        dot.layer?.cornerRadius = 7.5
+        dot.layer?.cornerRadius = TBStyle.dotSide / 2
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.borderWidth = 0.5
         dot.layer?.borderColor = NSColor.black.withAlphaComponent(0.28).cgColor
-        outerRing.fillColor = NSColor.clear.cgColor
-        outerRing.strokeColor = NSColor.black.withAlphaComponent(0.32).cgColor
-        outerRing.lineWidth = 1.5
-        outerRing.isHidden = true
-        dot.layer?.addSublayer(outerRing)
+        for ring in [innerRing, outerRing] {
+            ring.fillColor = NSColor.clear.cgColor
+            ring.strokeColor = NSColor.white.withAlphaComponent(0.85).cgColor
+            ring.lineWidth = 1.5
+            ring.isHidden = true
+            dot.layer?.addSublayer(ring)
+        }
+        outerRing.strokeColor = NSColor.white.withAlphaComponent(0.28).cgColor
         addSubview(dot)
         NSLayoutConstraint.activate([
             dot.centerXAnchor.constraint(equalTo: centerXAnchor),
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: 15),
-            dot.heightAnchor.constraint(equalToConstant: 15),
+            dot.widthAnchor.constraint(equalToConstant: TBStyle.dotSide),
+            dot.heightAnchor.constraint(equalToConstant: TBStyle.dotSide),
         ])
     }
 
@@ -857,10 +842,12 @@ private final class TBColorButton: NSButton {
 
     override func layout() {
         super.layout()
-        // 外圈路径：比 dot 大 1.5pt 的同心圆（环内缘 1.5 外缘 3，即 CSS 0 0 0 3px）
-        let rect = dot.bounds.insetBy(dx: -1.5, dy: -1.5)
-        outerRing.frame = rect.insetBy(dx: -outerRing.lineWidth / 2, dy: -outerRing.lineWidth / 2)
-        outerRing.path = CGPath(ellipseIn: outerRing.bounds, transform: nil)
+        // 内环路径：dot 外扩 4.5；外环：dot 外扩 8（同心圆环，线宽 1.5）
+        for (ring, offset) in [(innerRing, CGFloat(-4.5)), (outerRing, CGFloat(-8.0))] {
+            let rect = dot.bounds.insetBy(dx: offset, dy: offset)
+            ring.frame = rect.insetBy(dx: -ring.lineWidth / 2, dy: -ring.lineWidth / 2)
+            ring.path = CGPath(ellipseIn: ring.bounds, transform: nil)
+        }
     }
 
     /// ⚠️ 必须把命中测试指回按钮自身：装饰性的 dot 子视图会吃掉 mouseDown，
@@ -896,16 +883,8 @@ private final class TBColorButton: NSButton {
 
     func setSelected(_ isOn: Bool) {
         selected = isOn
-        if isOn {
-            // 0 0 0 1.5px rgba(255,255,255,.95) + 外圈 3px 黑 32%
-            dot.layer?.borderWidth = 1.5
-            dot.layer?.borderColor = NSColor.white.withAlphaComponent(0.95).cgColor
-            outerRing.isHidden = false
-        } else {
-            dot.layer?.borderWidth = 0.5
-            dot.layer?.borderColor = NSColor.black.withAlphaComponent(0.28).cgColor
-            outerRing.isHidden = true
-        }
+        innerRing.isHidden = !isOn
+        outerRing.isHidden = !isOn
     }
 }
 
@@ -945,7 +924,7 @@ private final class TBStrokeSlider: NSSlider {
     override func mouseExited(with event: NSEvent) { onHover?(false) }
 }
 
-// MARK: - 主按钮（#0A84FF 方形胶囊：纯图标，tooltip「复制并完成 ↩」）
+// MARK: - 主按钮「复制」（28×28 accent 实心纯图标键：唯一彩色 accent；无发光无上移）
 
 @MainActor
 private final class TBPrimaryButton: NSButton {
@@ -959,53 +938,31 @@ private final class TBPrimaryButton: NSButton {
         bezelStyle = .regularSquare
         title = ""                          // 去字：纯图标（信息走 tooltip）
         imagePosition = .imageOnly
-        contentTintColor = .white
+        contentTintColor = DesignTokens.labelOnAccent
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-            self.image = image.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold))
+            self.image = image.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: TBStyle.iconPointSize, weight: TBStyle.iconWeight)
+            )
         }
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 8
-        layer?.backgroundColor = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1).cgColor
-        // 原型 .tb-primary：inset 0 1px 0 rgba(255,255,255,.28) —— 顶部 1px 高光线
-        // 让蓝色胶囊有「玻璃立体感」，否则是一块死平的饱和色（用户实评「丑」的差距点）
-        let highlight = CALayer()
-        highlight.frame = CGRect(x: 1, y: 1, width: 0, height: 1)
-        highlight.autoresizingMask = [.layerWidthSizable, .layerMinYMargin]
-        highlight.backgroundColor = NSColor.white.withAlphaComponent(0.28).cgColor
-        layer?.addSublayer(highlight)
-        // 方形胶囊（旧：文字版自适应宽 + padding 0 10）
-        widthAnchor.constraint(equalToConstant: 30).isActive = true
+        layer?.cornerRadius = TBStyle.buttonRadius
+        layer?.backgroundColor = DesignTokens.accent.cgColor
+        widthAnchor.constraint(equalToConstant: DesignTokens.Toolbar.copyButtonSide).isActive = true
+        heightAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
         applyHot(false)
-        heightAnchor.constraint(equalToConstant: 28).isActive = true
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    private func applyHot(_ hot: Bool, pressed: Bool = false) {
+    private func applyHot(_ hot: Bool) {
         isHot = hot
-        // 原型 .tb-primary:hover —— 背景 #1a8cff + 上浮 2px + 投影加深；
-        // :active —— 回落 1px + scale(.97)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(
-            srgbRed: hot ? 0.102 : 0.039, green: hot ? 0.549 : 0.518,
-            blue: 1.0, alpha: 1
-        ).cgColor
-        layer?.transform = CATransform3DMakeTranslation(0, hot && !pressed ? 2 : 0, 0)
-        layer?.shadowColor = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0,
-                                     alpha: hot ? 0.45 : 0.38).cgColor
-        layer?.shadowOpacity = 1
-        layer?.shadowRadius = hot ? 8 : 5
-        layer?.shadowOffset = CGSize(width: 0, height: hot ? -6 : -3)
-        layer?.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                   cornerWidth: 8, cornerHeight: 8, transform: nil)
+        // hover = accent.hover（+0.12 亮度）；无位移、无发光（删旧 glow/上移）
+        layer?.backgroundColor = (hot ? TBStyle.accentHover : TBStyle.accent).cgColor
+        layer?.shadowOpacity = 0
         layer?.removeAnimation(forKey: "hot")
-    }
-
-    override func layout() {
-        super.layout()
-        applyHot(isHot)
     }
 
     override func updateTrackingAreas() {
@@ -1019,23 +976,12 @@ private final class TBPrimaryButton: NSButton {
     override func mouseEntered(with event: NSEvent) {
         isHot = true
         onHover?(true)
-        // hover：#1A8CFF + 上移 2pt + 更大投影
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.16)
-        layer?.backgroundColor = NSColor(srgbRed: 0.102, green: 0.549, blue: 1.0, alpha: 1).cgColor
-        layer?.transform = CATransform3DMakeTranslation(0, -2, 0)
-        CATransaction.commit()
         applyHot(true)
     }
 
     override func mouseExited(with event: NSEvent) {
         isHot = false
         onHover?(false)
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.16)
-        layer?.backgroundColor = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1).cgColor
-        layer?.transform = CATransform3DIdentity
-        CATransaction.commit()
         applyHot(false)
     }
 }

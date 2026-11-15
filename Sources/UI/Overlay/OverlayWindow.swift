@@ -53,13 +53,23 @@ final class OverlayWindow: NSWindow {
         (contentView as? OverlayView)?.enterEditorMode(session: session)
     }
 
-    /// 滚动截图模式（滚动 HUD）
+    /// 滚动截图模式（区域 outline + 光晕脉动）
     func enterScrollMode() {
         (contentView as? OverlayView)?.enterScrollMode()
     }
 
     func exitScrollMode() {
         (contentView as? OverlayView)?.exitScrollMode()
+    }
+
+    /// 滚动采集：区域随内容生长（全局矩形）
+    func updateScrollRegion(_ global: CGRect) {
+        (contentView as? OverlayView)?.updateScrollRegion(global: global)
+    }
+
+    /// 到底：底缘 2pt 绿条 + 光晕定格
+    func setScrollBottomReached() {
+        (contentView as? OverlayView)?.setScrollBottomReached()
     }
 
     /// 安装冻结帧（会话开始时的整屏静态图）
@@ -102,6 +112,8 @@ final class OverlayView: NSView {
     private(set) var scrollMode = false
     /// 滚动 HUD 显示的选区（本窗口负责的那块，可能是 nil=本屏无选区）
     private var scrollRectLocal: CGRect?
+    /// 采集区域边缘光晕 + 底缘绿条（motion.pulse；替代旧 draw 内画框）
+    private var scrollGlowView: ScrollRegionGlowView?
 
     /// 文字输入框（text 工具）
     private var textField: NSTextField?
@@ -186,6 +198,7 @@ final class OverlayView: NSView {
         } else {
             scrollRectLocal = nil
         }
+        installScrollGlow()
         needsDisplay = true
     }
 
@@ -193,7 +206,36 @@ final class OverlayView: NSView {
         scrollMode = false
         window?.ignoresMouseEvents = false
         scrollRectLocal = nil
+        scrollGlowView?.removeFromSuperview()
+        scrollGlowView = nil
         needsDisplay = true
+    }
+
+    /// 采集区域生长（全局矩形 → 本地）
+    func updateScrollRegion(global: CGRect) {
+        guard let frame = window?.frame else { return }
+        let local = CGRect(
+            x: global.minX - frame.minX,
+            y: frame.maxY - global.maxY,
+            width: global.width,
+            height: global.height
+        )
+        scrollRectLocal = local
+        scrollGlowView?.update(rect: local)
+    }
+
+    /// 到底确认态（底缘绿条亮起，光晕定格）
+    func setScrollBottomReached() {
+        scrollGlowView?.setBottomReached()
+    }
+
+    /// 边缘光晕层（scene 06：outline 1.5pt accent + 3.5pt soft 外圈 + motion.pulse）
+    private func installScrollGlow() {
+        guard let rect = scrollRectLocal, scrollGlowView == nil else { return }
+        let glow = ScrollRegionGlowView()
+        glow.frame = rect
+        addSubview(glow)
+        scrollGlowView = glow
     }
 
     /// 安装冻结帧并重绘（"屏幕定住"效果的唯一来源）
@@ -882,17 +924,11 @@ final class OverlayView: NSView {
                 controller.perform(action: .copy)
             }
         case kVK_ANSI_S:
+            // ⌘⌥S 快存（内置语义，不走热键体系）；⌘S 保存与裸 S 滚动截图
+            // 均已并入 settings.editorHotkeys（EditorKeyRouter 分发，见上方 match）
             if event.modifierFlags.contains(.command), event.modifierFlags.contains(.option),
                phase == .editing || phase == .confirmed {
                 controller.perform(action: .quickSave)
-                return
-            }
-            if event.modifierFlags.contains(.command), phase == .editing || phase == .confirmed {
-                controller.perform(action: .save)
-            } else if phase == .editing, !event.modifierFlags.contains(.command) {
-                // S = 滚动截图模式（需求 3：滚动截图）
-                Log.event(.scroll, "scroll.keyReceived")
-                controller.beginScrollCapture()
             } else {
                 super.keyDown(with: event)
             }
@@ -922,6 +958,11 @@ final class OverlayView: NSView {
         save: { [weak self] in self?.controller.perform(action: .save) },
         done: { [weak self] in self?.controller.perform(action: .copy) },
         cancel: { [weak self] in self?.controller.perform(action: .cancel) },
+        scroll: { [weak self] in
+            guard let self else { return }
+            Log.event(.scroll, "scroll.keyReceived")
+            self.controller.beginScrollCapture()
+        },
         selectTool: { [weak self] tool in
             guard let self else { return }
             self.editorSession?.currentTool = tool
@@ -1005,7 +1046,8 @@ final class OverlayView: NSView {
         }
     }
 
-    /// 滚动 HUD：选区框 + 帧/引导
+    /// 滚动采集态：蒙层 + 挖空采集区（outline/光晕/底缘绿条由 ScrollRegionGlowView 承担，
+    /// 帧数/进度由 ScrollCaptureHUDPanel 承担——图层动画不能走 draw 重绘路径）
     private func drawScrollHUD(ctx: CGContext) {
         ctx.setFillColor(NSColor.black.withAlphaComponent(0.2).cgColor)
         ctx.fill(bounds)
@@ -1014,25 +1056,6 @@ final class OverlayView: NSView {
         ctx.setBlendMode(.clear)
         ctx.fill(rect)
         ctx.restoreGState()
-        ctx.setStrokeColor(NSColor.white.cgColor)
-        ctx.setLineWidth(1.5)
-        ctx.stroke(rect)
-
-        let frames = controller.scrollFrameCount
-        let text = "滚动内容以捕获 · 已抓 \(frames) 帧 · Enter 完成拼接 · Esc 取消"
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.white,
-        ]
-        let textSize = (text as NSString).size(withAttributes: attributes)
-        let padding: CGFloat = 10
-        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + 8))
-        var origin = CGPoint(x: rect.midX - size.width / 2, y: rect.maxY + 10)
-        if origin.y + size.height > bounds.height { origin.y = rect.minY - size.height - 10 }
-        origin.x = min(max(origin.x, 8), bounds.width - 8 - size.width)
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
-        ctx.fill(CGRect(origin: origin, size: size))
-        (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 4), withAttributes: attributes)
     }
 
     /// 选区阶段：冻结帧 + 蒙层 + 橡皮筋 + 角标 + 窗口悬停高亮

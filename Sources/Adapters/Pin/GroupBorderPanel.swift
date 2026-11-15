@@ -61,15 +61,22 @@ final class GroupBorderPanel: NSPanel {
 }
 
 /// 组框内容视图：虚线框 + 徽标 + 合成按钮；命中区 = 边框带 + 徽标 + 按钮
+///
+/// token（重设计 scene 04）：虚线 1.5pt dash 5/4 accent α.75、组内蓝 α.03、
+/// 徽标 22 高 radius 11 accent 实心 10.5/600、合成键 24 高 radius 12 accent 实心
+/// 11.5/600 **无光晕**；accent 统一 system blue（原 #4C8DFF 删除）。
+/// ⚠️ 尺寸偏差说明：设计稿徽标/按钮骑在框顶（y −10/−11），但面板窗体只外扩
+/// 10pt 且虚线画在窗缘 —— 骑顶会裁出窗外，故贴框内侧摆放（视觉差异微小）。
 @MainActor
 final class GroupBorderView: NSView {
-    static let accent = NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 1) // #4C8DFF
+    /// 唯一强调色（token accent，随外观解析暗 #0A84FF / 亮 #007AFF）
+    static let accent = DesignTokens.accent
     /// 命中边框带宽度（pt）；窗体 = union rect 外扩 10 ⇒ 内区不含成员卡
     static let bandWidth: CGFloat = 10
 
     weak var panel: GroupBorderPanel?
     var memberCount: Int = 0
-    private let assembleButton = NSButton(title: "⟐ 合成整体", target: nil, action: nil)
+    private let assembleButton = NSButton(title: "合成整体", target: nil, action: nil)
 
     override var isFlipped: Bool { true }
 
@@ -78,19 +85,16 @@ final class GroupBorderView: NSView {
         wantsLayer = true
         assembleButton.isBordered = false
         assembleButton.wantsLayer = true
-        assembleButton.layer?.cornerRadius = 11
+        assembleButton.layer?.cornerRadius = DesignTokens.Radius.assemble
         assembleButton.layer?.backgroundColor = Self.accent.cgColor
-        assembleButton.layer?.shadowColor = Self.accent.cgColor
-        assembleButton.layer?.shadowOpacity = 0.45
-        assembleButton.layer?.shadowRadius = 5
-        assembleButton.layer?.shadowOffset = CGSize(width: 0, height: -3)
+        // 无光晕：删旧蓝色 shadow（迁移差异 §10-4）
         let para = NSMutableParagraphStyle()
         para.alignment = .center
         assembleButton.attributedTitle = NSAttributedString(
-            string: "⟐ 合成整体",
+            string: "合成整体",
             attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-                .foregroundColor: NSColor.white,
+                .font: DesignTokens.GroupFrame.assembleFont,
+                .foregroundColor: DesignTokens.labelOnAccent,
                 .paragraphStyle: para,
             ]
         )
@@ -112,15 +116,15 @@ final class GroupBorderView: NSView {
         layoutAssembleButton()
     }
 
-    /// 按钮贴框顶右（徽标旁）：翻转坐标下 y=2 顶对齐
+    /// 按钮贴框顶右：24 高 radius 12，右缘 12
     func layoutAssembleButton() {
         let size = assembleButton.intrinsicContentSize
-        let width = max(size.width + 16, 78)
+        let width = max(size.width + 24, 92)
         assembleButton.frame = NSRect(
-            x: bounds.width - width - 14,
+            x: bounds.width - width - 12,
             y: 2,
             width: width,
-            height: 22
+            height: DesignTokens.GroupFrame.assembleHeight
         )
     }
 
@@ -132,8 +136,11 @@ final class GroupBorderView: NSView {
         // 按钮等子控件优先
         if let hit = super.hitTest(point), hit !== self { return hit }
         // 边框带（外圈 bandWidth）+ 徽标区吃事件；成员卡区域穿透
+        // reviewer 补丁：徽标是纯绘制（非子视图），必须给显式命中矩形——
+        // 否则徽标下半部（band 之外）穿透，与注释「徽标区吃事件」不符
         let inner = bounds.insetBy(dx: Self.bandWidth, dy: Self.bandWidth)
-        return inner.contains(local) ? nil : self
+        if !inner.contains(local) { return self }
+        return badgeRect().contains(local) ? self : nil
     }
 
     // MARK: - 整组拖动（转发 registry）
@@ -152,22 +159,22 @@ final class GroupBorderView: NSView {
 
     // MARK: - 绘制
 
-    /// 徽标矩形（框顶左，骑在边框上）
+    /// 徽标矩形（框顶左）
     private func badgeRect() -> NSRect {
         let text = "拼贴空间 · \(memberCount) 张"
         let size = (text as NSString).size(withAttributes: Self.badgeAttributes)
-        return NSRect(x: 14, y: 1, width: ceil(size.width) + 16, height: 16)
+        return NSRect(x: 14, y: 2, width: ceil(size.width) + 24, height: DesignTokens.GroupFrame.badgeHeight)
     }
 
     private static let badgeAttributes: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
-        .foregroundColor: NSColor.white,
+        .font: DesignTokens.GroupFrame.badgeFont,
+        .foregroundColor: DesignTokens.labelOnAccent,
     ]
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
-        // 虚线组框（骑窗体边缘内缩 1pt）
+        // 虚线组框（骑窗体边缘内缩 1pt）：1.5pt dash 5/4 accent α.75
         let frameRect = bounds.insetBy(dx: 1, dy: 1)
         let path = CGPath(
             roundedRect: frameRect,
@@ -176,27 +183,28 @@ final class GroupBorderView: NSView {
         )
         ctx.saveGState()
         ctx.addPath(path)
-        ctx.setStrokeColor(Self.accent.withAlphaComponent(0.9).cgColor)
-        ctx.setLineWidth(1.5)
-        ctx.setLineDash(phase: 0, lengths: [5, 4])
+        ctx.setStrokeColor(Self.accent.withAlphaComponent(DesignTokens.GroupFrame.dashAlpha).cgColor)
+        ctx.setLineWidth(DesignTokens.GroupFrame.dashWidth)
+        ctx.setLineDash(phase: 0, lengths: DesignTokens.GroupFrame.dashPattern)
         ctx.strokePath()
         ctx.restoreGState()
 
-        // 组框内部淡蓝底（成员区穿透点击，纯视觉）
+        // 组框内部淡蓝底（α .03，成员区穿透点击，纯视觉）
         ctx.saveGState()
         ctx.addPath(CGPath(
             roundedRect: bounds.insetBy(dx: 2, dy: 2),
             cornerWidth: 13, cornerHeight: 13, transform: nil
         ))
         ctx.clip()
-        ctx.setFillColor(Self.accent.withAlphaComponent(0.04).cgColor)
+        ctx.setFillColor(Self.accent.withAlphaComponent(DesignTokens.GroupFrame.innerTintAlpha).cgColor)
         ctx.fill(bounds)
         ctx.restoreGState()
 
-        // 「拼贴空间 · N 张」徽标
+        // 「拼贴空间 · N 张」徽标：22 高 radius 11 accent 实心
         let badge = badgeRect()
         let badgePath = CGPath(
-            roundedRect: badge, cornerWidth: 8, cornerHeight: 8, transform: nil
+            roundedRect: badge, cornerWidth: DesignTokens.Radius.badge,
+            cornerHeight: DesignTokens.Radius.badge, transform: nil
         )
         ctx.setFillColor(Self.accent.withAlphaComponent(0.92).cgColor)
         ctx.addPath(badgePath)
@@ -204,7 +212,7 @@ final class GroupBorderView: NSView {
         let text = "拼贴空间 · \(memberCount) 张"
         let textSize = (text as NSString).size(withAttributes: Self.badgeAttributes)
         (text as NSString).draw(
-            at: CGPoint(x: badge.minX + 8, y: badge.minY + (badge.height - textSize.height) / 2),
+            at: CGPoint(x: badge.minX + 12, y: badge.minY + (badge.height - textSize.height) / 2),
             withAttributes: Self.badgeAttributes
         )
     }

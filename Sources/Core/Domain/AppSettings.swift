@@ -36,13 +36,14 @@ public struct AppSettings: Equatable, Sendable, Codable {
     /// 全屏截图热键（默认 "cmd+shift+s"）
     public var hotkeyFullScreen: String
     /// 编辑器内操作热键（工具栏后半段：action key → 组合串）
-    /// key 取 ToolbarPanel.Action 的 rawValue：undo / redo / toggleVisibility /
-    /// done / save / cancel / ocr / pin。值格式同 hotkeyRegion（"cmd+z"），
-    /// 额外允许裸键（"o"）与命名键（"return" / "esc"）——编辑器作用域，
-    /// 不注册 Carbon。
+    /// key 取 ToolbarPanel.Action 的语义名：undo / redo / toggleVisibility /
+    /// done / save / cancel / ocr / pin / scroll。值格式同 hotkeyRegion（"cmd+z"），
+    /// 额外允许裸键（"o"/"s"）与命名键（"return" / "esc"）——编辑器作用域，
+    /// 不注册 Carbon。scroll 清空则滚动截图无键（仅工具栏按钮入口）。
     public var editorHotkeys: [String: String]
 
-    /// 编辑器热键的出厂默认（= 原 keyDown 硬编码，迁移零感知）
+    /// 编辑器热键的出厂默认（= 原 keyDown 硬编码 + 滚动截图 s；存量存档缺 scroll
+    /// 键时 editorHotkey(for:) 自动回落默认 —— s 从「内置」转「可自定义」零感知迁移）
     public static let defaultEditorHotkeys: [String: String] = [
         "undo": "cmd+z",
         "redo": "cmd+shift+z",
@@ -52,6 +53,7 @@ public struct AppSettings: Equatable, Sendable, Codable {
         "cancel": "esc",
         "ocr": "o",
         "pin": "p",
+        "scroll": "s",
     ]
 
     /// 编辑器热键查找（缺失/非法回落默认；解析失败也回落——永不误吞按键）

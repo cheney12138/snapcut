@@ -1,20 +1,47 @@
 import AppKit
 import CoreGraphics
 
-/// 复制成功反馈（原型右下角 `.toast`：缩略图 + 「已复制到剪贴板」+ 尺寸格式）
+/// 复制成功反馈（重设计 scene 05：缩略图 + 「已复制到剪贴板」+ 尺寸格式）
+///
+/// 视觉真源：snapcut-design-redesign scene 05；token 取自 DesignTokens（§9 Toast 规格）：
+/// - 图片版 268×76、radius 14、padding 10、缩略图 56 radius 6 + 0.5pt 白 .22 描边
+/// - 纯文案版：高 40、radius 10、12/500 + 状态色图标 15（只表达状态）
+/// - mat.hud（钉暗窗口内解析暗玻璃）、描边 stroke（白 .14）、数字 tabular-nums
+/// - 入场：淡入 + 上滑 12pt、0.22s spring（motion.spring）
 ///
 /// 设计纪律：
-/// - 不抢焦点（`.nonactivatingPanel`，`ignoresMouseEvents = true`）——截完图用户要马上继续干活
+/// - 不抢焦点（.nonactivatingPanel，ignoresMouseEvents = true）——截完图用户要马上继续干活
 /// - 不写入截图（它在截图会话结束之后才出现，且不属于覆盖层）
-/// - 2 秒自动消失，淡出 + 轻微下滑（与工具栏同族的 spring 手感）
+/// - 2 秒自动消失，淡出 + 轻微下滑
 @MainActor
 enum CaptureToast {
+    /// 纯文案 toast 的状态语义（状态色只表达状态，不做装饰）
+    @MainActor
+    enum Status {
+        case ok
+        case warn
+
+        var color: NSColor {
+            switch self {
+            case .ok: return DesignTokens.statusOK
+            case .warn: return DesignTokens.statusWarn
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .ok: return "checkmark.circle"
+            case .warn: return "exclamationmark.circle"
+            }
+        }
+    }
+
     private static var current: NSPanel?
     private static var dismissWork: DispatchWorkItem?
 
-    /// 纯文案 toast（无缩略图）：系统级提示用（如菜单栏溢出告知）。
-    /// 同样不抢焦点，2.5 秒自动消失。
-    static func show(message: String) {
+    /// 纯文案 toast（无缩略图）：系统级提示用（如菜单栏溢出告知 / 滚动回退告知）。
+    /// 同样不抢焦点，2.5 秒自动消失。status 缺省 nil = 不带状态图标。
+    static func show(message: String, status: Status? = nil) {
         dismissWork?.cancel()
         current?.orderOut(nil)
         current = nil
@@ -25,9 +52,10 @@ enum CaptureToast {
         // 宽度随文案自适应（上限屏宽 - 40），避免长文案被裁切
         let probe = NSTextField(labelWithString: message)
         probe.font = .systemFont(ofSize: 12, weight: .medium)
-        let textWidth = probe.intrinsicContentSize.width + 32
+        let iconSpace: CGFloat = status == nil ? 0 : 15 + 10
+        let textWidth = probe.intrinsicContentSize.width + 32 + iconSpace
         let width = min(max(180, textWidth), visible.width - 40)
-        let height: CGFloat = 40
+        let height: CGFloat = DesignTokens.Toast.textHeight
 
         let panel = ToastPanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
@@ -43,35 +71,57 @@ enum CaptureToast {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
 
-        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-        effect.material = .hudWindow
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 10
-        effect.layer?.masksToBounds = true
-        effect.layer?.borderWidth = 0.5
-        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        let effect = DesignTokens.Mat.glass(
+            material: DesignTokens.Mat.hud,
+            cornerRadius: DesignTokens.Radius.lg
+        )
+        effect.frame = NSRect(x: 0, y: 0, width: width, height: height)
 
+        var views: [NSView] = []
+        if let status {
+            let icon = NSImageView()
+            icon.image = NSImage(systemSymbolName: status.symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
+            icon.contentTintColor = status.color
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            icon.widthAnchor.constraint(equalToConstant: 15).isActive = true
+            icon.heightAnchor.constraint(equalToConstant: 15).isActive = true
+            views.append(icon)
+        }
         let label = NSTextField(labelWithString: message)
         label.font = .systemFont(ofSize: 12, weight: .medium)
-        label.textColor = .white
+        label.textColor = DesignTokens.label1
         label.lineBreakMode = .byTruncatingTail
         label.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(label)
+        views.append(label)
+        let stack = NSStackView(views: views)
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        effect.addSubview(stack)
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: effect.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: effect.centerYAnchor),
+            stack.centerXAnchor.constraint(equalTo: effect.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: effect.centerYAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: effect.leadingAnchor, constant: 14),
         ])
         panel.contentView = effect
 
-        let restOrigin = CGPoint(x: visible.maxX - width - 20, y: visible.minY + 20)
+        let restOrigin = CGPoint(
+            x: visible.maxX - width - DesignTokens.Toast.screenMargin,
+            y: visible.minY + DesignTokens.Toast.screenMargin
+        )
         panel.setFrameOrigin(CGPoint(x: restOrigin.x, y: restOrigin.y - 12))
         panel.alphaValue = 0
         panel.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.3, 0.5, 1)
+            ctx.duration = DesignTokens.Motion.springDuration
+            ctx.timingFunction = CAMediaTimingFunction(
+                controlPoints: DesignTokens.Motion.springControlPoints.0,
+                DesignTokens.Motion.springControlPoints.1,
+                DesignTokens.Motion.springControlPoints.2,
+                DesignTokens.Motion.springControlPoints.3
+            )
             panel.animator().alphaValue = 1
             panel.animator().setFrameOrigin(restOrigin)
         }
@@ -79,7 +129,7 @@ enum CaptureToast {
 
         let work = DispatchWorkItem {
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.20
+                ctx.duration = DesignTokens.Motion.fadeDuration
                 panel.animator().alphaValue = 0
             } completionHandler: {
                 panel.orderOut(nil)
@@ -116,39 +166,35 @@ enum CaptureToast {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
 
-        // 背景：hud 磨砂 + 14pt 圆角 + 细描边
-        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-        effect.material = .hudWindow
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 14
-        effect.layer?.masksToBounds = true
-        effect.layer?.borderWidth = 0.5
-        effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        // 背景：mat.hud 玻璃（radius 14 + 0.5pt stroke）
+        let effect = DesignTokens.Mat.glass(
+            material: DesignTokens.Mat.hud,
+            cornerRadius: DesignTokens.Radius.xl
+        )
+        effect.frame = NSRect(x: 0, y: 0, width: width, height: height)
 
-        // 缩略图（保持比例，圆角 6，带描边）
-        let thumbSide: CGFloat = 56
+        // 缩略图（56pt radius 6 + 0.5pt 白 .22 描边）
+        let thumbSide = DesignTokens.Toast.thumbSide
         let thumbView = NSImageView(frame: NSRect(x: 10, y: 10, width: thumbSide, height: thumbSide))
         thumbView.image = NSImage(cgImage: image, size: NSSize(width: thumbSide, height: thumbSide))
         thumbView.imageScaling = .scaleProportionallyUpOrDown
         thumbView.wantsLayer = true
-        thumbView.layer?.cornerRadius = 6
+        thumbView.layer?.cornerRadius = DesignTokens.Radius.sm
         thumbView.layer?.masksToBounds = true
         thumbView.layer?.borderWidth = 0.5
-        thumbView.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        thumbView.layer?.borderColor = NSColor.white.withAlphaComponent(DesignTokens.Toast.thumbStrokeAlpha).cgColor
         effect.addSubview(thumbView)
 
-        // 文案两行：主文案 + 尺寸/格式
+        // 文案两行：t.head 主文案 + t.note 尺寸/格式（数字 tabular-nums）
         let textX = thumbSide + 20
         let title = NSTextField(labelWithString: message)
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
-        title.textColor = .white
+        title.font = DesignTokens.Font.head
+        title.textColor = DesignTokens.label1
         title.frame = NSRect(x: textX, y: height - 34, width: width - textX - 14, height: 18)
 
         let detail = NSTextField(labelWithString: "\(image.width) × \(image.height) · PNG")
-        detail.font = .systemFont(ofSize: 11, weight: .regular)
-        detail.textColor = NSColor.white.withAlphaComponent(0.62)
+        detail.font = DesignTokens.Font.monoDigit(11)
+        detail.textColor = DesignTokens.label2
         detail.frame = NSRect(x: textX, y: height - 53, width: width - textX - 14, height: 15)
 
         effect.addSubview(title)

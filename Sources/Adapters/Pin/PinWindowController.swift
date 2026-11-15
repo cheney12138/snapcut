@@ -69,6 +69,8 @@ final class PinWindowController {
         var snapped: (partner: PinWindowController, edge: MagnetEdge)?
         /// ⌘组拖的成员起始 frame（外框空间 = 窗体 frame，成员皆已成组）
         var members: [(pin: PinWindowController, startFrame: CGRect)]
+        /// ⌥拆组延迟提交（真实拖动 >3pt 才算，防 ⌥单击误拆）
+        var pendingDetach: Bool = false
     }
 
     private var drag: DragState?
@@ -158,9 +160,10 @@ final class PinWindowController {
             snapped: nil,
             members: []
         )
+        // reviewer 补丁：detach 不在按下时立即执行——⌥+单击（无拖动）不该拆组；
+        // 延迟到 dragMoved 首帧（超过 3pt 才算真拖动）再提交
         if detach {
-            PinMagnetRegistry.shared.detach(self)
-            showHUD("已移出拼贴组")
+            state.pendingDetach = true
         }
         if state.groupDrag {
             let members = PinMagnetRegistry.shared.groupMembers(of: self)
@@ -175,6 +178,19 @@ final class PinWindowController {
     func dragMoved(candidateOrigin explicit: CGPoint? = nil) {
         guard var state = drag else { return }
         let frame = window.frame
+        // ⌥ 拆组首帧提交：位移超过 3pt 才算真拖动（⌥单击不拆组）
+        if state.pendingDetach {
+            let moved = hypot(
+                frame.minX - state.originalFrame.minX,
+                frame.minY - state.originalFrame.minY
+            )
+            if moved > 3 {
+                state.pendingDetach = false
+                state.detach = true
+                PinMagnetRegistry.shared.detach(self)
+                showHUD("已移出拼贴组")
+            }
+        }
         let origin: CGPoint
         if let explicit {
             origin = explicit
