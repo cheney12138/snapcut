@@ -82,7 +82,8 @@ enum CGRenderer {
             break
 
         case .sequence(let anchor):
-            drawText("\(a.index ?? 1)", at: anchor, color: color, size: 16, badge: true, context: context, yDown: yDown)
+            // 字号/半径由渲染器常量统一（badgeFontSize 20 / badgeRadius 17，见 drawText）
+            drawText("\(a.index ?? 1)", at: anchor, color: color, badge: true, context: context, yDown: yDown)
 
         case .highlight(let from, let to):
             context.setStrokeColor(color.withAlphaComponent(0.4).cgColor)
@@ -134,14 +135,23 @@ enum CGRenderer {
         context.fillPath()
     }
 
+    /// 徽章几何（对齐 Snow Shot 序号观感）：圆直径 = 1.68 × 数字字号
+    /// （Snow Shot resolve_serial_number_badge_diameter：行高 1.2em + 0.4em padding），
+    /// 字号 20 semibold ⇒ 单个数字墨迹高 ≈ 14.3pt、圆直径 ≈ 34pt（半径 17），
+    /// 数字/圆径比例 42% ≈ Snow Shot（24pt 字号 / 40px 直径 = 42%）——
+    /// 病例（用户实报「这字号你能看清啊」）：旧版字号 16 + 半径 13，墨迹仅 11pt。
+    private static let badgeFontSize: CGFloat = 20
+    private static let badgeRadius: CGFloat = 17
+
     /// 文字（text/sequence 共用；sequence 画成实心圆徽章）
     ///
     /// 徽章对比度（病例：白色/黄色徽章 + 白色数字 ⇒ 白底白字看不见）：
     /// 按底色亮度选数字颜色（亮底黑字/暗底白字），并加一圈同色系描边，
     /// 保证徽章在任意底色的截图上都能被看见。
-    private static func drawText(_ text: String, at anchor: CGPoint, color: NSColor, size: CGFloat, badge: Bool = false, context: CGContext, yDown: Bool) {
+    private static func drawText(_ text: String, at anchor: CGPoint, color: NSColor, size: CGFloat? = nil, badge: Bool = false, context: CGContext, yDown: Bool) {
         guard !text.isEmpty else { return }
-        let font = NSFont.systemFont(ofSize: size, weight: badge ? .semibold : .medium)
+        let fontSize = size ?? (badge ? badgeFontSize : 14)
+        let font = NSFont.systemFont(ofSize: fontSize, weight: badge ? .semibold : .medium)
         // 徽章底色亮度 → 数字颜色（0.299/0.587/0.114 加权亮度，阈值 0.6）
         let components = color.usingColorSpace(.sRGB)
         let luminance = badge
@@ -159,7 +169,7 @@ enum CGRenderer {
 
         var origin = anchor
         if badge {
-            let radius = max(lineBounds.height / 2 + 5, 12)
+            let radius = badgeRadius
             let circle = CGRect(
                 x: anchor.x - radius, y: anchor.y - radius,
                 width: radius * 2, height: radius * 2
@@ -193,6 +203,14 @@ enum CGRenderer {
         }
         context.translateBy(x: origin.x, y: baseline)
         context.scaleBy(x: 1, y: -1)
+        // ⚠️ 关键修复（用户两轮实报「序号乱序」的实锤根因）：CTLineDraw 会把已画
+        // 行的 advance 累加进 context 的 text matrix（tx += 行宽），而 text matrix
+        // 不属于 graphics state——saveGState/restoreGState 恢复不了它。同一帧里
+        // 画第 N 个文字标注时字形整体右漂 10.4pt × N：圆圈（纯路径）留在原地，
+        // 数字漂进相邻圆圈或空白处 ⇒ 用户看到「圆里没数字 / 数字乱序」。
+        // （像素实验：6 个同字段徽章顺序绘制，ink x 实测 60/126/200/267/341/411，
+        // textMatrix tx 每次 +10.42；置 identity 后 61/121/181/241/301/361 全对位。）
+        context.textMatrix = .identity
         CTLineDraw(line, context)
         context.restoreGState()
     }

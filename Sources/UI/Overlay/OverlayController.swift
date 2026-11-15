@@ -78,8 +78,15 @@ final class OverlayController {
                 for screen in NSScreen.screens {
                     guard let displayID = DisplayRegistry.displayID(of: screen) else { continue }
                     group.addTask {
-                        let image = try? await SCKCapture.shared.captureDisplay(displayID: displayID)
-                        return (displayID, image)
+                        do {
+                            let image = try await SCKCapture.shared.captureDisplay(displayID: displayID)
+                            return (displayID, image)
+                        } catch {
+                            Log.error(.capture, "freeze.fail", [
+                                "display": "\(displayID)", "err": "\(error)",
+                            ])
+                            return (displayID, nil)
+                        }
                     }
                 }
                 for await (displayID, image) in group {

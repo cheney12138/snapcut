@@ -1,12 +1,16 @@
 import AppKit
 
-/// 设置窗口（macOS 原生偏好面板观感）
+/// 设置窗口（System Settings 同款玻璃分组卡观感）
 ///
 /// - NSToolbar 三个可选中 tab：「通用」「快捷键」「关于」（toolbarStyle = .preference，
 ///   系统偏好同款居中布局）；三个等大小子视图叠在同一容器里切 isHidden，无闪烁。
 /// - 无「确定/取消」按钮：任何控件改动立即 `store.save`，窗口关闭即生效。
-/// - 视觉：NSStackView + 分组小号灰字标题，行高 32，左右 20pt 边距，系统控件原生皮肤
-///   （与 ToolbarPanel 一致走 controlAccentColor，不自绘皮肤）。
+/// - 视觉（延展设计真源 toolbar 的玻璃语言，真源无 settings 场景）：
+///   磨砂分组卡 NSVisualEffectView .underWindowBackground + 圆角 12 + 明暗自适应描边
+///   （暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.09)，对齐真源 --glass-stroke/--glass-edge）；
+///   分组标题 11pt semibold secondary；行式设置左标签右控件，行高 36，8pt 栅格（间距 8/12）；
+///   分隔线 0.5pt 暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.085)（对齐 --hair）；
+///   品牌色走 controlAccentColor（暗色即 #0A84FF），字体 SF Pro 体系。
 /// - 六边形纪律：只依赖端口 `SettingsStoring`，适配器由合成根注入（主会话接线）。
 @MainActor
 final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSControlTextEditingDelegate {
@@ -30,7 +34,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private let generalPane = NSView()
     private let hotkeyPane = NSView()
     private let aboutPane = NSView()
-    private var permBox: NSBox?
     private var permStatusDot: NSView?
     private var permButtonRef: NSButton?
     private var permHintRef: NSTextField?
@@ -42,8 +45,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private var filenamePopup: NSPopUpButton!
     private var historyField: NSTextField!
     private var historyStepper: NSStepper!
-    private var notifyCheck: NSButton!
-    private var soundCheck: NSButton!
+    private var notifySwitch: NSSwitch!
+    private var soundSwitch: NSSwitch!
 
     // 快捷键 tab 控件
     private var regionRecorder: HotkeyRecorderView!
@@ -81,7 +84,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         windowBuilt = true
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -97,7 +100,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         win.toolbar = toolbar
         win.delegate = self  // 需要 NSWindowDelegate（windowWillClose）
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 420))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 480))
         for pane in [generalPane, hotkeyPane, aboutPane] {
             container.addSubview(pane)
             pane.translatesAutoresizingMaskIntoConstraints = false
@@ -210,7 +213,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         pathField.font = .systemFont(ofSize: 12)
         pathField.lineBreakMode = .byTruncatingMiddle
         pathField.translatesAutoresizingMaskIntoConstraints = false
-        pathField.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        pathField.widthAnchor.constraint(equalToConstant: 220).isActive = true
 
         let chooseButton = NSButton(title: "选择…", target: self, action: #selector(chooseDirectory(_:)))
         chooseButton.bezelStyle = .rounded
@@ -249,29 +252,36 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         unitLabel.font = .systemFont(ofSize: 12)
         unitLabel.textColor = .secondaryLabelColor
 
-        // 复选框
-        notifyCheck = NSButton(checkboxWithTitle: "复制后显示通知", target: self, action: #selector(notifyToggled(_:)))
-        notifyCheck.font = .systemFont(ofSize: 13)
-        soundCheck = NSButton(checkboxWithTitle: "截图音效", target: self, action: #selector(soundToggled(_:)))
-        soundCheck.font = .systemFont(ofSize: 13)
+        // 开关（NSSwitch：System Settings 同款，行式左标签右开关）
+        notifySwitch = NSSwitch()
+        notifySwitch.target = self
+        notifySwitch.action = #selector(notifyToggled(_:))
+        soundSwitch = NSSwitch()
+        soundSwitch.target = self
+        soundSwitch.action = #selector(soundToggled(_:))
 
-        let stack = makeVerticalStack(rows: [
-            groupHeader("截图"),
-            row(fieldLabel("截图完成后"), afterCapturePopup),
-            row(fieldLabel("保存目录"), pathField, chooseButton),
-            groupHeader("文件"),
-            row(fieldLabel("文件名"), filenamePopup),
-            groupHeader("历史"),
-            row(fieldLabel("历史保留"), historyField, historyStepper, unitLabel),
-            groupHeader("通知"),
-            row(notifyCheck),
-            row(soundCheck),
+        // 四张磨砂分组卡（8pt 栅格：卡间距 12，卡内边距 12/16）
+        let captureCard = makeGroupCard(title: "截图", rows: [
+            row("截图完成后", trailing: [afterCapturePopup]),
+            row("保存目录", trailing: [pathField, chooseButton]),
         ])
-        stack.setCustomSpacing(6, after: stack.arrangedSubviews[1])   // 组内紧凑
-        stack.setCustomSpacing(6, after: stack.arrangedSubviews[4])
-        stack.setCustomSpacing(6, after: stack.arrangedSubviews[6])
-        generalPane.addSubview(stack)
-        pinStack(stack, to: generalPane)
+        let fileCard = makeGroupCard(title: "文件", rows: [
+            row("文件名", trailing: [filenamePopup]),
+        ])
+        let historyCard = makeGroupCard(title: "历史", rows: [
+            row("历史保留", trailing: [historyField, historyStepper, unitLabel]),
+        ])
+        let notifyCard = makeGroupCard(title: "通知", rows: [
+            row("复制后显示通知", trailing: [notifySwitch]),
+            row("截图音效", trailing: [soundSwitch]),
+        ])
+
+        let outer = NSStackView(views: [captureCard, fileCard, historyCard, notifyCard])
+        outer.orientation = .vertical
+        outer.alignment = .leading
+        outer.spacing = 12
+        outer.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
+        pinStack(outer, to: generalPane)
     }
 
     @objc private func afterCaptureChanged(_ sender: NSPopUpButton) {
@@ -338,12 +348,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
-    @objc private func notifyToggled(_ sender: NSButton) {
+    @objc private func notifyToggled(_ sender: NSSwitch) {
         settings.showCopyNotification = sender.state == .on
         persist()
     }
 
-    @objc private func soundToggled(_ sender: NSButton) {
+    @objc private func soundToggled(_ sender: NSSwitch) {
         settings.playCaptureSound = sender.state == .on
         persist()
     }
@@ -362,16 +372,31 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         wireRecorder(regionRecorder, other: fullScreenRecorder)
         wireRecorder(fullScreenRecorder, other: regionRecorder)
 
-        let stack = makeVerticalStack(rows: [
-            groupHeader("全局热键"),
-            row(fieldLabel("区域截图"), regionRecorder),
-            row(fieldLabel("全屏截图"), fullScreenRecorder),
-            hotkeyHint,
+        // 磨砂分组卡（与通用页同一玻璃语言）：两行录制行 + 红字提示
+        let card = makeGroupCard(title: "全局热键", rows: [
+            row("区域截图", trailing: [regionRecorder]),
+            row("全屏截图", trailing: [fullScreenRecorder]),
         ])
-        stack.setCustomSpacing(6, after: stack.arrangedSubviews[1])
-        stack.setCustomSpacing(2, after: stack.arrangedSubviews[2])
-        hotkeyPane.addSubview(stack)
-        pinStack(stack, to: hotkeyPane)
+
+        // 提示容器：左缘对齐卡内行（窗边 20 + 卡内 16），避免直接挂栈顶产生 16pt 错位
+        let hintWrap = NSView()
+        hintWrap.translatesAutoresizingMaskIntoConstraints = false
+        hintWrap.widthAnchor.constraint(equalToConstant: 520).isActive = true
+        hintWrap.addSubview(hotkeyHint)
+        hotkeyHint.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            hotkeyHint.leadingAnchor.constraint(equalTo: hintWrap.leadingAnchor, constant: 16),
+            hotkeyHint.topAnchor.constraint(equalTo: hintWrap.topAnchor),
+            hotkeyHint.bottomAnchor.constraint(equalTo: hintWrap.bottomAnchor),
+        ])
+
+        let outer = NSStackView(views: [card, hintWrap])
+        outer.orientation = .vertical
+        outer.alignment = .leading
+        outer.spacing = 0
+        outer.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
+        outer.setCustomSpacing(8, after: card)
+        pinStack(outer, to: hotkeyPane)
     }
 
     private func wireRecorder(_ recorder: HotkeyRecorderView, other: HotkeyRecorderView) {
@@ -469,30 +494,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         permRow.alignment = .centerY
         permRow.spacing = 8
         permRow.translatesAutoresizingMaskIntoConstraints = false
-        permRow.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        permRow.widthAnchor.constraint(equalToConstant: 292).isActive = true
 
         let permHint = NSTextField(labelWithString: "")
-        permHint.font = .systemFont(ofSize: 10.5)
+        permHint.font = .systemFont(ofSize: 11)
         permHint.textColor = .secondaryLabelColor
         permHintRef = permHint
 
-        let hairline = NSView()
-        hairline.translatesAutoresizingMaskIntoConstraints = false
-        hairline.wantsLayer = true
-        hairline.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        hairline.widthAnchor.constraint(equalToConstant: 300).isActive = true
-        hairline.heightAnchor.constraint(equalToConstant: 0.5).isActive = true
+        // 权限状态卡：与通用/快捷键页同一磨砂卡（玻璃语言统一，不再用 NSBox/分离 hairline）
+        let permCard = makeGlassCard()
+        let permStack = NSStackView(views: [permRow, permHint])
+        permStack.orientation = .vertical
+        permStack.alignment = .leading
+        permStack.spacing = 8
+        permStack.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+        permStack.translatesAutoresizingMaskIntoConstraints = false
+        permCard.addSubview(permStack)
+        NSLayoutConstraint.activate([
+            permStack.topAnchor.constraint(equalTo: permCard.topAnchor),
+            permStack.bottomAnchor.constraint(equalTo: permCard.bottomAnchor),
+            permStack.leadingAnchor.constraint(equalTo: permCard.leadingAnchor),
+            permStack.trailingAnchor.constraint(equalTo: permCard.trailingAnchor),
+        ])
 
         let stack = NSStackView(views: [
             iconView, nameLabel, versionLabel, tagline,
-            hairline, permRow, permHint,
+            permCard,
         ])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 8
         stack.setCustomSpacing(4, after: versionLabel)
         stack.setCustomSpacing(24, after: tagline)
-        stack.setCustomSpacing(10, after: hairline)
         stack.translatesAutoresizingMaskIntoConstraints = false
         aboutPane.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -536,8 +569,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             min(max(settings.historyLimit, AppSettings.historyLimitRange.lowerBound),
                 AppSettings.historyLimitRange.upperBound)
         )
-        notifyCheck.state = settings.showCopyNotification ? .on : .off
-        soundCheck.state = settings.playCaptureSound ? .on : .off
+        notifySwitch.state = settings.showCopyNotification ? .on : .off
+        soundSwitch.state = settings.playCaptureSound ? .on : .off
         regionRecorder?.setCombo(settings.hotkeyRegion)
         fullScreenRecorder?.setCombo(settings.hotkeyFullScreen)
         hotkeyHint?.isHidden = true
@@ -555,26 +588,52 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         store.save(settings)  // 适配器内打 settings.save 日志
     }
 
-    // MARK: - 布局助手（分组标题小号灰字 / 行高 32 / 左右 20pt）
+    // MARK: - 布局助手（磨砂分组卡 / 行高 36 / 8pt 栅格）
 
-    private func makeVerticalStack(rows: [NSView]) -> NSStackView {
-        let stack = NSStackView(views: rows)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        return stack
+    /// 磨砂玻璃卡基元：.underWindowBackground 磨砂 + 圆角 12 + 明暗自适应描边
+    private func makeGlassCard() -> GlassCardView {
+        let card = GlassCardView()
+        card.material = .underWindowBackground
+        card.blendingMode = .behindWindow
+        card.state = .active
+        card.translatesAutoresizingMaskIntoConstraints = false
+        return card
     }
 
-    private func pinStack(_ stack: NSStackView, to pane: NSView) {
-        pane.addSubview(stack)
+    /// 分组卡：11pt 灰字分组标题 + 行式设置行，行间 0.5pt 自适应分隔线
+    private func makeGroupCard(title: String, rows: [NSView]) -> GlassCardView {
+        let card = makeGlassCard()
+
+        var content: [NSView] = [groupHeader(title)]
+        for (i, rowView) in rows.enumerated() {
+            if i > 0 {
+                let hair = HairlineView()
+                hair.translatesAutoresizingMaskIntoConstraints = false
+                hair.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+                hair.heightAnchor.constraint(equalToConstant: 0.5).isActive = true
+                content.append(hair)
+            }
+            content.append(rowView)
+        }
+        let stack = NSStackView(views: content)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        stack.setCustomSpacing(10, after: content[0])   // 标题 → 首行
+        for (i, sub) in content.enumerated() where sub is HairlineView {
+            stack.setCustomSpacing(0, after: sub)
+            if i > 0 { stack.setCustomSpacing(0, after: content[i - 1]) }
+        }
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: pane.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: card.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
         ])
+        return card
     }
 
     private func groupHeader(_ text: String) -> NSView {
@@ -584,24 +643,39 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         return label
     }
 
-    private func fieldLabel(_ text: String) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
+    /// 行式设置：左标签（左对齐 13pt）+ 弹性空隙 + 右侧控件（8pt 栅格，行高 36）
+    private func row(_ labelText: String, trailing: [NSView]) -> NSStackView {
+        let label = NSTextField(labelWithString: labelText)
         label.font = .systemFont(ofSize: 13)
-        label.alignment = .right
+        label.textColor = .labelColor
         label.translatesAutoresizingMaskIntoConstraints = false
-        label.widthAnchor.constraint(equalToConstant: 100).isActive = true
-        return label
-    }
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-    private func row(_ views: NSView...) -> NSStackView {
-        let stack = NSStackView(views: views)
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
+        let stack = NSStackView(views: [label, spacer] + trailing)
         stack.orientation = .horizontal
         stack.alignment = .centerY
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.widthAnchor.constraint(equalToConstant: 520).isActive = true  // 560 − 左右 20×2
-        stack.heightAnchor.constraint(equalToConstant: 32).isActive = true  // 行高 32
+        stack.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        stack.heightAnchor.constraint(equalToConstant: 36).isActive = true
         return stack
+    }
+
+    private static let rowWidth: CGFloat = 488   // 560 − 窗边 20×2 − 卡内边距 16×2
+
+    private func pinStack(_ stack: NSStackView, to pane: NSView) {
+        pane.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: pane.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: pane.bottomAnchor),
+        ])
     }
 
     // MARK: - 文案
@@ -620,6 +694,73 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         case .appAndTime: return "应用名 + 时间"
         case .askEveryTime: return "每次询问"
         }
+    }
+}
+
+// MARK: - 玻璃基元（磨砂分组卡 / 明暗自适应分隔线）
+
+/// 磨砂分组卡：.underWindowBackground 磨砂 + 圆角 12 + 描边随明暗模式切换
+/// （暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.09)，对齐设计真源 glass-stroke/glass-edge）
+@MainActor
+private final class GlassCardView: NSVisualEffectView {
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("unsupported") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyChrome()
+    }
+
+    override func layout() {
+        super.layout()
+        applyChrome()
+    }
+
+    private func applyChrome() {
+        layer?.cornerRadius = 12
+        layer?.masksToBounds = true
+        layer?.borderWidth = 0.5
+        layer?.borderColor = Self.edgeColor.cgColor
+    }
+
+    private static var edgeColor: NSColor {
+        isDarkAppearance ? NSColor.white.withAlphaComponent(0.12)
+                         : NSColor.black.withAlphaComponent(0.09)
+    }
+
+    static var isDarkAppearance: Bool {
+        NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
+}
+
+/// 0.5pt 分隔线：暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.085)，随明暗模式刷新
+@MainActor
+private final class HairlineView: NSView {
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        applyColor()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("unsupported") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColor()
+    }
+
+    private func applyColor() {
+        layer?.backgroundColor = (GlassCardView.isDarkAppearance
+            ? NSColor.white.withAlphaComponent(0.12)
+            : NSColor.black.withAlphaComponent(0.085)).cgColor
     }
 }
 

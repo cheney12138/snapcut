@@ -8,6 +8,12 @@ import CoreGraphics
 /// - 面板：padding 8/8（v0.4 呼吸感，8pt 栅格）、radius 12、rgba(38,38,43,.60) + blur(.hudWindow)、
 ///   border 0.5pt 白 16%、inset 高光 0 1px 0 白 14%、
 ///   双层投影 0 14px 34px -8px rgba(0,0,0,.55) + 0 2px 6px rgba(0,0,0,.30)
+///   （⚠️ 原型 .toolbar 的真实投影就是这两层；任务简报里的「0 8 20 rgba(0,0,0,.4)」
+///   实为原型 .showbar（index.html 643-646 行）的值，不是工具栏容器）
+/// - 玻璃（v0.5 重做）：NSVisualEffectView(.hudWindow/.behindWindow/.active) 之上叠
+///   60% 深色着色 ⇒ 真实毛玻璃，能透出冻结画面；⚠️ 必须把窗口 appearance 钉死
+///   darkAqua——否则系统浅色模式下 .hudWindow 解析成浅色材质，60% 深色叠上去
+///   变成一坨不透明中灰（用户实报「不透明深灰」的根因之一）
 /// - 按钮：28×28、radius 8、图标 17pt、默认白 82%、hover 白 12% + 上移 2pt，
 ///   选中 #0A84FF + inset 白高光 0 1px 0 白 30% + 蓝色外发光 0 2px 8px rgba(10,132,255,.42)
 /// - 颜色点 15px（选中：白 1.5px 环 + 外圈 3px 黑 32% 环）、间距 8
@@ -17,8 +23,12 @@ import CoreGraphics
 /// - 悬停提示：深色胶囊（10.5pt，上方 8pt，阴影 0 6px 16px 黑 35%）
 ///
 /// 结构要点：按钮的蓝色发光与 hover 态不能被裁剪 ⇒ 栈不放进 effect view
-/// （其 layer.masksToBounds=true 会裁掉子视图阴影），而是放在无裁剪的根视图上；
-/// 面板投影由根视图上的专用图层绘制（hasShadow=false）。
+/// （其 layer.masksToBounds=true 会裁掉子视图阴影），而是放在无裁剪的根视图上。
+///
+/// 投影（v0.5 修复）：窗口四周留 shadowMargin 空白，投影图层铺在面板本体四周，
+/// 溢出面板边界的阴影画在留白区里；留白区 hitTest 穿透（不挡下层编辑画布）。
+/// 旧版两个投影视图从未加布局约束（frame 恒为 0）且窗口=面板大小，阴影整个被
+/// 窗口边界裁掉——工具栏从来没有过投影。
 ///
 /// 铁律：nonactivatingPanel（不抢激活）；点击不 makeKey。
 
@@ -35,6 +45,10 @@ private enum TBStyle {
     static let separatorWidth: CGFloat = 0.5
     static let separatorHeight: CGFloat = 17
     static let separatorMargin: CGFloat = 8
+    /// 窗口四周投影留白：NSWindow 会把 contentView 外的绘制裁掉，
+    /// 面板投影要溢出面板边界就得多给窗口留画布；留白区 hitTest 穿透。
+    /// 尺寸校验：底部阴影最远 ~ spread 8 + blur 17 + offset 14 = 39pt
+    static let shadowMargin: CGFloat = 40
     static let dotSide: CGFloat = 15
     static let dotGap: CGFloat = 8
     static let sliderWidth: CGFloat = 88
@@ -43,6 +57,20 @@ private enum TBStyle {
     static let accentGlow = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 0.42) // rgba(10,132,255,.42)
     static let iconIdle = NSColor.white.withAlphaComponent(0.82)
     static let iconActive = NSColor.white
+}
+
+/// 窗口 contentView：比面板本体大 2×shadowMargin，专供投影溢出绘制；
+/// 面板矩形之外的留白区 hitTest 返回 nil ⇒ 点击穿透给下层编辑画布
+/// （与旧版窗口=面板大小时的行为一致：面板外的点击从来都落在画布上）
+@MainActor
+private final class TBOuterView: NSView {
+    weak var panelRootView: NSView?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let panel = panelRootView else { return super.hitTest(point) }
+        let local = convert(point, from: superview)
+        return panel.frame.contains(local) ? super.hitTest(point) : nil
+    }
 }
 
 @MainActor
@@ -57,6 +85,8 @@ final class ToolbarPanel: NSPanel {
 
     // 视图
     private var rootStack: NSStackView!
+    /// 面板本体视图（玻璃圆角矩形，不含投影留白）
+    private var panelRoot: NSView?
     private var toolButtons: [EditorSession.Tool: TBToolButton] = [:]
     private var colorButtons: [TBColorButton] = []
     private var strokeWidthSlider: NSSlider!
@@ -66,8 +96,9 @@ final class ToolbarPanel: NSPanel {
     private var tooltip: ToolbarTooltipWindow?
 
     init() {
+        let m = TBStyle.shadowMargin
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 44),
+            contentRect: NSRect(x: 0, y: 0, width: 520 + m * 2, height: 44 + m * 2),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -76,6 +107,9 @@ final class ToolbarPanel: NSPanel {
         // 工具栏上面，把点击全部吃掉（病例：所有按钮点了没反应）
         level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // ⚠️ 玻璃材质钉死暗色：不设的话跟随系统主题，浅色模式下 .hudWindow 是浅色
+        // 材质，叠 60% 深色后成浑浊中灰，没有玻璃感（用户实报「不透明深灰」）
+        appearance = NSAppearance(named: .darkAqua)
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false          // 阴影由根视图图层画（面板自带阴影会被裁掉/难调 spread）
@@ -95,20 +129,54 @@ final class ToolbarPanel: NSPanel {
     // MARK: - UI 构建
 
     private func buildUI() {
+        let m = TBStyle.shadowMargin
+
+        // 0) 外层窗口 contentView：比面板大 2×shadowMargin，专供投影溢出绘制；
+        //    留白区（面板矩形之外）hitTest 返回 nil，点击穿透给下层编辑画布
+        let outer = TBOuterView()
+        outer.wantsLayer = true
+        // 注意：contentView 不设 translatesAutoresizingMaskIntoConstraints=false，
+        // 窗口 setContentSize 直接管它的 frame（设了反而丢失窗口尺寸联动）
+
+        // 面板本体（玻璃圆角矩形）：按钮发光/hover 上移在它上面溢出绘制，
+        // 所以它自身也不 masksToBounds（裁剪交给 effect view 自己）
         let root = NSView()
         root.wantsLayer = true
         root.translatesAutoresizingMaskIntoConstraints = false
-        // 根视图绝不 masksToBounds：面板投影、按钮发光都在它上面溢出绘制
+        outer.addSubview(root)
+        panelRoot = root
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: outer.leadingAnchor, constant: m),
+            root.trailingAnchor.constraint(equalTo: outer.trailingAnchor, constant: -m),
+            root.topAnchor.constraint(equalTo: outer.topAnchor, constant: m),
+            root.bottomAnchor.constraint(equalTo: outer.bottomAnchor, constant: -m),
+        ])
 
         // 1) 面板投影（两层，照 CSS box-shadow 顺序画在最底）
         //    0 14px 34px -8px rgba(0,0,0,.55) → offset(0,-14) blur→radius 17 spread→path 内缩 8
-        root.addSubview(makeShadowView(radius: 17, offset: CGSize(width: 0, height: -14),
-                                       alpha: 0.55, spread: 8))
+        let shadowFar = makeShadowView(radius: 17, offset: CGSize(width: 0, height: -14),
+                                       alpha: 0.55, spread: 8)
         //    0 2px 6px rgba(0,0,0,.30) → offset(0,-2) radius 3
-        root.addSubview(makeShadowView(radius: 3, offset: CGSize(width: 0, height: -2),
-                                       alpha: 0.30, spread: 0))
+        let shadowNear = makeShadowView(radius: 3, offset: CGSize(width: 0, height: -2),
+                                        alpha: 0.30, spread: 0)
+        root.addSubview(shadowFar)
+        root.addSubview(shadowNear)
+        // ⚠️ 旧版病例：投影视图只创建没加约束（frame 恒为 0），且窗口=面板大小，
+        // 阴影被窗口边界裁掉——投影从来没画出来过。现在铺满面板本体，
+        // shadowPath 用自身 bounds（见 applyPanelShadowPaths）
+        NSLayoutConstraint.activate([
+            shadowFar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            shadowFar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            shadowFar.topAnchor.constraint(equalTo: root.topAnchor),
+            shadowFar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            shadowNear.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            shadowNear.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            shadowNear.topAnchor.constraint(equalTo: root.topAnchor),
+            shadowNear.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
 
-        // 2) 玻璃容器（hudWindow 磨砂 + 60% 深色着色，等价原型的 rgba(38,38,43,.60)）
+        // 2) 玻璃容器（hudWindow 磨砂 + 60% 深色着色，等价原型的 rgba(38,38,43,.60)）；
+        //    窗口 appearance 已钉死 darkAqua（见 init），浅色系统下也能出暗玻璃
         let effect = NSVisualEffectView()
         effect.material = .hudWindow
         effect.blendingMode = .behindWindow
@@ -268,10 +336,12 @@ final class ToolbarPanel: NSPanel {
         close.onHover = { [weak self] inside in self?.handleHover(inside, button: close, text: "取消 Esc") }
         stack.addArrangedSubview(close)
 
-        contentView = root
+        contentView = outer
+        outer.panelRootView = root
         root.layoutSubtreeIfNeeded()
         let fitting = root.fittingSize
-        setContentSize(fitting)
+        // 窗口 = 面板 + 四周投影留白（留白区点击穿透，见 TBOuterView）
+        setContentSize(NSSize(width: fitting.width + m * 2, height: fitting.height + m * 2))
     }
 
     private func makeShadowView(radius: CGFloat, offset: CGSize, alpha: CGFloat, spread: CGFloat) -> NSView {
@@ -283,19 +353,21 @@ final class ToolbarPanel: NSPanel {
         view.layer?.shadowOpacity = 1
         view.layer?.shadowRadius = radius
         view.layer?.shadowOffset = offset
-        // path 在布局后由面板统一设置（见 applyPanelShadowPaths）
+        // path 在布局后由面板统一设置（见 applyPanelShadowPaths）；
+        // 视图铺满面板本体，shadowPath 直接用自身 bounds（无跨坐标系换算）
         view.layer?.name = "panel-shadow-\(radius)"
         view.layer?.shadowPath = nil
         if spread > 0 { view.layer?.setValue(spread, forKey: "shadowSpreadHint") }
         return view
     }
 
-    /// 布局完成后给两个投影视图设置 shadowPath（含 -8px spread：路径内缩 8）
+    /// 布局完成后给两个投影视图设置 shadowPath（含 -8px spread：路径内缩 8）。
+    /// 投影视图已铺满面板本体，路径直接取自身 bounds，无跨视图坐标系换算
     private func applyPanelShadowPaths() {
-        guard let contentBounds = contentView?.bounds else { return }
-        for subview in (contentView?.subviews ?? []) where subview.layer?.name?.hasPrefix("panel-shadow") == true {
+        guard let root = panelRoot else { return }
+        for subview in root.subviews where subview.layer?.name?.hasPrefix("panel-shadow") == true {
             let spread = (subview.layer?.value(forKey: "shadowSpreadHint") as? CGFloat) ?? 0
-            let rect = contentBounds.insetBy(dx: spread, dy: spread)
+            let rect = CGRect(origin: .zero, size: subview.bounds.size).insetBy(dx: spread, dy: spread)
             subview.layer?.shadowPath = CGPath(
                 roundedRect: rect,
                 cornerWidth: TBStyle.cornerRadius,
@@ -340,26 +412,32 @@ final class ToolbarPanel: NSPanel {
     func place(below selection: CGRect) {
         applyPanelShadowPaths()
         contentView?.layoutSubtreeIfNeeded()
-        let size = frame.size
+        let margin = TBStyle.shadowMargin
+        // frame 含四周投影留白；定位算的是「面板本体」矩形
+        let panelSize = CGSize(width: frame.width - margin * 2,
+                               height: frame.height - margin * 2)
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
         // 1) 优先选区下方 12pt；2) 下方放不下翻到上方；3) 全屏截图这种上下都没有外部
         // 空间的情况，**落进可视区内**（贴底），否则会跑到屏幕外被裁掉（用户实拍病例）
-        var origin = CGPoint(x: selection.midX - size.width / 2, y: selection.minY - size.height - 12)
+        var origin = CGPoint(x: selection.midX - panelSize.width / 2,
+                             y: selection.minY - panelSize.height - 12)
         if origin.y < visible.minY + 8 {
             let above = selection.maxY + 12
-            if above + size.height <= visible.maxY - 8 {
+            if above + panelSize.height <= visible.maxY - 8 {
                 origin.y = above
             } else {
                 // 全屏/贴边选区：放在可视区靠下位置（比贴顶更符合直觉、更好点）
                 origin.y = visible.minY + 16
             }
         }
-        origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - size.height - 8)
-        origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
+        origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - panelSize.height - 8)
+        origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - panelSize.width - 8)
 
         // 原型入场：translateY(8px)→0 + scale(.985)→1 + 淡入，240ms spring
-        let finalFrame = CGRect(origin: origin, size: size)
-        setFrameOrigin(CGPoint(x: origin.x, y: origin.y - 8))
+        // 窗口原点 = 面板原点 - 留白；入场平移量不变
+        let finalFrame = CGRect(origin: CGPoint(x: origin.x - margin, y: origin.y - margin),
+                                size: frame.size)
+        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - 8))
         alphaValue = 0
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.24
