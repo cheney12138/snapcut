@@ -168,7 +168,17 @@ final class AppCoordinator {
             switch result {
             case .copy(let image):
                 self.state = .exporting
-                if self.settings.afterCapture == .save {
+                // 画布激活重定向（docs/06 §3 连续工作流）：拼贴窗开着时，
+                // ⌘⇧A 复制路径的产物不再进剪贴板，直接飞入画布（nextGridSlot 自动排格）
+                if CollageWindowController.shared.isActive {
+                    CollageWindowController.shared.addPiece(image: image)
+                    if self.settings.showCopyNotification {
+                        CaptureToast.show(image: image, message: "已加入拼贴画布")
+                    }
+                    Log.event(.app, "collage.capture.redirect", [
+                        "pxW": "\(image.width)", "pxH": "\(image.height)",
+                    ])
+                } else if self.settings.afterCapture == .save {
                     self.exporter.savePanel(image)
                 } else {
                     self.exporter.copyToClipboard(image)
@@ -264,6 +274,29 @@ extension AppCoordinator {
         if CommandLine.arguments.contains("--selftest-tray") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 self?.tray.selfTestDumpHistoryMenu()
+            }
+            return
+        }
+        if CommandLine.arguments.contains("--selftest-collage") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                Log.event(.app, "selftest.collage")
+                _ = self
+                let controller = CollageWindowController.shared
+                controller.openDocument(CollageDocument())
+                // 种两块样例贴片（程序生成纯色位图），验证排版/分镜框/自动扩画布
+                func sample(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, w: Int, h: Int) -> CGImage? {
+                    guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+                          let ctx = CGContext(
+                        data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: space,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                    ) else { return nil }
+                    ctx.setFillColor(CGColor(srgbRed: r, green: g, blue: b, alpha: 1))
+                    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+                    return ctx.makeImage()
+                }
+                if let a = sample(0.20, 0.55, 0.95, w: 640, h: 400) { controller.addPiece(image: a) }
+                if let b = sample(0.95, 0.62, 0.18, w: 520, h: 360) { controller.addPiece(image: b) }
             }
             return
         }

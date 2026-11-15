@@ -26,6 +26,11 @@ final class PinWindowController {
     /// 控制器持有的静态数组：窗口关闭前实例不会被 ARC 回收（防提前释放）
     private static var live: [PinWindowController] = []
 
+    /// ⌥拖合并命中测试：光标全局点落在另一张存活贴图窗口内（不含自己）
+    static func hitOtherPin(at globalPoint: CGPoint, excluding: PinWindowController) -> PinWindowController? {
+        live.first { $0 !== excluding && $0.window.frame.contains(globalPoint) }
+    }
+
     // MARK: - 状态
 
     let image: CGImage
@@ -36,6 +41,13 @@ final class PinWindowController {
     private(set) var scale: CGFloat = 1
     private var alpha: CGFloat = 1
     private var hudHideTask: Task<Void, Never>?
+
+    // MARK: - ⌥拖合并手势状态（docs/06 §3a：图 ⌥拖到另一张图上松手 → 成组进拼贴）
+
+    /// grabOffset：按下时光标相对窗口左上角的偏移（Y-up 全局坐标）；拖动中保持不变
+    private var optionDrag: (grabOffset: CGPoint, originalFrame: CGRect)?
+    /// 悬停命中的合并目标（变化时刷新 HUD 反馈）
+    private var optionDragTarget: PinWindowController?
 
     // MARK: - 入口
 
@@ -151,6 +163,107 @@ final class PinWindowController {
         Log.event(Self.logCategory, "pin.copy", ["ok": "\(ok)"])
     }
 
+    // MARK: - 合并到拼贴（C3，docs/06 §3b：右键「合并到拼贴…」）
+
+    /// 本张 pin 图入拼贴画布；成功后关窗（orderOut）。
+    /// 走 CollageMergeTarget 协议（AppCoordinatorShared.collageTarget，C2 侧实现），
+    /// C3 不碰 CollageDocument/SnapGeometry；落位（nextGridSlot）是 C2 的事。
+    @discardableResult
+    func mergeToCollage() -> Bool {
+        guard let collage = AppCoordinatorShared.collageTarget else {
+            showHUD("拼贴暂不可用")
+            Log.event(Self.logCategory, "pin.merge.noTarget", [:])
+            return false
+        }
+        Log.event(Self.logCategory, "pin.merge.menu", [:])
+        collage.acceptPiece(image: image, at: nil)
+        close()
+        return true
+    }
+
+    /// ⌥拖成组：目标图先入、拖动图后入（连续两次 acceptPiece =
+    /// C2 侧 nextGridSlot 依次相邻落位），两张 pin 窗都关闭。
+    func mergePair(with target: PinWindowController) {
+        guard let collage = AppCoordinatorShared.collageTarget else {
+            showHUD("拼贴暂不可用")
+            Log.event(Self.logCategory, "pin.merge.noTarget", [:])
+            return
+        }
+        Log.event(Self.logCategory, "pin.merge.pair", [
+            "w": "\(Int(image.width))", "h": "\(Int(image.height))",
+            "tw": "\(Int(target.image.width))", "th": "\(Int(target.image.height))",
+        ])
+        collage.acceptPiece(image: target.image, at: nil)
+        collage.acceptPiece(image: image, at: nil)
+        target.close()
+        close()
+    }
+
+    /// drop target 合并：编辑器导出的图拖进 pin 窗（docs/06 §4 PinWindow 扩展），
+    /// 本 pin 图与拖入图成组入拼贴，本 pin 窗关闭。
+    func mergeDropped(_ dropped: CGImage) {
+        guard let collage = AppCoordinatorShared.collageTarget else {
+            showHUD("拼贴暂不可用")
+            Log.event(Self.logCategory, "pin.merge.noTarget", [:])
+            return
+        }
+        Log.event(Self.logCategory, "pin.merge.drop", [
+            "w": "\(Int(image.width))", "h": "\(Int(image.height))",
+            "dw": "\(Int(dropped.width))", "dh": "\(Int(dropped.height))",
+        ])
+        collage.acceptPiece(image: image, at: nil)
+        collage.acceptPiece(image: dropped, at: nil)
+        close()
+    }
+
+    // MARK: - ⌥拖合并手势（PinContentView mouseDown ⌥ 分支转发进来）
+
+    /// 按下：记住抓取偏移与原位（松手未命中任何贴图时回滚）
+    func beginOptionDrag() {
+        let win = window
+        let mouse = NSEvent.mouseLocation
+        let frame = win.frame
+        optionDrag = (
+            grabOffset: CGPoint(x: mouse.x - frame.minX, y: frame.maxY - mouse.y),
+            originalFrame: frame
+        )
+        optionDragTarget = nil
+        showHUD("⌥ 拖到另一张贴图合并")
+        Log.event(Self.logCategory, "pin.merge.dragBegin", [:])
+    }
+
+    /// 拖动：窗口跟随光标；悬停到另一张贴图上时 HUD 提示可合并
+    func optionDragMoved() {
+        guard let drag = optionDrag else { return }
+        let win = window
+        let mouse = NSEvent.mouseLocation
+        let topLeft = CGPoint(x: mouse.x - drag.grabOffset.x, y: mouse.y + drag.grabOffset.y)
+        win.setFrameOrigin(CGPoint(x: topLeft.x, y: topLeft.y - win.frame.height))
+        let other = Self.hitOtherPin(at: mouse, excluding: self)
+        if other !== optionDragTarget {
+            optionDragTarget = other
+            showHUD(other == nil ? "⌥ 拖到另一张贴图合并" : "松手合并进拼贴")
+        }
+    }
+
+    /// 松手：命中另一张贴图 → 两图成组进拼贴（双双关窗）；
+    /// 未命中 → 回滚原位（手势取消，不误位移）。
+    /// 只在 ⌥拖手势进行中生效——普通拖动（performDrag）后的 stray mouseUp 忽略。
+    func endOptionDrag() {
+        guard let drag = optionDrag else { return }
+        optionDrag = nil
+        let target = optionDragTarget
+        optionDragTarget = nil
+        let win = window
+        let mouse = NSEvent.mouseLocation
+        if let other = Self.hitOtherPin(at: mouse, excluding: self) ?? target {
+            mergePair(with: other)
+        } else {
+            win.setFrame(drag.originalFrame, display: true)
+            Log.event(Self.logCategory, "pin.merge.dragCancel", [:])
+        }
+    }
+
     // MARK: - 关闭
 
     func close() {
@@ -167,7 +280,8 @@ final class PinWindowController {
 
     // MARK: - HUD 淡出
 
-    private func showHUD(_ text: String) {
+    /// HUD 显示（internal：PinContentView 拖拽悬停提示同文件跨类型调用）
+    func showHUD(_ text: String) {
         contentView.showHUD(text: text)
         hudHideTask?.cancel()
         hudHideTask = Task { [weak self] in

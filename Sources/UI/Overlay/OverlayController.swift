@@ -467,6 +467,16 @@ final class OverlayController {
         let image = session.renderFinalImage()
         let rect = session.selectionGlobal
         AppCoordinatorShared.deps?.history.record(image)
+        // 画布激活重定向（docs/06 §3）：拼贴窗开着时「贴图」改飞入画布，
+        // 不再独立 pin（连续截图 → 排版工作流）
+        if CollageWindowController.shared.isActive {
+            CollageWindowController.shared.addPiece(image: image)
+            Log.event(.pin, "collage.pin.redirect", [
+                "pxW": "\(image.width)", "pxH": "\(image.height)",
+            ])
+            perform(action: .cancel)
+            return
+        }
         AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: rect)
         Log.event(.pin, "pin.wire", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
         perform(action: .cancel)   // 贴图后结束截图会话（图像已经在屏幕上）
@@ -705,6 +715,10 @@ final class OverlayController {
 @MainActor
 enum AppCoordinatorShared {
     static weak var coordinator: AppCoordinator?
+    /// C3⇄C2 拼贴合并挂点（协议见 Sources/UI/Collage/CollageMergeTarget.swift）：
+    /// CollageWindowController（C2，遵循 CollageMergeTarget）创建时写入、
+    /// 关闭时置 nil；Pin 侧手势（右键合并 / ⌥拖 / drop）只读这里。
+    static weak var collageTarget: CollageMergeTarget?
     /// 合成根注入的依赖（端口集合）；只有 AppCoordinator 写，其余只读
     @MainActor static var deps: Dependencies?
     static func didEnterConfirm() {

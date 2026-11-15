@@ -21,6 +21,8 @@ final class PinContentView: NSView {
         // 固定贴住右下角：翻转坐标下 min-Y 视觉上是顶部，顶部/左侧边距可伸缩
         hud.autoresizingMask = [.minXMargin, .minYMargin]
         addSubview(hud)
+        // drop target（C3 交付物 3）：编辑器导出的图拖进来 → 合并进拼贴
+        registerForDraggedTypes([.tiff, .png])
     }
 
     @available(*, unavailable)
@@ -32,11 +34,25 @@ final class PinContentView: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     override func mouseDown(with event: NSEvent) {
+        // ⌥拖合并手势（docs/06 §3a）：按住 ⌥ 拖到另一张 pin 图上松手 → 成组进拼贴。
+        // 拖动/松手事件由 mouseDragged/mouseUp 转发（不 performDrag）。
+        if event.modifierFlags.contains(.option) {
+            controller?.beginOptionDrag()
+            return
+        }
         // 双击复位到 100%（锚在光标处）；随后 performDrag 处理按住拖动，互不冲突
         if event.clickCount >= 2 {
             controller?.resetZoom(anchor: convert(event.locationInWindow, from: nil))
         }
         window?.performDrag(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        controller?.optionDragMoved()
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        controller?.endOptionDrag()
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -59,20 +75,49 @@ final class PinContentView: NSView {
     private func buildContextMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
+        let merge = NSMenuItem(title: "合并到拼贴…", action: #selector(menuMergeToCollage), keyEquivalent: "")
+        // 拼贴画布未打开（C2 侧未挂 collageTarget）时置灰，点了也不误动作
+        merge.isEnabled = AppCoordinatorShared.collageTarget != nil
         let copy = NSMenuItem(title: "复制图像", action: #selector(menuCopyImage), keyEquivalent: "")
         let reset = NSMenuItem(title: "缩放 100%", action: #selector(menuResetZoom), keyEquivalent: "")
         let close = NSMenuItem(title: "关闭", action: #selector(menuClose), keyEquivalent: "")
-        for item in [copy, reset, close] {
+        for item in [merge, copy, reset, close] {
             item.target = self
-            item.isEnabled = true
             menu.addItem(item)
         }
         return menu
     }
 
+    @objc private func menuMergeToCollage() { controller?.mergeToCollage() }
+
     @objc private func menuCopyImage() { controller?.copyImageToPasteboard() }
     @objc private func menuResetZoom() { controller?.resetZoom(anchor: CGPoint(x: bounds.midX, y: bounds.midY)) }
     @objc private func menuClose() { controller?.close() }
+
+    // MARK: - Drop target（编辑器导出的图拖进 pin 窗 → 也走合并）
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard sender.draggingPasteboard.canReadObject(forClasses: [NSImage.self], options: [:]) else { return [] }
+        controller?.showHUD("松手合并进拼贴")
+        return [.copy]
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        hud.isHidden = true
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let image = Self.pasteboardImage(sender.draggingPasteboard) else { return false }
+        controller?.mergeDropped(image)
+        return true
+    }
+
+    /// 剪贴板图像 → CGImage（NSImage 中转；位图表示保像素）
+    private static func pasteboardImage(_ pasteboard: NSPasteboard) -> CGImage? {
+        guard let objects = pasteboard.readObjects(forClasses: [NSImage.self], options: [:]),
+              let nsImage = objects.first as? NSImage else { return nil }
+        return nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
 
     // MARK: - 绘制
 
