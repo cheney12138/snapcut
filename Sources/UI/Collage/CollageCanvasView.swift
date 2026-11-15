@@ -187,14 +187,6 @@ final class CollageCanvasView: NSView {
     }
 
     private func drawPiece(_ piece: CollagePiece, frame: CGRect, context ctx: CGContext) {
-        Log.event(.app, "collage.draw.piece", [
-            "ref": String(piece.imageRef.suffix(8)),
-            "hasImage": "\(CollageImageCache.shared.image(for: piece.imageRef) != nil)",
-            "viewFrame": "\(Int(frame.minX)),\(Int(frame.minY)) \(Int(frame.width))x\(Int(frame.height))",
-            "pieceFrame": "\(Int(piece.frame.minX)),\(Int(piece.frame.minY))",
-            "canvas": "\(Int(document.canvasOrigin.x)),\(Int(document.canvasOrigin.y)) \(Int(document.canvasSize.width))x\(Int(document.canvasSize.height))",
-            "view": "\(Int(bounds.width))x\(Int(bounds.height)) offset=\(Int(canvasOffset.x)),\(Int(canvasOffset.y))",
-        ])
         guard let image = CollageImageCache.shared.image(for: piece.imageRef) else {
             // 缓存逐出兜底：灰块占位（NSCache 内存压力回收后的降级可见性）
             ctx.setFillColor(Self.placeholder.cgColor)
