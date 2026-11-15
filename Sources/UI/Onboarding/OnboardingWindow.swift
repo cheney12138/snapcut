@@ -179,6 +179,9 @@ final class OnboardingWindow: NSPanel {
         primary.frame = NSRect(x: pad, y: pad, width: size.width - pad * 2, height: 34)
         card.addSubview(primary)
 
+        // ⚠️ 病例（permfix2 重构回归）：card 构建完忘了 addSubview 进 container——
+        // contentView 是空容器，窗口「在屏但全黑/AX 树为空」（用户实报引导卡弹不出）
+        container.addSubview(card)
         contentView = container
     }
 
