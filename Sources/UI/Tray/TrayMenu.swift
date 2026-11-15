@@ -13,12 +13,35 @@ struct TrayMenuContent: View {
         AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
     }
 
+    /// 未授权门禁（用户裁定 2026-11-15）：无屏幕录制权限时菜单只留
+    /// 「去授权」一个功能入口 + 退出——截屏类入口全部隐藏（点进去也是被拦），
+    /// 授权完成菜单自动恢复完整形态（body 每次展开重新求值）。
+    private var permissionGranted: Bool {
+        AppCoordinatorShared.deps?.permission.isGranted() ?? false
+    }
+
     var body: some View {
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "?"
         Text("Snapcut \(version)")
 
         Divider()
 
+        if !permissionGranted {
+            Button("去授权…") {
+                Log.event(.tray, "tray.action", ["item": "authorize"])
+                AppCoordinatorShared.deps?.permission.request()
+            }
+            Divider()
+            Button("退出 Snapcut") {
+                Log.event(.tray, "tray.action", ["item": "quit"])
+                SnapcutQuitController.quit()
+            }
+        } else {
+            fullMenu
+        }
+    }
+
+    @ViewBuilder private var fullMenu: some View {
         Button("截取区域  \(HotkeySpec.display(hotkeys.hotkeyRegion))") {
             Log.event(.tray, "tray.action", ["item": "captureRegion"])
             AppCoordinatorShared.coordinator?.beginRegionCapture()

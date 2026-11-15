@@ -206,6 +206,11 @@ final class AppCoordinator {
         return false
     }
 
+    /// 托盘「去授权」入口：弹引导卡（引导卡上的「去授权」按钮是唯一授权路径）
+    func presentOnboardingFromTray() {
+        presentOnboardingForce()
+    }
+
     /// 强制弹引导卡（未授权门禁触发；已开着则前置聚焦）
     private func presentOnboardingForce() {
         if let window = onboardingWindow, window.isVisible {

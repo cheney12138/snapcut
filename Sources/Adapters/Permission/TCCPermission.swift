@@ -21,9 +21,19 @@ enum TCCPermission {
     /// 触发系统确认窗（仅此而已——用户点「打开系统设置」由系统自己拉起列表页；
     /// 我们的贴身浮窗在检测到系统设置窗口出现后自动跟上）。
     static func requestSystemPrompt() {
-        guard !CGPreflightScreenCaptureAccess() else { return }
-        _ = CGRequestScreenCaptureAccess()
-        Log.event(.permission, "permission.request", [:])
+        // 用户裁定（2026-11-15）：「去授权」两个入口（引导卡 + 托盘菜单）
+        // 都直接唤起权限 list + 打开浮窗——不再依赖 TCC 确认框的
+        // 「打开系统设置」按钮（用户实报：点了去授权没打开权限面板）。
+        let granted = CGPreflightScreenCaptureAccess()
+        if !granted {
+            // 触发一次 TCC 注册（让 Snapcut 出现在录屏列表里；
+            // 框若弹出属于系统行为，我们不依赖它）
+            _ = CGRequestScreenCaptureAccess()
+        }
+        NSWorkspace.shared.open(
+            URL(string: "x-apple.system.preferences:com.apple.preference.security?Privacy_ScreenCapture")!
+        )
+        Log.event(.permission, "permission.request", ["granted": "\(granted)"])
         // 浮窗待命：tick 找到系统设置窗口后自动显示
         PermissionDragOverlay.shared.show()
     }
