@@ -22,8 +22,18 @@ public struct HotkeySpec: Equatable, Sendable {
         "k": 40, "n": 45, "m": 46,
     ]
 
+    /// 命名键（编辑器作用域）：键名 ⇄ 键码。return/esc 是 done/cancel 的
+    /// 系统约定默认；字母裸键（o/p/h）是编辑器原语义。
+    public static let namedKeys: [String: UInt32] = [
+        "return": 36, "esc": 53, "space": 49, "delete": 51, "tab": 48,
+    ]
+    private static let namedKeySymbols: [String: String] = [
+        "return": "⏎", "esc": "esc", "space": "Space", "delete": "⌫", "tab": "⇥",
+    ]
+
     /// 显示格式化："cmd+shift+a" → "⌘ ⇧ A"（UI 三处共用：引导窗/托盘菜单/设置页）
     /// （病例：用户改了快捷键，引导窗提示还是写死的 ⌘⇧A）
+    /// 命名键显示符号（"return"→"⏎"，"esc"→"esc"）；裸键无前缀（"o"→"O"）
     public static func display(_ text: String) -> String {
         let parts = text.lowercased().split(separator: "+").map(String.init)
         guard let key = parts.last, !key.isEmpty else { return text }
@@ -37,13 +47,27 @@ public struct HotkeySpec: Equatable, Sendable {
             default: break
             }
         }
+        if let symbol = namedKeySymbols[key] { return prefix + symbol }
         return prefix + (key.count == 1 ? key.uppercased() : key)
     }
 
+    /// 全局热键解析（原语义：至少一个修饰键，防抢打字）
     public static func parse(_ text: String) -> HotkeySpec? {
+        parse(text, allowBare: false)
+    }
+
+    /// 编辑器热键解析：allowBare = true 时允许裸键（"o"）与命名键
+    /// （"return"/"esc"）——编辑器作用域无打字冲突（文字输入态不走这条路径）。
+    public static func parse(_ text: String, allowBare: Bool) -> HotkeySpec? {
         let parts = text.lowercased().split(separator: "+").map(String.init)
-        guard let keyPart = parts.last, keyPart.count == 1, let char = keyPart.first,
-              let code = keyCodes[char] else { return nil }
+        guard let keyPart = parts.last, !keyPart.isEmpty else { return nil }
+        var code: UInt32? = nil
+        if keyPart.count == 1, let char = keyPart.first {
+            code = keyCodes[char]
+        } else if let named = namedKeys[keyPart] {
+            code = named
+        }
+        guard let keyCode = code else { return nil }
         var mods: HotkeyModifiers = []
         for part in parts.dropLast() {
             switch part {
@@ -54,20 +78,36 @@ public struct HotkeySpec: Equatable, Sendable {
             default: return nil
             }
         }
-        // 至少一个修饰键，否则会抢普通打字
-        guard !mods.isEmpty else { return nil }
-        return HotkeySpec(keyCode: code, modifiers: mods)
+        // 至少一个修饰键，否则会抢普通打字（编辑器作用域例外）
+        if mods.isEmpty {
+            guard allowBare else { return nil }
+            // 裸键仅允许字母数字（命名键裸按需带修饰键，避免抢系统行为）
+            guard keyPart.count == 1 else { return nil }
+        }
+        return HotkeySpec(keyCode: keyCode, modifiers: mods)
     }
 
     /// 反序列化（设置面板回填用）
     public static func string(keyCode: UInt32, modifiers: HotkeyModifiers) -> String? {
-        guard let char = keyCodes.first(where: { $0.value == keyCode })?.key else { return nil }
+        var keyPart: String? = nil
+        if let char = keyCodes.first(where: { $0.value == keyCode })?.key {
+            keyPart = String(char)
+        } else if let named = namedKeys.first(where: { $0.value == keyCode })?.key {
+            keyPart = named
+        }
+        guard let key = keyPart else { return nil }
         var parts: [String] = []
         if modifiers.contains(.control) { parts.append("ctrl") }
         if modifiers.contains(.option) { parts.append("opt") }
         if modifiers.contains(.shift) { parts.append("shift") }
         if modifiers.contains(.command) { parts.append("cmd") }
-        parts.append(String(char))
+        parts.append(key)
         return parts.joined(separator: "+")
+    }
+
+    /// NSEvent → 组合串（编辑器 keyDown 匹配用；与 HotkeyRecorderView 的
+    /// 录制格式同源）。返回 nil = 不可识别的键。
+    public static func combo(fromkeyCode keyCode: UInt32, modifiers: HotkeyModifiers) -> String? {
+        string(keyCode: keyCode, modifiers: modifiers)
     }
 }

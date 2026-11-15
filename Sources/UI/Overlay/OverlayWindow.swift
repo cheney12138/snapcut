@@ -845,6 +845,14 @@ final class OverlayView: NSView {
             }
             return
         }
+        // 编辑器自定义热键（工具栏后半段 8 动作，settings.editorHotkeys）：
+        // 匹配优先于下述系统语义（Return/Esc 先走文字输入态，S 滚动/⌘⌥S 快存
+        // 等内置键序保留——自定义组合撞内置键时内置先行，设置页有冲突提示）。
+        if let action = matchEditorHotkey(event) {
+            performEditorHotkeyAction(action)
+            return
+        }
+
         switch Int(event.keyCode) {
         case kVK_Escape:
             if scrollMode {
@@ -887,34 +895,6 @@ final class OverlayView: NSView {
             } else {
                 super.keyDown(with: event)
             }
-        case kVK_ANSI_O:
-            if phase == .editing, !event.modifierFlags.contains(.command) {
-                controller.toolbarAction(.ocr)
-                return
-            }
-            super.keyDown(with: event)
-        case kVK_ANSI_P:
-            if phase == .editing, !event.modifierFlags.contains(.command) {
-                controller.toolbarAction(.pin)
-                return
-            }
-            super.keyDown(with: event)
-        case kVK_ANSI_Z:
-            if event.modifierFlags.contains(.command) {
-                if event.modifierFlags.contains(.shift) {
-                    controller.redoAnnotation()
-                } else {
-                    controller.undoAnnotation()
-                }
-            } else {
-                super.keyDown(with: event)
-            }
-        case kVK_ANSI_H:
-            if phase == .editing {
-                controller.toggleToolbarVisibility()
-            } else {
-                super.keyDown(with: event)
-            }
         default:
             // 热键 1-6 直选工具（R6）
             if phase == .editing,
@@ -925,6 +905,40 @@ final class OverlayView: NSView {
                 return
             }
             super.keyDown(with: event)
+        }
+    }
+
+// MARK: 编辑器自定义热键（工具栏后半段）
+
+    /// event → 组合串 → settings.editorHotkeys 反查 action key。
+    /// 仅编辑/确认阶段且无文字输入时生效（文字输入态的键必须给输入框）。
+    private func matchEditorHotkey(_ event: NSEvent) -> String? {
+        guard textField == nil, phase == .editing || phase == .confirmed, !scrollMode else { return nil }
+        let settings = AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
+        guard let combo = HotkeySpec.combo(fromkeyCode: UInt32(event.keyCode), modifiers: event.modifierFlags.hotkeyModifiers) else { return nil }
+        for (actionKey, stored) in settings.editorHotkeys {
+            let effective = stored.isEmpty ? (AppSettings.defaultEditorHotkeys[actionKey] ?? "") : stored
+            guard !effective.isEmpty else { continue }
+            // 撞内置键（滚动 S / 快存 ⌘⌥S / 文字态 Esc/Return——上面已挡）：
+            // 组合一致时让内置语义先行（见调用点注释）
+            if HotkeySpec.parse(effective, allowBare: true)?.keyCode == HotkeySpec.parse(combo)?.keyCode,
+               effective == combo { return actionKey }
+        }
+        return nil
+    }
+
+    private func performEditorHotkeyAction(_ actionKey: String) {
+        Log.event(.editor, "editor.hotkey", ["action": actionKey])
+        switch actionKey {
+        case "undo": controller.undoAnnotation()
+        case "redo": controller.redoAnnotation()
+        case "toggleVisibility": controller.toggleToolbarVisibility()
+        case "ocr": controller.toolbarAction(.ocr)
+        case "pin": controller.toolbarAction(.pin)
+        case "save": controller.perform(action: .save)
+        case "done": controller.perform(action: .copy)
+        case "cancel": controller.perform(action: .cancel)
+        default: break
         }
     }
 
@@ -1568,5 +1582,18 @@ private final class FontSizeOptionButton: NSButton {
     /// 点击即生效（不等 mouseUp，输入态下手感更快）
     override func mouseDown(with event: NSEvent) {
         onActivated?()
+    }
+}
+
+// MARK: - NSEvent → HotkeyModifiers 桥（UI 层；Core 无 AppKit）
+
+extension NSEvent.ModifierFlags {
+    var hotkeyModifiers: HotkeyModifiers {
+        var mods: HotkeyModifiers = []
+        if contains(.command) { mods.insert(.command) }
+        if contains(.shift) { mods.insert(.shift) }
+        if contains(.option) { mods.insert(.option) }
+        if contains(.control) { mods.insert(.control) }
+        return mods
     }
 }

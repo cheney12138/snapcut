@@ -31,7 +31,7 @@ final class AppCoordinator {
 
     /// 用户设置（设置面板写入 UserDefaults，启动时读取；改动需重启生效）
     /// 设置（启动加载 + 面板保存后回写；引导窗/托盘读它显示实际快捷键）
-    private(set) var settings: AppSettings = AppSettings.defaultSettings
+    var settings: AppSettings = AppSettings.defaultSettings
 
     /// 权限门禁镜像到 UserDefaults（@AppStorage 桥）：Tahoe MenuBarExtra .menu
     /// content 是快照，只有 @AppStorage 写入能触发菜单重建。翻转时才写。

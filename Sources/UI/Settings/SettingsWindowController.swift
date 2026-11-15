@@ -51,6 +51,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     // 快捷键 tab 控件
     private var regionRecorder: HotkeyRecorderView!
     private var fullScreenRecorder: HotkeyRecorderView!
+    /// 编辑器热键（工具栏后半段 8 动作）录制器，key = action key
+    private var editorRecorders: [String: HotkeyRecorderView] = [:]
     private var hotkeyHint: NSTextField!
 
     private init() {
@@ -189,6 +191,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     func windowWillClose(_ notification: Notification) {
         regionRecorder?.endRecordingIfNeeded()
         fullScreenRecorder?.endRecordingIfNeeded()
+        for r in editorRecorders.values { r.endRecordingIfNeeded() }
         Log.event(.app, "settings.window.close")
     }
 
@@ -366,6 +369,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
 
     // MARK: - 快捷键 tab
 
+    /// 编辑器热键行定义（顺序 = 工具栏后半段按钮序）
+    private static let editorHotkeyRows: [(key: String, label: String)] = [
+        ("undo", "撤销"),
+        ("redo", "重做"),
+        ("save", "保存"),
+        ("done", "复制完成"),
+        ("cancel", "取消截图"),
+        ("ocr", "文字识别"),
+        ("pin", "贴图"),
+        ("toggleVisibility", "隐藏贴图"),
+    ]
+
     private func buildHotkeyPane() {
         regionRecorder = HotkeyRecorderView()
         fullScreenRecorder = HotkeyRecorderView()
@@ -384,6 +399,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             row("全屏截图", trailing: [fullScreenRecorder]),
         ])
 
+        // 编辑器操作热键（工具栏后半段，仅截图编辑时生效）
+        var editorRows: [NSView] = []
+        for (actionKey, label) in Self.editorHotkeyRows {
+            let rec = HotkeyRecorderView()
+            rec.allowBare = true
+            rec.setCombo(settings.editorHotkey(for: actionKey))
+            wireEditorRecorder(rec, actionKey: actionKey)
+            editorRecorders[actionKey] = rec
+            editorRows.append(row(label, trailing: [rec]))
+        }
+        let editorCard = makeGroupCard(title: "编辑器操作（截图编辑时生效）", rows: editorRows)
+
         // 提示容器：左缘对齐卡内行（窗边 20 + 卡内 16），避免直接挂栈顶产生 16pt 错位
         let hintWrap = NSView()
         hintWrap.translatesAutoresizingMaskIntoConstraints = false
@@ -396,13 +423,71 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             hotkeyHint.bottomAnchor.constraint(equalTo: hintWrap.bottomAnchor),
         ])
 
-        let outer = NSStackView(views: [card, hintWrap])
+        let outer = NSStackView(views: [card, editorCard, hintWrap])
         outer.orientation = .vertical
         outer.alignment = .leading
         outer.spacing = 0
         outer.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
         outer.setCustomSpacing(8, after: card)
+        outer.setCustomSpacing(8, after: editorCard)
         pinStack(outer, to: hotkeyPane)
+    }
+
+    /// 编辑器热键录制：进入录制时停掉所有其他录制器（全局两个 + 编辑器八个）
+    private func wireEditorRecorder(_ recorder: HotkeyRecorderView, actionKey: String) {
+        recorder.onStart = { [weak self, weak recorder] in
+            self?.regionRecorder?.endRecordingIfNeeded()
+            self?.fullScreenRecorder?.endRecordingIfNeeded()
+            for (k, r) in self?.editorRecorders ?? [:] where k != actionKey {
+                r.endRecordingIfNeeded()
+            }
+            self?.hotkeyHint.isHidden = true
+            _ = recorder
+        }
+        recorder.onCombo = { [weak self, weak recorder] combo in
+            guard let self, let recorder else { return }
+            self.handleEditorCombo(from: recorder, actionKey: actionKey, combo: combo)
+        }
+    }
+
+    private func handleEditorCombo(from recorder: HotkeyRecorderView, actionKey: String, combo: String?) {
+        guard let combo else {
+            hotkeyHint.stringValue = "组合无效：需含修饰键，或单个字母/数字键"
+            hotkeyHint.isHidden = false
+            return
+        }
+        // 冲突检查：其他编辑器动作 + 全局热键 + 内置保留键（S=滚动 / C=取色 / 空格=移动 / 1-6=工具 / ⌘⌥S=快存）
+        for rowDef in Self.editorHotkeyRows where rowDef.key != actionKey {
+            if settings.editorHotkey(for: rowDef.key) == combo {
+                hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「\(rowDef.label)」占用"
+                hotkeyHint.isHidden = false
+                return
+            }
+        }
+        if combo == settings.hotkeyRegion {
+            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「区域截图（全局）」占用"
+            hotkeyHint.isHidden = false
+            return
+        }
+        if combo == settings.hotkeyFullScreen {
+            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「全屏截图（全局）」占用"
+            hotkeyHint.isHidden = false
+            return
+        }
+        let reserved: [String: String] = ["s": "滚动截图", "c": "取色", "space": "移动贴图", "cmd+opt+s": "快速保存"]
+        if let name = reserved[combo] {
+            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」是内置功能「\(name)」的按键，请换一个"
+            hotkeyHint.isHidden = false
+            return
+        }
+        hotkeyHint.isHidden = true
+        var hotkeys = settings.editorHotkeys
+        if hotkeys.isEmpty { hotkeys = AppSettings.defaultEditorHotkeys }
+        hotkeys[actionKey] = combo
+        settings.editorHotkeys = hotkeys
+        recorder.setCombo(combo)
+        Log.event(.app, "settings.editorHotkey", ["action": actionKey, "combo": combo])
+        persist()
     }
 
     private func wireRecorder(_ recorder: HotkeyRecorderView, other: HotkeyRecorderView) {
@@ -592,6 +677,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private func persist() {
         guard let store else { return }
         store.save(settings)  // 适配器内打 settings.save 日志
+        // 即时回灌运行中的 coordinator（编辑器热键逐键读 settings，
+        // 不重启即生效；全局 Carbon 热键仍需重启重注册——历史行为，另案）
+        AppCoordinatorShared.coordinator?.settings = settings
     }
 
     // MARK: - 布局助手（磨砂分组卡 / 行高 36 / 8pt 栅格）
@@ -775,7 +863,11 @@ private final class HairlineView: NSView {
 @MainActor
 private final class HotkeyRecorderView: NSButton {
 
-    /// 录到合法组合（含修饰键）回调；nil = 非法组合
+    /// 录到合法组合回调；nil = 非法组合。
+    /// allowBare = true（编辑器热键）：裸字母/数字合法（"o"），带修饰键的
+    /// 命名键合法（"cmd+return"）；裸命名键仍非法（return/esc 与录制控件
+    /// 自身的确认/取消语义冲突）。
+    var allowBare = false
     var onCombo: (String?) -> Void = { _ in }
     /// 进入录制态回调（取消另一个录制器、隐藏红字提示）
     var onStart: () -> Void = {}
@@ -857,12 +949,18 @@ private final class HotkeyRecorderView: NSButton {
         if event.modifierFlags.contains(.shift) { mods.append("shift") }
         if event.modifierFlags.contains(.option) { mods.append("opt") }
         if event.modifierFlags.contains(.control) { mods.append("ctrl") }
-        // 非法：必须含至少一个修饰键（红字提示，保持录制态可重按）
-        guard !mods.isEmpty else {
+        let key = Self.keyName(for: event)
+        if mods.isEmpty {
+            // 编辑器热键：裸字母/数字合法（原 O/P/H 语义）；裸命名键非法
+            if allowBare, key.count == 1, key.first?.isLetter == true || key.first?.isNumber == true {
+                onCombo(key)
+                isRecording = false
+                updateDisplay()
+                return
+            }
             onCombo(nil)
             return
         }
-        let key = Self.keyName(for: event)
         onCombo((mods + [key]).joined(separator: "+"))
         isRecording = false
         updateDisplay()
