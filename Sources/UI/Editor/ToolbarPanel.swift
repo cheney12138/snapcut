@@ -231,7 +231,7 @@ final class ToolbarPanel: NSPanel {
             toolButtons[tool] = button
             stack.addArrangedSubview(button)
         }
-        let scrollButton = TBIconButton(symbol: "arrow.down.to.line", fallback: "滚")
+        let scrollButton = TBIconButton(icon: .scroll, fallback: "滚")
         scrollButton.tag = 206
         scrollButton.target = self
         scrollButton.action = #selector(toolTapped(_:))
@@ -279,14 +279,14 @@ final class ToolbarPanel: NSPanel {
         stack.addArrangedSubview(makeSeparator())
 
         // 4) 撤销 / 重做
-        undoButton = TBIconButton(symbol: "arrow.uturn.backward", fallback: "↩︎")
+        undoButton = TBIconButton(icon: .undo, fallback: "↩︎")
         undoButton.target = self
         undoButton.action = #selector(actionTapped(_:))
         undoButton.tag = 100
         undoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.undoButton, text: "撤销 ⌘Z") }
         stack.addArrangedSubview(undoButton)
 
-        redoButton = TBIconButton(symbol: "arrow.uturn.forward", fallback: "↪︎")
+        redoButton = TBIconButton(icon: .redo, fallback: "↪︎")
         redoButton.target = self
         redoButton.action = #selector(actionTapped(_:))
         redoButton.tag = 101
@@ -296,21 +296,21 @@ final class ToolbarPanel: NSPanel {
         stack.addArrangedSubview(makeSeparator())
 
         // 5) 取字 / 贴图 / 显隐
-        let ocr = TBIconButton(symbol: "text.viewfinder", fallback: "字")
+        let ocr = TBIconButton(icon: .ocr, fallback: "字")
         ocr.tag = 204
         ocr.target = self
         ocr.action = #selector(actionTapped(_:))
         ocr.onHover = { [weak self] inside in self?.handleHover(inside, button: ocr, text: "取字 O") }
         stack.addArrangedSubview(ocr)
 
-        let pin = TBIconButton(symbol: "pin", fallback: "钉")
+        let pin = TBIconButton(icon: .pin, fallback: "钉")
         pin.tag = 205
         pin.target = self
         pin.action = #selector(actionTapped(_:))
         pin.onHover = { [weak self] inside in self?.handleHover(inside, button: pin, text: "贴图 P") }
         stack.addArrangedSubview(pin)
 
-        let eye = TBIconButton(symbol: "eye", fallback: "眼")
+        let eye = TBIconButton(icon: .eye, fallback: "眼")
         eye.tag = 200
         eyeButton = eye
         eye.target = self
@@ -322,21 +322,21 @@ final class ToolbarPanel: NSPanel {
 
         // 6) 主按钮「复制」（28×28 纯图标 accent 实心键，唯一彩色 accent；tooltip 保留）
         //    + 保存 + 取消（同构，无彩）
-        let copy = TBPrimaryButton(symbol: "doc.on.doc")
+        let copy = TBPrimaryButton(icon: .copy)
         copy.tag = 201
         copy.target = self
         copy.action = #selector(actionTapped(_:))
         copy.onHover = { [weak self] inside in self?.handleHover(inside, button: copy, text: "复制并完成 ↩") }
         stack.addArrangedSubview(copy)
 
-        let save = TBIconButton(symbol: "square.and.arrow.down", fallback: "存")
+        let save = TBIconButton(icon: .save, fallback: "存")
         save.tag = 202
         save.target = self
         save.action = #selector(actionTapped(_:))
         save.onHover = { [weak self] inside in self?.handleHover(inside, button: save, text: "保存 ⌘S") }
         stack.addArrangedSubview(save)
 
-        let close = TBIconButton(symbol: "xmark", fallback: "×")
+        let close = TBIconButton(icon: .cancel, fallback: "×")
         close.tag = 203
         close.target = self
         close.action = #selector(actionTapped(_:))
@@ -616,10 +616,7 @@ class TBIconButton: NSButton {
 
     init(symbol: String, fallback: String) {
         super.init(frame: .zero)
-        isBordered = false
-        bezelStyle = .regularSquare
-        title = ""
-        imagePosition = .imageOnly
+        setupButtonShell()
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
             self.image = image.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: TBStyle.iconPointSize, weight: TBStyle.iconWeight)
@@ -629,6 +626,21 @@ class TBIconButton: NSButton {
             font = .systemFont(ofSize: 14, weight: .medium)
         }
         setupCommon()
+    }
+
+    /// 设计稿自绘线性图标（TBIcon，模板图 + contentTintColor 上色）
+    init(icon: TBIcon.Kind, fallback: String) {
+        super.init(frame: .zero)
+        setupButtonShell()
+        image = TBIcon.image(icon, pointSize: TBStyle.iconPointSize)
+        setupCommon()
+    }
+
+    private func setupButtonShell() {
+        isBordered = false
+        bezelStyle = .regularSquare
+        title = ""
+        imagePosition = .imageOnly
     }
 
     /// 自绘模板图（文字工具的 "T"：原型 #i-text 的三笔画，SF Symbols 无对应）
@@ -755,14 +767,21 @@ private final class TBToolButton: TBIconButton {
 
     init(tool: EditorSession.Tool) {
         self.tool = tool
-        if tool == .text {
-            // 原型 #i-text 是衬线 "T"；SF Symbols（textformat/character）都长得像 "A"，
-            // 按原型三笔画自绘 17pt 模板图
-            super.init(templateImage: Self.makeTextGlyph(), fallback: tool.label)
-        } else {
-            super.init(symbol: tool.symbolName, fallback: tool.label)
-        }
+        // 设计稿 1:1 自绘线性图标（SF Symbol 字形比例与设计稿不符——
+        // 用户实报「icon 没跟设计稿对齐/复制键竖着拉长」）
+        super.init(icon: Self.iconKind(for: tool), fallback: tool.label)
         tag = tool.rawValue
+    }
+
+    private static func iconKind(for tool: EditorSession.Tool) -> TBIcon.Kind {
+        switch tool {
+        case .arrow: return .arrow
+        case .rect: return .rect
+        case .text: return .text
+        case .mosaic: return .mosaic
+        case .sequence: return .sequence
+        case .highlight: return .highlight
+        }
     }
 
     @available(*, unavailable)
@@ -932,18 +951,14 @@ private final class TBPrimaryButton: NSButton {
     private var trackingArea: NSTrackingArea?
     private var isHot = false
 
-    init(symbol: String) {
+    init(icon: TBIcon.Kind) {
         super.init(frame: .zero)
         isBordered = false
         bezelStyle = .regularSquare
         title = ""                          // 去字：纯图标（信息走 tooltip）
         imagePosition = .imageOnly
         contentTintColor = DesignTokens.labelOnAccent
-        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-            self.image = image.withSymbolConfiguration(
-                NSImage.SymbolConfiguration(pointSize: TBStyle.iconPointSize, weight: TBStyle.iconWeight)
-            )
-        }
+        self.image = TBIcon.image(icon, pointSize: TBStyle.iconPointSize)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = TBStyle.buttonRadius
