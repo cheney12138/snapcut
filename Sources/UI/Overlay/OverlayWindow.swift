@@ -718,27 +718,36 @@ final class OverlayView: NSView {
             needsDisplay = true
             return
         }
-        guard let pending = pendingAnnotation, let session = editorSession else { return }
+        _ = finalizePendingAnnotation(at: point)
+    }
+
+    /// 拖拽标注定稿（mouseUp 正常路径与导出 flush 共用）：
+    /// 返回 true = 有标注落库。非法几何（箭头/高亮 <4pt、矩形 <3px）视为
+    /// 用户放弃，静默丢弃。
+    /// 收口背景（用户病例 2026-11-15）：拖完箭头立即按 Enter，导出图无箭头
+    /// ——mouseUp 与 keyDown 的事件时序在触摸板上不可靠，渲染前必须 flush。
+    @discardableResult
+    private func finalizePendingAnnotation(at point: CGPoint) -> Bool {
+        guard let pending = pendingAnnotation, let session = editorSession else { return false }
         let a = localToAnnotation(point)
         var final = pending
-        // 交互预览态 → 定稿几何
         switch pending.shape {
         case .arrow(let from, _):
             let start = pendingStartPoint ?? from
-            if hypot(a.x - start.x, a.y - start.y) < 4 { pendingAnnotation = nil; needsDisplay = true; return }
+            if hypot(a.x - start.x, a.y - start.y) < 4 { pendingAnnotation = nil; needsDisplay = true; return false }
             final.shape = .arrow(from: start, to: a)
         case .highlight(let from, _):
-            if hypot(a.x - from.x, a.y - from.y) < 4 { pendingAnnotation = nil; needsDisplay = true; return }
+            if hypot(a.x - from.x, a.y - from.y) < 4 { pendingAnnotation = nil; needsDisplay = true; return false }
             final.shape = .highlight(from: from, to: a)
         case .rect:
             let rect = rectFromPoints(pendingStartPoint ?? a, a)
-            if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return }
+            if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return false }
             final.shape = .rect(rect)
         case .mosaic:
             let rect = rectFromPoints(pendingStartPoint ?? a, a)
-            if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return }
+            if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return false }
             final.shape = .mosaic(rect)
-        default: break
+        default: return false
         }
         Log.event(.editor, "editor.shape.commit", [
             "shape": "\(final.shape)", "color": "\(final.color)",
@@ -747,6 +756,20 @@ final class OverlayView: NSView {
         pendingAnnotation = nil
         pendingStartPoint = nil
         needsDisplay = true
+        return true
+    }
+
+    /// 导出前统一 flush（唯一收口点，OverlayController 各导出路径调用）：
+    /// pending 用「当前光标位」定稿——触摸板拖拽后光标停在锚点上，mouseUp
+    /// 若因竞态未达，这里兜底提交，保证编辑器所见 = 导出所得。
+    func flushPendingAnnotationForExport() {
+        guard pendingAnnotation != nil else { return }
+        let p = cursorLocal
+        if !finalizePendingAnnotation(at: p) {
+            Log.event(.editor, "editor.shape.flush.drop", [:])
+        } else {
+            Log.event(.editor, "editor.shape.flush", [:])
+        }
     }
 
     // MARK: - 文字输入

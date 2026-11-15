@@ -435,6 +435,7 @@ final class OverlayController {
     /// 取字：识别当前合成图（含标注）→ 浮层展示
     private func runOCR() {
         guard let session = editorSession else { return }
+        (editorWindow()?.contentView as? OverlayView)?.flushPendingAnnotationForExport()
         let image = session.renderFinalImage()
         let rect = session.selectionGlobal
         let screen = session.screen
@@ -491,6 +492,7 @@ final class OverlayController {
     /// 贴图：把当前合成图钉在屏幕上
     private func pinCurrentImage() {
         guard let session = editorSession else { return }
+        (editorWindow()?.contentView as? OverlayView)?.flushPendingAnnotationForExport()
         let image = session.renderFinalImage()
         let rect = session.selectionGlobal
         AppCoordinatorShared.deps?.history.record(image)
@@ -839,6 +841,9 @@ final class OverlayController {
                 return
             }
             // 编辑态：合成导出（编辑器所见 = 导出所得）
+            // 病例收口（2026-11-15）：拖拽标注 + 立即导出的 mouseUp/keyDown
+            // 竞态——渲染前 flush pending，三个导出点共用同一兜底
+            (editorWindow()?.contentView as? OverlayView)?.flushPendingAnnotationForExport()
             let start = DispatchTime.now()
             let finalImage = session.renderFinalImage()
             let elapsedMs = Int(

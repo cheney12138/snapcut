@@ -200,6 +200,7 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
     /// renderFinalImage（底图 + 马赛克像素化 + CGRenderer.composite 矢量标注）
     /// → 既有导出链路（矩阵 PNG：间隙背景色 + 标注已烤入）
     private func exportAndClose(mode: ExportMode) {
+        editorView?.flushPendingAnnotationForExport()
         let image = session.renderFinalImage()
         AppCoordinatorShared.deps?.history.record(image)
         switch mode {
@@ -237,6 +238,7 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
 
     /// 合成图（含标注）重新 pin 回桌面（闭环：还能继续参与下一轮磁吸）
     private func pinComposite() {
+        editorView?.flushPendingAnnotationForExport()
         let image = session.renderFinalImage()
         AppCoordinatorShared.deps?.history.record(image)
         guard let window, let view = editorView else { return }
@@ -253,6 +255,7 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
 
     /// 取字（复用 Vision 端口 + OCRResultPanel）
     private func runOCR() {
+        editorView?.flushPendingAnnotationForExport()
         let image = session.renderFinalImage()
         AppCoordinatorShared.deps?.history.record(image)
         guard let window, let deps = AppCoordinatorShared.deps else { return }
@@ -409,34 +412,52 @@ final class CollageEditorContentView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard let pending = pendingAnnotation else { return }
-        let a = localToAnnotation(convert(event.locationInWindow, from: nil))
+        _ = finalizePendingAnnotation(at: convert(event.locationInWindow, from: nil))
+    }
+
+    /// 定稿 pending（mouseUp 正常路径 + 导出 flush 共用；同 OverlayWindow 收口）
+    @discardableResult
+    private func finalizePendingAnnotation(at point: CGPoint) -> Bool {
+        guard let pending = pendingAnnotation else { return false }
+        let a = localToAnnotation(point)
         var final = pending
         switch pending.shape {
         case .arrow(let from, _):
             let start = pendingStartPoint ?? from
-            guard hypot(a.x - start.x, a.y - start.y) >= 4 else { cancelPending(); return }
+            guard hypot(a.x - start.x, a.y - start.y) >= 4 else { cancelPending(); return false }
             final.shape = .arrow(from: start, to: a)
         case .highlight(let from, _):
             let start = pendingStartPoint ?? from
-            guard hypot(a.x - start.x, a.y - start.y) >= 4 else { cancelPending(); return }
+            guard hypot(a.x - start.x, a.y - start.y) >= 4 else { cancelPending(); return false }
             final.shape = .highlight(from: start, to: a)
         case .rect:
             let rect = rectFromPoints(pendingStartPoint ?? a, a)
-            guard rect.width >= 3, rect.height >= 3 else { cancelPending(); return }
+            guard rect.width >= 3, rect.height >= 3 else { cancelPending(); return false }
             final.shape = .rect(rect)
         case .mosaic:
             let rect = rectFromPoints(pendingStartPoint ?? a, a)
-            guard rect.width >= 3, rect.height >= 3 else { cancelPending(); return }
+            guard rect.width >= 3, rect.height >= 3 else { cancelPending(); return false }
             final.shape = .mosaic(rect)
         default:
-            break
+            return false
         }
         Log.event(.editor, "editor.shape.commit", [
             "shape": "\(final.shape)", "color": "\(final.color)",
         ])
         controller?.addAnnotation(final)
         cancelPending()
+        return true
+    }
+
+    /// 导出前统一 flush（mouseUp/keyDown 竞态兜底，光标位定稿）
+    func flushPendingAnnotationForExport() {
+        guard pendingAnnotation != nil else { return }
+        // 光标位：ContentView 无 cursorLocal 跟踪，用 window 鼠标位换算
+        let mouse = NSEvent.mouseLocation
+        let inWin = window?.convertPoint(fromScreen: mouse) ?? .zero
+        let p = convert(inWin, from: nil)
+        let ok = finalizePendingAnnotation(at: p)
+        Log.event(.editor, ok ? "editor.shape.flush" : "editor.shape.flush.drop", [:])
     }
 
     private func cancelPending() {
