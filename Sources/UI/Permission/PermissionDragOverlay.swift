@@ -18,11 +18,16 @@ final class PermissionDragOverlay {
     // MARK: - 常量
 
     private static let settingsBundleID = "com.apple.systempreferences"
-    /// 主设置窗尺寸门槛（对话框量级排除，见 settingsWindowFrame 病例注释）：
-    /// TCC 确认框约 460×200pt；系统设置主窗可缩放下限远大于此
-    private static let minMainWindowWidth: CGFloat = 500
-    private static let minMainWindowHeight: CGFloat = 320
+    /// 主设置窗尺寸门槛（第二轮实锤后大幅提高）：第一轮的 500×320 没拦住——
+    /// 实机日志 `hit=settings owner=系统设置 title=(redacted)` 证明 TCC 确认框
+    /// （macOS 26 屏幕录制确认框带 App 图标预览，实测过 500×320 线）也被放行了。
+    /// 系统设置主窗默认 800×600+，700×500 仍远在其下；TCC 确认框没这么大。
+    private static let minMainWindowWidth: CGFloat = 700
+    private static let minMainWindowHeight: CGFloat = 500
     private static let tickInterval: TimeInterval = 0.1
+    /// show() 后延迟 3s 才开始 tick：TCC 确认框弹出后用户还没点「打开系统设置」的
+    /// 时期内，浮窗必须安静待命（设置主窗冷启动要几秒，时序天然分离）
+    private static let tickStartDelay: TimeInterval = 3.0
     private static let permissionPollInterval: TimeInterval = 2.0
     /// 目标窗消失超过这个时长 → 收浮层（孤儿浮层比没有浮层更糟）
     /// 12s：系统设置冷启动可能 >5s（病例：浮窗等不到目标出现就退场了）
@@ -40,6 +45,8 @@ final class PermissionDragOverlay {
     private var targetGoneSince: Date?
 
     private var isShown = false
+    /// tick 生效时刻（show() + tickStartDelay）：确认框在场期间不启动匹配
+    private var tickStartAt = Date.distantPast
     /// 用户已把 App 拖进权限列表（等待重启生效）——浮窗切换「已添加」文案
     private var droppedInList = false
     private var dismissTimer: Timer?
@@ -68,7 +75,10 @@ final class PermissionDragOverlay {
         self.panel = panel
         // 显示交给 tick：第一次找到系统设置窗口后才 orderFront + 贴角
         // （冷启动期直接显示会在错误位置闪现）
-        Log.event(.permission, "dragOverlay.show")
+        // tick 延迟 tickStartDelay 启动：TCC 确认框与设置主窗的时序天然分离
+        // （用户点「打开系统设置」后设置冷启动要几秒），确认框在场期不匹配
+        tickStartAt = Date().addingTimeInterval(Self.tickStartDelay)
+        Log.event(.permission, "dragOverlay.show", ["tickStartDelay": "\(Self.tickStartDelay)"])
 
         let tick = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -139,6 +149,9 @@ final class PermissionDragOverlay {
     // MARK: - 锚定跟随（100ms tick）
 
     private func tick() {
+        // show() 后的静默期：TCC 确认框在场期间不启动匹配（防抢跑第一道闸）
+        guard Date() >= tickStartAt else { return }
+
         // ⚠️ 拖拽进行中冻结一切重定位与消失（拖一半浮层跑了 = 灾难）
         if DragSourceCoordinator.shared.isDragging || (NSEvent.pressedMouseButtons & 1) != 0 {
             return
@@ -188,8 +201,9 @@ final class PermissionDragOverlay {
     /// tick 10Hz 轮询 → match 打点只在状态变化时落一条（避免日志刷屏）
     private var matchLogSignature: String?
 
-    /// 匹配结果变化时落一条 dragOverlay.match（记 owner/title，供实机根因核对）
-    private func noteMatchResult(hit: Bool, owner: String, title: String, missReason: String) {
+    /// 匹配结果变化时落一条 dragOverlay.match（记 owner/title/size，供实机根因核对）
+    private func noteMatchResult(hit: Bool, owner: String, title: String,
+                                 missReason: String, size: String = "") {
         let signature = hit ? "hit|\(owner)|\(title)" : "miss|\(missReason)"
         guard signature != matchLogSignature else { return }
         matchLogSignature = signature
@@ -197,25 +211,40 @@ final class PermissionDragOverlay {
             "hit": hit ? "settings" : missReason,
             "owner": owner,
             "title": title,
+            "size": size,
         ])
     }
 
     /// 用 CGWindowListCopyWindowInfo 找系统设置 layer-0 主窗（NSRunningApplication 拿不到窗口列表）
     ///
-    /// 病例（用户实报「权限面板还没出来，浮窗就出现了」）：
-    /// TCC 确认框（「'Snapcut' 想要录制此电脑的屏幕和音频」）刚弹出，浮窗就同时贴上去了。
-    /// macOS 26 上该确认框的窗口 owner 与系统设置同进程（com.apple.systempreferences），
-    /// 旧逻辑只按「owner PID + layer0 + 尺寸≥50」匹配 → 确认框被误认成设置主窗。
+    /// 病例二轮（第一轮 500×320 + 标题校验没拦住）：实机日志
+    ///   evt=dragOverlay.show
+    ///   evt=dragOverlay.match hit=settings owner=系统设置 title=(redacted)
+    /// 即 TCC 确认框（「'Snapcut' 想要录制此电脑的屏幕和音频」，owner 与系统设置同进程
+    /// com.apple.systempreferences）被 match 成目标窗。逐闸复盘：
+    /// - 尺寸闸 500×320：macOS 26 确认框带 App 图标预览，实际尺寸过了线 → 没拦住；
+    /// - 标题闸：未授权期 kCGWindowName 被系统裁剪（title=(redacted)）→ 形同虚设。
     ///
-    /// 修复（**不能依赖 kCGWindowName 判别**——未授权期系统裁剪窗口标题，读不到，
-    /// 而浮窗恰恰只在未授权期出现）：
-    /// - 尺寸门槛提到对话框量级之上（minMainWindowWidth/Height）：TCC 确认框
-    ///   ≈460×200pt 被排除，设置主窗远大于此；
-    /// - 标题可读时（授权后 / 宿主有屏幕录制权限）再校验含「设置/Settings」，双保险。
+    /// 新判据链（四道闸，命中必须全过；打点保留各分支供实机定位）：
+    /// ① 进程形态闸：NSRunningApplication(com.apple.systempreferences) 存在且
+    ///   activationPolicy == .regular——TCC 确认框由后台形态的 systempreferences
+    ///   进程承载（无 Dock 图标）；用户点「打开系统设置」后进程才转 regular 并拉起主窗。
+    /// ② 静默期闸：show() 后 3s 内不启动 tick（确认框在场期天然排除）。
+    /// ③ 尺寸闸 700×500：确认框没这么大；设置主窗默认 800×600+。
+    /// ④ 标题闸：标题可读时（授权后）才校验含「设置/Settings」——不能依赖
+    ///   kCGWindowName（未授权期被裁剪），也不能依赖辅助功能权限。
+    /// 同进程多窗（确认框 + 主窗并存）时取面积最大者 = 主窗。
     private func settingsWindowFrame() -> CGRect? {
         guard let settingsApp = NSRunningApplication
             .runningApplications(withBundleIdentifier: Self.settingsBundleID).first else {
             noteMatchResult(hit: false, owner: "", title: "", missReason: "settingsNotRunning")
+            return nil
+        }
+        // ① 进程形态闸：确认框承载期进程不是 regular（后台形态，无 Dock 图标）
+        let policy = settingsApp.activationPolicy
+        guard policy == .regular else {
+            noteMatchResult(hit: false, owner: "系统设置", title: "",
+                            missReason: "policySuspect(policy=\(policy.rawValue))")
             return nil
         }
         let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
@@ -232,30 +261,36 @@ final class PermissionDragOverlay {
                   let bounds = CGRect.rect(fromDict: boundsDict) else { continue }
             let owner = info[kCGWindowOwnerName as String] as? String ?? "?"
             let title = info[kCGWindowName as String] as? String ?? ""
+            let titleDisplay = title.isEmpty ? "(redacted)" : title
             if bounds.width < 50 || bounds.height < 50 { continue } // 排除杂音小窗
-            // 对话框量级排除：TCC 确认框（同进程 owner 的陷阱窗）尺寸远小于主设置窗
+            // ③ 尺寸闸：700×500（确认框过不了；设置主窗默认 800×600+）
             if bounds.width < Self.minMainWindowWidth || bounds.height < Self.minMainWindowHeight {
-                noteMatchResult(hit: false, owner: owner, title: title, missReason: "dialogSuspect")
+                noteMatchResult(hit: false, owner: owner, title: titleDisplay,
+                                missReason: "dialogSuspect",
+                                size: "\(Int(bounds.width))x\(Int(bounds.height))")
                 continue
             }
-            // 主设置窗标题校验（kCGWindowName 未授权期缺省 → 跳过，靠尺寸门槛兜底）
+            // ④ 标题闸（kCGWindowName 未授权期缺省 → 跳过，靠①③双闸兜底）
             if !title.isEmpty,
                !title.contains("设置"),
                !title.localizedCaseInsensitiveContains("settings") {
-                noteMatchResult(hit: false, owner: owner, title: title, missReason: "titleMismatch")
+                noteMatchResult(hit: false, owner: owner, title: titleDisplay,
+                                missReason: "titleMismatch",
+                                size: "\(Int(bounds.width))x\(Int(bounds.height))")
                 continue
             }
             if best == nil || bounds.area > best!.area {
                 best = bounds
                 bestOwner = owner
-                bestTitle = title.isEmpty ? "(redacted)" : title
+                bestTitle = titleDisplay
             }
         }
         guard let rect = best else {
             noteMatchResult(hit: false, owner: "", title: "", missReason: "noSettingsWindow")
             return nil
         }
-        noteMatchResult(hit: true, owner: bestOwner, title: bestTitle, missReason: "")
+        noteMatchResult(hit: true, owner: bestOwner, title: bestTitle,
+                        missReason: "", size: "\(Int(rect.width))x\(Int(rect.height))")
         return Self.cgToAppKit(rect)
     }
 

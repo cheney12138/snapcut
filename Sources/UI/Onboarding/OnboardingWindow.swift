@@ -20,8 +20,11 @@ final class OnboardingWindow: NSPanel {
         self.onPermissionTap = onPermissionTap
         self.onFinish = onFinish
         let size = NSSize(width: 400, height: 292)
+        // 窗口比卡四边各大 1pt：卡内缩进窗口，卡边缘的遮罩/圆角边缘不落在窗口
+        // 边缘上（窗口边缘的材质缓冲边缘伪影被 1pt 透明带吸收，见 buildUI 病例）
+        let windowSize = NSSize(width: size.width + 2, height: size.height + 2)
         super.init(
-            contentRect: NSRect(origin: .zero, size: size),
+            contentRect: NSRect(origin: .zero, size: windowSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -42,40 +45,40 @@ final class OnboardingWindow: NSPanel {
         buildUI(size: size, permissionGranted: permissionGranted)
     }
 
-    /// 毛玻璃圆角遮罩：黑底白形（maskImage 语义：不透明处保留）
-    private static func roundedMask(size: NSSize, radius: CGFloat) -> NSImage {
-        let image = NSImage(size: size)
-        image.lockFocus()
-        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size),
-                     xRadius: radius, yRadius: radius).setClip()
-        NSColor.black.setFill()
-        NSRect(origin: .zero, size: size).fill()
-        image.unlockFocus()
-        return image
-    }
-
     private func buildUI(size: NSSize, permissionGranted: Bool) {
-        // 玻璃卡（原型：radius 16 / padding 22 / .5pt 白 16% / 深影）
-        let card = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        // 卡片容器（窗口比卡四边各大 1pt，卡内缩进窗口）
+        let container = NSView(frame: NSRect(origin: .zero,
+                                             size: NSSize(width: size.width + 2, height: size.height + 2)))
+        // 玻璃卡（原型：radius 16 / padding 22 / .5pt 白 12% / 深影）
+        let card = NSVisualEffectView(frame: NSRect(x: 1, y: 1, width: size.width, height: size.height))
         card.material = .hudWindow
         card.appearance = NSAppearance(named: .darkAqua)
         card.blendingMode = .behindWindow
         card.state = .active
         card.wantsLayer = true
-        // 病例（用户实报「四周有白色角」）：NSVisualEffectView + layer.cornerRadius
-        // 的模糊采样在圆角外溢出白边（材质缓冲不受 masksToBounds 完整裁剪，
-        // 浅色内容上四角尤其明显）。maskImage 是 effect view 的官方圆角通道，
-        // 按 alpha 轮廓真正裁掉模糊缓冲；描边/背景色走同层不受影响。
-        card.maskImage = Self.roundedMask(size: size, radius: 16)
+        // 病例二轮（用户实拍：白背景下卡边缘仍是一圈黑线，第一轮内描边修法无效）：
+        // 黑线随 3da1eee 引入 maskImage 才出现——同项目 CaptureToast/CountdownHUD/
+        // ToolbarPanel 用同族材质（hudWindow + cornerRadius + masksToBounds +
+        // hasShadow）浮在任意内容上从未被报黑边，唯一差异就是 maskImage：
+        // maskImage 的半透明遮罩边缘坡道进了窗口阴影源 + 材质合成，
+        // 在浅背景上生成紧贴卡边的一圈暗色硬轮廓。离线 harness
+        // （onb_edge_harness.swift）证实：maskImage 与否，cacheDisplay 像素层面
+        // 边缘都不比内部暗（环 min=93=内部 min，暗像素 0）——黑线只在
+        // 窗口服务器合成路径（材质遮罩边缘/阴影源）出现，第一轮改 layer 层
+        // 的描边当然拦不住。
+        // 修复：弃用 maskImage（连同它要修的「白角」——同 commit 自证屏幕级
+        // 「白像素」实为玻璃透出的底下内容，系误诊），改用本项目已实机的
+        // toast/toolbar 配方：layer.cornerRadius + masksToBounds；窗口四边各
+        // 留 1pt 透明带，卡边缘不落在窗口边缘上，材质缓冲的窗口边缘伪影被
+        // 透明带吸收。圆角形状 = cornerRadius 隆齐（与 CaptureToast 同款，
+        // 无 mask 坡道进阴影源）。
         card.layer?.cornerRadius = 16
         card.layer?.masksToBounds = true
-        // 病例（用户实报「周围一圈黑线很丑」）：0.5pt layer 描边跨在 layer 边缘两侧，
-        // 外半边被 maskImage 的 alpha 轮廓裁掉，只剩内半圈残边；残边与遮罩抗锯齿
-        // 相乘后覆盖度打折发脏，深色卡 × 浅色背景下呈一圈黑线。
-        // 修复：layer 描边整个去掉，改用**内描边画法**——圆角路径内缩 0.25pt 描
-        // 0.5pt 白 12%（原型暗色 --glass-stroke 精确值：rgba(255,255,255,.12)，
-        // 宽 .5px，见 index.html scene 07 .onb-card）的 CAShapeLayer，整条描边
-        // 完整落在遮罩内侧，抗锯齿干净不发黑。
+        // 内描边（原型暗色 --glass-stroke 精确值：rgba(255,255,255,.12)，宽 .5px，
+        // 见 index.html scene 07 .onb-card）——圆角路径内缩 0.25pt，整条描边完整
+        // 落在卡内。第一轮曾把黑线归咎于旧 layer 描边（改内描边），实机复测
+        // 证明描边不是黑线根因（真凶是 maskImage，见上方病例）；内描边本身
+        // 抗锯齿干净，保留作玻璃质感描边。
         let stroke = CAShapeLayer()
         let inset: CGFloat = 0.25
         let strokeFrame = CGRect(origin: .zero, size: size)
@@ -94,7 +97,6 @@ final class OnboardingWindow: NSPanel {
 
         let pad: CGFloat = 22
         var y = size.height - pad
-
         // 图标 + 标题
         let iconSide: CGFloat = 46
         let icon = NSImageView(frame: NSRect(x: pad, y: y - iconSide, width: iconSide, height: iconSide))
@@ -177,7 +179,7 @@ final class OnboardingWindow: NSPanel {
         primary.frame = NSRect(x: pad, y: pad, width: size.width - pad * 2, height: 34)
         card.addSubview(primary)
 
-        contentView = card
+        contentView = container
     }
 
     /// 居中显示（若权限已授权且已完成引导，调用方不应显示）
