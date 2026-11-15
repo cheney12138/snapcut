@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BUNDLE_ID="app.snapcut.macos"
+BUNDLE_ID="app.snapcut.snapcut"
 BUNDLE="build/Snapcut.app"
 
 status() {
