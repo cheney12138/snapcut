@@ -8,23 +8,26 @@ import SwiftUI
 struct TrayMenuContent: View {
     @State private var history: [HistoryStore.Item] = []
 
+    /// 实际注册的快捷键（用户可改；菜单显示跟实际一致）
+    private var hotkeys: AppSettings {
+        AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
+    }
+
     var body: some View {
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "?"
         Text("Snapcut \(version)")
 
         Divider()
 
-        Button("截取区域") {
+        Button("截取区域  \(HotkeySpec.display(hotkeys.hotkeyRegion))") {
             Log.event(.tray, "tray.action", ["item": "captureRegion"])
             AppCoordinatorShared.coordinator?.beginRegionCapture()
         }
-        .keyboardShortcut("a", modifiers: [.command, .shift])
 
-        Button("截取全屏") {
+        Button("截取全屏  \(HotkeySpec.display(hotkeys.hotkeyFullScreen))") {
             Log.event(.tray, "tray.action", ["item": "captureFullScreen"])
             AppCoordinatorShared.coordinator?.beginFullScreenCapture()
         }
-        .keyboardShortcut("s", modifiers: [.command, .shift])
 
         Button("延时 3 秒截图") {
             Log.event(.tray, "tray.action", ["item": "captureDelayed"])

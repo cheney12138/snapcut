@@ -102,10 +102,12 @@ final class OnboardingWindow: NSPanel {
         y -= iconSide + 18
 
         // 行：权限（带按钮）+ 三个快捷键
+        // 快捷键显示跟随实际设置（病例：用户改键后引导窗还是写死的 ⌘⇧A）
+        let settings = AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
         let rows: [(String, String, Bool)] = [
             ("屏幕录制权限", permissionGranted ? "已授权 ✓" : "未授权", true),
-            ("区域截图", "⌘ ⇧ A", false),
-            ("全屏截图", "⌘ ⇧ S", false),
+            ("区域截图", HotkeySpec.display(settings.hotkeyRegion), false),
+            ("全屏截图", HotkeySpec.display(settings.hotkeyFullScreen), false),
             ("取色（框选时）", "C", false),
         ]
         for (titleText, valueText, isPermission) in rows {

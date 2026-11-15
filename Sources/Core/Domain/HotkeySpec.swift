@@ -22,6 +22,24 @@ public struct HotkeySpec: Equatable, Sendable {
         "k": 40, "n": 45, "m": 46,
     ]
 
+    /// 显示格式化："cmd+shift+a" → "⌘ ⇧ A"（UI 三处共用：引导窗/托盘菜单/设置页）
+    /// （病例：用户改了快捷键，引导窗提示还是写死的 ⌘⇧A）
+    public static func display(_ text: String) -> String {
+        let parts = text.lowercased().split(separator: "+").map(String.init)
+        guard let key = parts.last, !key.isEmpty else { return text }
+        var prefix = ""
+        for mod in parts.dropLast() {
+            switch mod {
+            case "cmd", "command": prefix += "⌘ "
+            case "shift": prefix += "⇧ "
+            case "opt", "option", "alt": prefix += "⌥ "
+            case "ctrl", "control": prefix += "⌃ "
+            default: break
+            }
+        }
+        return prefix + (key.count == 1 ? key.uppercased() : key)
+    }
+
     public static func parse(_ text: String) -> HotkeySpec? {
         let parts = text.lowercased().split(separator: "+").map(String.init)
         guard let keyPart = parts.last, keyPart.count == 1, let char = keyPart.first,

@@ -33,21 +33,21 @@ final class StatusItemController: NSObject {
         menu.addItem(versionItem)
         menu.addItem(.separator())
 
+        // 快捷键显示跟随实际设置（Carbon 注册的真值；菜单里只是展示）
+        let settings = coordinator?.settings ?? AppSettings.defaultSettings
         let captureItem = NSMenuItem(
-            title: "截取区域",
+            title: "截取区域  \(HotkeySpec.display(settings.hotkeyRegion))",
             action: #selector(captureRegion(_:)),
-            keyEquivalent: "a"
+            keyEquivalent: ""
         )
-        captureItem.keyEquivalentModifierMask = [.command, .shift]
         captureItem.target = self
         menu.addItem(captureItem)
 
         let fullScreenItem = NSMenuItem(
-            title: "截取全屏",
+            title: "截取全屏  \(HotkeySpec.display(settings.hotkeyFullScreen))",
             action: #selector(captureFullScreen(_:)),
-            keyEquivalent: "s"
+            keyEquivalent: ""
         )
-        fullScreenItem.keyEquivalentModifierMask = [.command, .shift]
         fullScreenItem.target = self
         menu.addItem(fullScreenItem)
 

@@ -30,6 +30,7 @@ final class AppCoordinator {
     private var overlayController: OverlayController?
 
     /// 用户设置（设置面板写入 UserDefaults，启动时读取；改动需重启生效）
+    /// 设置（启动加载 + 面板保存后回写；引导窗/托盘读它显示实际快捷键）
     private(set) var settings: AppSettings = AppSettings.defaultSettings
 
     func start() {
