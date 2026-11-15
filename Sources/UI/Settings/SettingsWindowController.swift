@@ -67,7 +67,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         settings = store.load()
         ensureWindow()
         refreshControls()
+        // 病例：权限状态只在 buildAboutPane 时刷过一次（首次 open），用户事后
+        // 授权再开窗口仍显示「未授权」旧文案——每次 open 都要重刷
+        refreshPermissionStatus()
         NSApp.activate(ignoringOtherApps: true)
+        // 玻璃语言钉暗色（浅色系统主题下 underWindowBackground/hudWindow 会解析成
+        // 亮材质，白底白字不可读；与 ToolbarPanel 的 darkAqua 同源决策）
+        window?.appearance = NSAppearance(named: .darkAqua)
         window?.center()
         window?.makeKeyAndOrderFront(nil)
         Log.event(.app, "settings.window.open")
