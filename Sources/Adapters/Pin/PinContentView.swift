@@ -4,15 +4,24 @@ import CoreGraphics
 /// 贴图内容视图：1:1 像素精确绘制（不重采样）+ 6pt 圆角 + 1px 白描边 + 交互转发。
 /// isFlipped 场景：CGContext.draw 假设 Y-up，本视图 Y-down ⇒ 局部镜像一次再 draw
 /// （同 Sources/Overlay/OverlayWindow.swift drawEditor 的翻转处理）。
+///
+/// 成组视觉（设计定稿 §1.3，inGroup 标志位驱动，摘组即回纯图）：
+/// 8pt 白垫 + 1px 描边 + 10pt 圆角（窗体已由 controller.setInGroup 外扩 9pt）。
 @MainActor
 final class PinContentView: NSView {
     static let cornerRadius: CGFloat = 6
+    static let groupCornerRadius: CGFloat = 10
     static let borderWidth: CGFloat = 1
 
     weak var controller: PinWindowController?
 
     /// 右下角百分比读数（缩放 / ⌥透明度共用）
     let hud = PinHUDView(frame: .zero)
+
+    /// 吸附预览发光（拖动中贴合：移动卡与目标卡都亮）
+    private var snapGlow = false {
+        didSet { needsDisplay = true }
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -21,8 +30,6 @@ final class PinContentView: NSView {
         // 固定贴住右下角：翻转坐标下 min-Y 视觉上是顶部，顶部/左侧边距可伸缩
         hud.autoresizingMask = [.minXMargin, .minYMargin]
         addSubview(hud)
-        // drop target（C3 交付物 3）：编辑器导出的图拖进来 → 合并进拼贴
-        registerForDraggedTypes([.tiff, .png])
     }
 
     @available(*, unavailable)
@@ -33,26 +40,29 @@ final class PinContentView: NSView {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
+    func setSnapGlow(_ on: Bool) {
+        snapGlow = on
+    }
+
     override func mouseDown(with event: NSEvent) {
-        // ⌥拖合并手势（docs/06 §3a）：按住 ⌥ 拖到另一张 pin 图上松手 → 成组进拼贴。
+        // 手动拖动（设计定稿 §1.1）：普通拖 = 单卡移动 + 磁吸预览；
+        // ⌘拖 = 所在组全体刚体移动（吸整组包围盒）；⌥拖 = 拆组拖（脱离所在组）。
         // 拖动/松手事件由 mouseDragged/mouseUp 转发（不 performDrag）。
-        if event.modifierFlags.contains(.option) {
-            controller?.beginOptionDrag()
-            return
-        }
-        // 双击复位到 100%（锚在光标处）；随后 performDrag 处理按住拖动，互不冲突
+        let groupDrag = event.modifierFlags.contains(.command)
+        let detach = event.modifierFlags.contains(.option)
+        // 双击复位到 100%（锚在光标处）
         if event.clickCount >= 2 {
             controller?.resetZoom(anchor: convert(event.locationInWindow, from: nil))
         }
-        window?.performDrag(with: event)
+        controller?.beginDrag(groupDrag: groupDrag, detach: detach)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        controller?.optionDragMoved()
+        controller?.dragMoved()
     }
 
     override func mouseUp(with event: NSEvent) {
-        controller?.endOptionDrag()
+        controller?.endDrag()
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -75,78 +85,82 @@ final class PinContentView: NSView {
     private func buildContextMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
-        let merge = NSMenuItem(title: "合并到拼贴…", action: #selector(menuMergeToCollage), keyEquivalent: "")
-        // 拼贴画布未打开（C2 侧未挂 collageTarget）时置灰，点了也不误动作
-        merge.isEnabled = AppCoordinatorShared.collageTarget != nil
         let copy = NSMenuItem(title: "复制图像", action: #selector(menuCopyImage), keyEquivalent: "")
         let reset = NSMenuItem(title: "缩放 100%", action: #selector(menuResetZoom), keyEquivalent: "")
         let close = NSMenuItem(title: "关闭", action: #selector(menuClose), keyEquivalent: "")
-        for item in [merge, copy, reset, close] {
+        for item in [copy, reset, close] {
             item.target = self
             menu.addItem(item)
         }
         return menu
     }
 
-    @objc private func menuMergeToCollage() { controller?.mergeToCollage() }
-
     @objc private func menuCopyImage() { controller?.copyImageToPasteboard() }
     @objc private func menuResetZoom() { controller?.resetZoom(anchor: CGPoint(x: bounds.midX, y: bounds.midY)) }
     @objc private func menuClose() { controller?.close() }
-
-    // MARK: - Drop target（编辑器导出的图拖进 pin 窗 → 也走合并）
-
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingPasteboard.canReadObject(forClasses: [NSImage.self], options: [:]) else { return [] }
-        controller?.showHUD("松手合并进拼贴")
-        return [.copy]
-    }
-
-    override func draggingExited(_ sender: NSDraggingInfo?) {
-        hud.isHidden = true
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let image = Self.pasteboardImage(sender.draggingPasteboard) else { return false }
-        controller?.mergeDropped(image)
-        return true
-    }
-
-    /// 剪贴板图像 → CGImage（NSImage 中转；位图表示保像素）
-    private static func pasteboardImage(_ pasteboard: NSPasteboard) -> CGImage? {
-        guard let objects = pasteboard.readObjects(forClasses: [NSImage.self], options: [:]),
-              let nsImage = objects.first as? NSImage else { return nil }
-        return nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
-    }
 
     // MARK: - 绘制
 
     override func draw(_ dirtyRect: NSRect) {
         guard let controller, let ctx = NSGraphicsContext.current?.cgContext else { return }
         let rect = bounds
-        let radius = Self.cornerRadius
+        let inGroup = controller.inGroup
+        let pad: CGFloat = inGroup ? PinWindowController.groupPad : 0
+        let radius = inGroup ? Self.groupCornerRadius : Self.cornerRadius
 
-        // 1. 圆角裁剪（窗口背景透明，四角自然透出桌面）
-        let clipPath = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        // 1. 成组白垫（外层圆角矩形；未成组无垫）
+        if inGroup {
+            let padPath = CGPath(
+                roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil
+            )
+            ctx.addPath(padPath)
+            ctx.setFillColor(NSColor.white.cgColor)
+            ctx.fillPath()
+        }
+
+        // 2. 图像 1:1 像素精确绘制：Y-down 上下文需镜像一次再 draw，方向才正确。
+        //    成组时画在白垫+描边内缩 9pt 的矩形里（窗体外扩 9pt ⇒ 图像全局位置不变）
+        let imageRect = inGroup
+            ? rect.insetBy(dx: pad + Self.borderWidth, dy: pad + Self.borderWidth)
+            : rect
         ctx.saveGState()
-        ctx.addPath(clipPath)
+        ctx.addPath(CGPath(
+            roundedRect: imageRect, cornerWidth: Self.cornerRadius,
+            cornerHeight: Self.cornerRadius, transform: nil
+        ))
         ctx.clip()
-
-        // 2. 图像 1:1 像素精确绘制：Y-down 上下文需镜像一次再 draw，方向才正确
-        ctx.translateBy(x: rect.midX, y: rect.midY)
+        ctx.translateBy(x: imageRect.midX, y: imageRect.midY)
         ctx.scaleBy(x: 1, y: -1)
-        ctx.translateBy(x: -rect.midX, y: -rect.midY)
+        ctx.translateBy(x: -imageRect.midX, y: -imageRect.midY)
         ctx.interpolationQuality = .none
-        ctx.draw(controller.image, in: rect)
+        ctx.draw(controller.image, in: imageRect)
         ctx.restoreGState()
 
-        // 3. 1px 白描边（内缩 0.5pt 让描边完整落在窗口内，深浅背景都可见）
+        // 3. 描边：未成组 1px 白描边（内缩 0.5pt 让描边完整落在窗口内，深浅背景都可见）；
+        //    成组 1px 深色发丝线骑在白垫外缘（白垫在深色桌面上自身已可见）
         let borderRect = rect.insetBy(dx: Self.borderWidth / 2, dy: Self.borderWidth / 2)
-        let borderPath = CGPath(roundedRect: borderRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
-        ctx.setStrokeColor(NSColor.white.cgColor)
+        let borderPath = CGPath(
+            roundedRect: borderRect, cornerWidth: radius, cornerHeight: radius, transform: nil
+        )
+        ctx.setStrokeColor(inGroup ? NSColor.black.withAlphaComponent(0.15).cgColor : NSColor.white.cgColor)
         ctx.setLineWidth(Self.borderWidth)
         ctx.addPath(borderPath)
         ctx.strokePath()
+
+        // 4. 吸附预览发光（贴合瞬间：边框高亮 + 外发光）
+        if snapGlow {
+            let glowRect = rect.insetBy(dx: 1, dy: 1)
+            let glowPath = CGPath(
+                roundedRect: glowRect, cornerWidth: radius, cornerHeight: radius, transform: nil
+            )
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 12, color: NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 0.9).cgColor)
+            ctx.setStrokeColor(NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 1).cgColor)
+            ctx.setLineWidth(2)
+            ctx.addPath(glowPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
     }
 
     // MARK: - HUD

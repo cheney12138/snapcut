@@ -848,6 +848,7 @@ final class OverlayView: NSView {
         // 编辑器自定义热键（工具栏后半段 8 动作，settings.editorHotkeys）：
         // 匹配优先于下述系统语义（Return/Esc 先走文字输入态，S 滚动/⌘⌥S 快存
         // 等内置键序保留——自定义组合撞内置键时内置先行，设置页有冲突提示）。
+        // （分发逻辑在 EditorKeyRouter：拼贴合成编辑宿主共用）
         if let action = matchEditorHotkey(event) {
             performEditorHotkeyAction(action)
             return
@@ -910,48 +911,38 @@ final class OverlayView: NSView {
 
 // MARK: 编辑器自定义热键（工具栏后半段）
 
+    /// 分发逻辑在共享的 EditorKeyRouter（Sources/UI/Editor/EditorKeyRouter.swift），
+    /// 拼贴合成编辑宿主（CollageEditorWindowController）复用同一套。
+    private lazy var editorKeyActions = EditorKeyRouter.Actions(
+        undo: { [weak self] in self?.controller.undoAnnotation() },
+        redo: { [weak self] in self?.controller.redoAnnotation() },
+        toggleVisibility: { [weak self] in self?.controller.toggleToolbarVisibility() },
+        ocr: { [weak self] in self?.controller.toolbarAction(.ocr) },
+        pin: { [weak self] in self?.controller.toolbarAction(.pin) },
+        save: { [weak self] in self?.controller.perform(action: .save) },
+        done: { [weak self] in self?.controller.perform(action: .copy) },
+        cancel: { [weak self] in self?.controller.perform(action: .cancel) },
+        selectTool: { [weak self] tool in
+            guard let self else { return }
+            self.editorSession?.currentTool = tool
+            self.controller.refreshToolbar()
+            self.needsDisplay = true
+        }
+    )
+
     /// event → 组合串 → settings.editorHotkeys 反查 action key。
     /// 仅编辑/确认阶段且无文字输入时生效（文字输入态的键必须给输入框）。
     private func matchEditorHotkey(_ event: NSEvent) -> String? {
         guard textField == nil, phase == .editing || phase == .confirmed, !scrollMode else { return nil }
-        let settings = AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
-        guard let combo = HotkeySpec.combo(fromkeyCode: UInt32(event.keyCode), modifiers: event.modifierFlags.hotkeyModifiers) else { return nil }
-        for (actionKey, stored) in settings.editorHotkeys {
-            let effective = stored.isEmpty ? (AppSettings.defaultEditorHotkeys[actionKey] ?? "") : stored
-            guard !effective.isEmpty else { continue }
-            // 撞内置键（滚动 S / 快存 ⌘⌥S / 文字态 Esc/Return——上面已挡）：
-            // 组合一致时让内置语义先行（见调用点注释）
-            if HotkeySpec.parse(effective, allowBare: true)?.keyCode == HotkeySpec.parse(combo)?.keyCode,
-               effective == combo { return actionKey }
-        }
-        return nil
+        return EditorKeyRouter.matchHotkey(event)
     }
 
     private func performEditorHotkeyAction(_ actionKey: String) {
-        Log.event(.editor, "editor.hotkey", ["action": actionKey])
-        switch actionKey {
-        case "undo": controller.undoAnnotation()
-        case "redo": controller.redoAnnotation()
-        case "toggleVisibility": controller.toggleToolbarVisibility()
-        case "ocr": controller.toolbarAction(.ocr)
-        case "pin": controller.toolbarAction(.pin)
-        case "save": controller.perform(action: .save)
-        case "done": controller.perform(action: .copy)
-        case "cancel": controller.perform(action: .cancel)
-        default: break
-        }
+        EditorKeyRouter.perform(actionKey, actions: editorKeyActions)
     }
 
     private func toolFor(keyCode: Int) -> EditorSession.Tool? {
-        let map = [
-            kVK_ANSI_1: EditorSession.Tool.arrow,
-            kVK_ANSI_2: EditorSession.Tool.rect,
-            kVK_ANSI_3: EditorSession.Tool.text,
-            kVK_ANSI_4: EditorSession.Tool.mosaic,
-            kVK_ANSI_5: EditorSession.Tool.sequence,
-            kVK_ANSI_6: EditorSession.Tool.highlight,
-        ]
-        return map[keyCode]
+        EditorKeyRouter.tool(for: keyCode)
     }
 
     // MARK: - 坐标换算

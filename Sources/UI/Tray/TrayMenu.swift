@@ -56,11 +56,6 @@ struct TrayMenuContent: View {
             AppCoordinatorShared.coordinator?.beginDelayedCapture(seconds: 3)
         }
 
-        Button("新建拼贴") {
-            Log.event(.tray, "tray.action", ["item": "openCollage"])
-            // C2 画布窗入口：空文档打开（已开则前置并重置为空文档）
-            CollageWindowController.shared.openDocument(CollageDocument())
-        }
 
         Menu("历史记录") {
             if history.isEmpty {

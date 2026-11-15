@@ -260,17 +260,7 @@ final class AppCoordinator {
             switch result {
             case .copy(let image):
                 self.state = .exporting
-                // 画布激活重定向（docs/06 §3 连续工作流）：拼贴窗开着时，
-                // ⌘⇧A 复制路径的产物不再进剪贴板，直接飞入画布（nextGridSlot 自动排格）
-                if CollageWindowController.shared.isActive {
-                    CollageWindowController.shared.addPiece(image: image)
-                    if self.settings.showCopyNotification {
-                        CaptureToast.show(image: image, message: "已加入拼贴画布")
-                    }
-                    Log.event(.app, "collage.capture.redirect", [
-                        "pxW": "\(image.width)", "pxH": "\(image.height)",
-                    ])
-                } else if self.settings.afterCapture == .save {
+                if self.settings.afterCapture == .save {
                     self.exporter.savePanel(image)
                 } else {
                     self.exporter.copyToClipboard(image)
@@ -371,12 +361,10 @@ extension AppCoordinator {
             return
         }
         if CommandLine.arguments.contains("--selftest-collage") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 Log.event(.app, "selftest.collage")
-                _ = self
-                let controller = CollageWindowController.shared
-                controller.openDocument(CollageDocument())
-                // 种两块样例贴片（程序生成纯色位图），验证排版/分镜框/自动扩画布
+                // 新拼贴自测（贴图磁吸链）：种两张纯色贴图 pin，手动落位到磁吸阈值内，
+                // 验证 PinMagnetRegistry snap → 组框 → （不自动 assemble，视觉验收人工判）
                 func sample(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, w: Int, h: Int) -> CGImage? {
                     guard let space = CGColorSpace(name: CGColorSpace.sRGB),
                           let ctx = CGContext(
@@ -388,8 +376,20 @@ extension AppCoordinator {
                     ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
                     return ctx.makeImage()
                 }
-                if let a = sample(0.20, 0.55, 0.95, w: 640, h: 400) { controller.addPiece(image: a) }
-                if let b = sample(0.95, 0.62, 0.18, w: 520, h: 360) { controller.addPiece(image: b) }
+                let screen = NSScreen.main?.frame ?? .zero
+                let ptScale = NSScreen.main?.backingScaleFactor ?? 2
+                if let a = sample(0.20, 0.55, 0.95, w: 640, h: 400) {
+                    AppCoordinatorShared.deps?.pinning.pin(a, atGlobalRect: CGRect(
+                        x: screen.midX - 330, y: screen.midY - 100,
+                        width: 320, height: 200))
+                }
+                if let b = sample(0.95, 0.62, 0.18, w: 520, h: 360) {
+                    AppCoordinatorShared.deps?.pinning.pin(b, atGlobalRect: CGRect(
+                        // 预贴边：b 左缘 = a 右缘 + 16pt gutter（屏 point）
+                        x: screen.midX - 330 + 320 + 16, y: screen.midY - 100,
+                        width: 260, height: 180))
+                }
+                _ = ptScale
             }
             return
         }

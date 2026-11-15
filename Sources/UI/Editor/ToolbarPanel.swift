@@ -410,6 +410,39 @@ final class ToolbarPanel: NSPanel {
     }
 
     func place(below selection: CGRect) {
+        place(panelOriginFor: { visible, panelSize in
+            // 1) 优先选区下方 12pt；2) 下方放不下翻到上方；3) 全屏截图这种上下都没有外部
+            //    空间的情况，**落进可视区内**（贴底），否则会跑到屏幕外被裁掉（用户实拍病例）
+            var origin = CGPoint(x: selection.midX - panelSize.width / 2,
+                                 y: selection.minY - panelSize.height - 12)
+            if origin.y < visible.minY + 8 {
+                let above = selection.maxY + 12
+                if above + panelSize.height <= visible.maxY - 8 {
+                    origin.y = above
+                } else {
+                    // 全屏/贴边选区：放在可视区靠下位置（比贴顶更符合直觉、更好点）
+                    origin.y = visible.minY + 16
+                }
+            }
+            return origin
+        })
+    }
+
+    /// 拼贴合成编辑窗场景（设计定稿 §1.4）：工具栏贴宿主窗顶（框顶外 12pt），
+    /// 顶上放不下翻到窗底
+    func place(aboveGlobal hostRect: CGRect) {
+        place(panelOriginFor: { visible, panelSize in
+            var origin = CGPoint(x: hostRect.midX - panelSize.width / 2,
+                                 y: hostRect.maxY + 12)
+            if origin.y + panelSize.height > visible.maxY - 8 {
+                origin.y = hostRect.minY - panelSize.height - 12
+            }
+            return origin
+        })
+    }
+
+    /// 共用定位/出场动画：panelOriginFor 返回「面板本体」原点（不含投影留白）
+    private func place(panelOriginFor compute: (_ visible: CGRect, _ panelSize: CGSize) -> CGPoint) {
         applyPanelShadowPaths()
         contentView?.layoutSubtreeIfNeeded()
         let margin = TBStyle.shadowMargin
@@ -417,19 +450,7 @@ final class ToolbarPanel: NSPanel {
         let panelSize = CGSize(width: frame.width - margin * 2,
                                height: frame.height - margin * 2)
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-        // 1) 优先选区下方 12pt；2) 下方放不下翻到上方；3) 全屏截图这种上下都没有外部
-        // 空间的情况，**落进可视区内**（贴底），否则会跑到屏幕外被裁掉（用户实拍病例）
-        var origin = CGPoint(x: selection.midX - panelSize.width / 2,
-                             y: selection.minY - panelSize.height - 12)
-        if origin.y < visible.minY + 8 {
-            let above = selection.maxY + 12
-            if above + panelSize.height <= visible.maxY - 8 {
-                origin.y = above
-            } else {
-                // 全屏/贴边选区：放在可视区靠下位置（比贴顶更符合直觉、更好点）
-                origin.y = visible.minY + 16
-            }
-        }
+        var origin = compute(visible, panelSize)
         origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - panelSize.height - 8)
         origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - panelSize.width - 8)
 
