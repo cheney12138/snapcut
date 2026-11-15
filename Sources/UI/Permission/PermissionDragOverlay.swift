@@ -18,6 +18,10 @@ final class PermissionDragOverlay {
     // MARK: - 常量
 
     private static let settingsBundleID = "com.apple.systempreferences"
+    /// 主设置窗尺寸门槛（对话框量级排除，见 settingsWindowFrame 病例注释）：
+    /// TCC 确认框约 460×200pt；系统设置主窗可缩放下限远大于此
+    private static let minMainWindowWidth: CGFloat = 500
+    private static let minMainWindowHeight: CGFloat = 320
     private static let tickInterval: TimeInterval = 0.1
     private static let permissionPollInterval: TimeInterval = 2.0
     /// 目标窗消失超过这个时长 → 收浮层（孤儿浮层比没有浮层更糟）
@@ -161,6 +165,7 @@ final class PermissionDragOverlay {
             }
         }
         // 冷启动（从未见过目标）：安静等待系统设置窗口出现，不显示不销毁
+        // match 打点由 settingsWindowFrame() 的 noteMatchResult 落（状态变化时才记，10Hz 不刷屏）
     }
 
     /// 贴角：目标窗右下角内侧（右距 12 / 下距 16），夹进屏幕 visibleFrame
@@ -180,15 +185,44 @@ final class PermissionDragOverlay {
         panel.setFrameOrigin(origin)
     }
 
-    /// 用 CGWindowListCopyWindowInfo 找系统设置 layer-0 最大在屏窗（NSRunningApplication 拿不到窗口列表）
+    /// tick 10Hz 轮询 → match 打点只在状态变化时落一条（避免日志刷屏）
+    private var matchLogSignature: String?
+
+    /// 匹配结果变化时落一条 dragOverlay.match（记 owner/title，供实机根因核对）
+    private func noteMatchResult(hit: Bool, owner: String, title: String, missReason: String) {
+        let signature = hit ? "hit|\(owner)|\(title)" : "miss|\(missReason)"
+        guard signature != matchLogSignature else { return }
+        matchLogSignature = signature
+        Log.event(.permission, "dragOverlay.match", [
+            "hit": hit ? "settings" : missReason,
+            "owner": owner,
+            "title": title,
+        ])
+    }
+
+    /// 用 CGWindowListCopyWindowInfo 找系统设置 layer-0 主窗（NSRunningApplication 拿不到窗口列表）
+    ///
+    /// 病例（用户实报「权限面板还没出来，浮窗就出现了」）：
+    /// TCC 确认框（「'Snapcut' 想要录制此电脑的屏幕和音频」）刚弹出，浮窗就同时贴上去了。
+    /// macOS 26 上该确认框的窗口 owner 与系统设置同进程（com.apple.systempreferences），
+    /// 旧逻辑只按「owner PID + layer0 + 尺寸≥50」匹配 → 确认框被误认成设置主窗。
+    ///
+    /// 修复（**不能依赖 kCGWindowName 判别**——未授权期系统裁剪窗口标题，读不到，
+    /// 而浮窗恰恰只在未授权期出现）：
+    /// - 尺寸门槛提到对话框量级之上（minMainWindowWidth/Height）：TCC 确认框
+    ///   ≈460×200pt 被排除，设置主窗远大于此；
+    /// - 标题可读时（授权后 / 宿主有屏幕录制权限）再校验含「设置/Settings」，双保险。
     private func settingsWindowFrame() -> CGRect? {
-        let targetBundleID = "com.apple.systempreferences"
-        let settingsApps = NSRunningApplication.runningApplications(withBundleIdentifier: targetBundleID)
-        guard let settingsApp = settingsApps.first,
-              settingsApp.isActive || !settingsApp.isTerminated else { return nil }
+        guard let settingsApp = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Self.settingsBundleID).first else {
+            noteMatchResult(hit: false, owner: "", title: "", missReason: "settingsNotRunning")
+            return nil
+        }
         let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
             as? [[String: Any]] ?? []
         var best: CGRect?
+        var bestOwner = ""
+        var bestTitle = ""
         for info in infoList {
             guard let pid = info[kCGWindowOwnerPID as String] as? Int32,
                   pid == settingsApp.processIdentifier,
@@ -196,12 +230,33 @@ final class PermissionDragOverlay {
                   layer == 0,
                   let boundsDict = info[kCGWindowBounds as String] as? [String: Any],
                   let bounds = CGRect.rect(fromDict: boundsDict) else { continue }
+            let owner = info[kCGWindowOwnerName as String] as? String ?? "?"
+            let title = info[kCGWindowName as String] as? String ?? ""
             if bounds.width < 50 || bounds.height < 50 { continue } // 排除杂音小窗
+            // 对话框量级排除：TCC 确认框（同进程 owner 的陷阱窗）尺寸远小于主设置窗
+            if bounds.width < Self.minMainWindowWidth || bounds.height < Self.minMainWindowHeight {
+                noteMatchResult(hit: false, owner: owner, title: title, missReason: "dialogSuspect")
+                continue
+            }
+            // 主设置窗标题校验（kCGWindowName 未授权期缺省 → 跳过，靠尺寸门槛兜底）
+            if !title.isEmpty,
+               !title.contains("设置"),
+               !title.localizedCaseInsensitiveContains("settings") {
+                noteMatchResult(hit: false, owner: owner, title: title, missReason: "titleMismatch")
+                continue
+            }
             if best == nil || bounds.area > best!.area {
                 best = bounds
+                bestOwner = owner
+                bestTitle = title.isEmpty ? "(redacted)" : title
             }
         }
-        return best.map(Self.cgToAppKit)
+        guard let rect = best else {
+            noteMatchResult(hit: false, owner: "", title: "", missReason: "noSettingsWindow")
+            return nil
+        }
+        noteMatchResult(hit: true, owner: bestOwner, title: bestTitle, missReason: "")
+        return Self.cgToAppKit(rect)
     }
 
     /// CG 全局坐标（原点在主屏左上，Y 向下）→ AppKit 全局坐标（原点主屏左下，Y 向上）

@@ -69,8 +69,27 @@ final class OnboardingWindow: NSPanel {
         card.maskImage = Self.roundedMask(size: size, radius: 16)
         card.layer?.cornerRadius = 16
         card.layer?.masksToBounds = true
-        card.layer?.borderWidth = 0.5
-        card.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        // 病例（用户实报「周围一圈黑线很丑」）：0.5pt layer 描边跨在 layer 边缘两侧，
+        // 外半边被 maskImage 的 alpha 轮廓裁掉，只剩内半圈残边；残边与遮罩抗锯齿
+        // 相乘后覆盖度打折发脏，深色卡 × 浅色背景下呈一圈黑线。
+        // 修复：layer 描边整个去掉，改用**内描边画法**——圆角路径内缩 0.25pt 描
+        // 0.5pt 白 12%（原型暗色 --glass-stroke 精确值：rgba(255,255,255,.12)，
+        // 宽 .5px，见 index.html scene 07 .onb-card）的 CAShapeLayer，整条描边
+        // 完整落在遮罩内侧，抗锯齿干净不发黑。
+        let stroke = CAShapeLayer()
+        let inset: CGFloat = 0.25
+        let strokeFrame = CGRect(origin: .zero, size: size)
+        stroke.frame = strokeFrame
+        stroke.path = CGPath(
+            roundedRect: strokeFrame.insetBy(dx: inset, dy: inset),
+            cornerWidth: 16 - inset,
+            cornerHeight: 16 - inset,
+            transform: nil
+        )
+        stroke.fillColor = nil
+        stroke.strokeColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        stroke.lineWidth = 0.5
+        card.layer?.addSublayer(stroke)
         card.layer?.backgroundColor = NSColor(srgbRed: 0.149, green: 0.149, blue: 0.169, alpha: 0.72).cgColor
 
         let pad: CGFloat = 22
@@ -102,12 +121,10 @@ final class OnboardingWindow: NSPanel {
         y -= iconSide + 18
 
         // 行：权限（带按钮）+ 三个快捷键
-        // 快捷键显示跟随实际设置（病例：用户改键后引导窗还是写死的 ⌘⇧A）
-        let settings = AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
         let rows: [(String, String, Bool)] = [
             ("屏幕录制权限", permissionGranted ? "已授权 ✓" : "未授权", true),
-            ("区域截图", HotkeySpec.display(settings.hotkeyRegion), false),
-            ("全屏截图", HotkeySpec.display(settings.hotkeyFullScreen), false),
+            ("区域截图", "⌘ ⇧ A", false),
+            ("全屏截图", "⌘ ⇧ S", false),
             ("取色（框选时）", "C", false),
         ]
         for (titleText, valueText, isPermission) in rows {
