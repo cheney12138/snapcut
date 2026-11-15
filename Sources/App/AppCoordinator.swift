@@ -184,13 +184,14 @@ final class AppCoordinator {
     /// 授权后未重启进程期间，再触发截图会让 SCK/WindowServer 再次请求录屏
     /// 权限 → TCC 又弹一次。此时直接用系统通知提示重启，不进截图流程。
     private func ensureCaptureReadiness() -> Bool {
+        // 门禁语义（用户三次重申，TCCPermission.swift 注释里早写了但没实现）：
+        // **未授权时快捷键/菜单不进截图流程，直接弹引导卡**（引导卡上
+        // 「去授权」才是唯一的授权入口）——而不是唤起选区面板再让 SCK
+        // 在半路弹 TCC 框（用户实报「快捷键唤起了面板、TCC 框又弹」）。
         let granted = deps.permission.isGranted()
-        guard !granted else { return true }
-        // 进程未持有：区分「从未授权」与「系统已授权但需重启」——
-        // 后者表现为 TCC 数据库已允许而本进程 preflight 仍 false
-        // （tccd 判定 Allowed (System Set) 后 CGPreflight 仍 false 的窗口期）。
-        // 简化：未授权一律放行（首次授权流程需要弹框）——只在「本会话内
-        // 出现过 permission.request 弹框」后 5 分钟内的触发改为提示重启。
+        if granted { return true }
+
+        // 系统设置里已开但进程未重启：提示重启（防 TCC 重弹）
         if permissionPromptWindowActive {
             Log.event(.app, "capture.blocked.pendingRestart")
             let notif = NSUserNotification()
@@ -198,7 +199,20 @@ final class AppCoordinator {
             notif.informativeText = "权限已开启，重启 Snapcut 后生效"
             return false
         }
-        return true
+
+        // 未授权 → 弹引导卡（唯一授权路径），拦下截图
+        Log.event(.app, "capture.blocked.unauthorized")
+        presentOnboardingForce()
+        return false
+    }
+
+    /// 强制弹引导卡（未授权门禁触发；已开着则前置聚焦）
+    private func presentOnboardingForce() {
+        if let window = onboardingWindow, window.isVisible {
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        presentOnboardingIfNeeded()
     }
 
     private var permissionPromptWindowActive = false
