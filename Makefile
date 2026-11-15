@@ -27,7 +27,7 @@ dev: gen check-arch
 	rsync -a --delete "build/DerivedData/Build/Products/Debug/Snapcut.app/" "$(BUNDLE)/"
 	# 收尾签名：固定本地证书（TCC 授权锚定 requirement 而非 cdhash——
 	# Snow Shot 安装器同款机制，授权一次跨构建长期有效）
-	codesign --force --identifier dev.snapcut.app --sign "$(LOCAL_SIGN_ID)" "$(BUNDLE)"
+	codesign --force --identifier app.snapcut.macos --sign "$(LOCAL_SIGN_ID)" "$(BUNDLE)"
 	@echo "== $(BUNDLE) ready =="
 
 ## 终端直跑（实时 stderr 日志）
