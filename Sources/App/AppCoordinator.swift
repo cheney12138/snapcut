@@ -57,10 +57,15 @@ final class AppCoordinator {
     private static let onboardingKey = "onboarding.completed"
 
     /// 首启或权限缺失时展示引导卡：把「授权」放在用户第一次想截图之前
+    /// 引导卡展示逻辑（用户裁定 2026-11-15，对齐 glance）：
+    /// **未授权就弹**——completed 标记只用于「授权完成后别再打扰」，不作为豁免条件。
+    /// 用户授权被系统重置（tccutil / requirement 变化）时引导会重新出现，这是正确行为。
     private func presentOnboardingIfNeeded() {
         let granted = deps.permission.isGranted()
-        let completed = UserDefaults.standard.bool(forKey: Self.onboardingKey)
-        guard !granted || !completed else { return }
+        guard !granted else {
+            Log.event(.app, "onboarding.skip", ["reason": "granted"])
+            return
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let self else { return }
             var created: OnboardingWindow?
@@ -80,7 +85,7 @@ final class AppCoordinator {
             guard let window = created else { return }
             self.onboardingWindow = window
             window.showCentered(on: NSScreen.main ?? NSScreen.screens[0])
-            Log.event(.app, "onboarding.show", ["granted": "\(granted)", "completed": "\(completed)"])
+            Log.event(.app, "onboarding.show", ["granted": "\(granted)"])
         }
     }
 
