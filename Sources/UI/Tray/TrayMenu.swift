@@ -7,17 +7,18 @@ import SwiftUI
 @MainActor
 struct TrayMenuContent: View {
     @State private var history: [HistoryStore.Item] = []
+    /// 权限门禁状态（@State 而非计算属性——Tahoe 的 MenuBarExtra 菜单 body
+    /// 不会因外部非响应式调用重新求值，用户实报「授权完成菜单还是未授权态」；
+    /// 菜单每次展开 onAppear + 1s 轮询双保险刷新）
+    @State private var permissionGranted: Bool = false
 
     /// 实际注册的快捷键（用户可改；菜单显示跟实际一致）
     private var hotkeys: AppSettings {
         AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
     }
 
-    /// 未授权门禁（用户裁定 2026-11-15）：无屏幕录制权限时菜单只留
-    /// 「去授权」一个功能入口 + 退出——截屏类入口全部隐藏（点进去也是被拦），
-    /// 授权完成菜单自动恢复完整形态（body 每次展开重新求值）。
-    private var permissionGranted: Bool {
-        AppCoordinatorShared.deps?.permission.isGranted() ?? false
+    private func refreshPermission() {
+        permissionGranted = AppCoordinatorShared.deps?.permission.isGranted() ?? false
     }
 
     var body: some View {
@@ -100,7 +101,13 @@ struct TrayMenuContent: View {
         .keyboardShortcut("q", modifiers: [.command])
         .onAppear {
             history = HistoryStore.shared.items()
-            Log.event(.tray, "tray.menu.built", ["history": "\(history.count)"])
+            refreshPermission()
+            Log.event(.tray, "tray.menu.built", ["history": "\(history.count)", "granted": "\(permissionGranted)"])
+        }
+        // 授权窗口期（未授权→刚授权）每 1s 刷一次菜单形态；授权后停
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            let g = AppCoordinatorShared.deps?.permission.isGranted() ?? false
+            if g != permissionGranted { permissionGranted = g }
         }
     }
 
