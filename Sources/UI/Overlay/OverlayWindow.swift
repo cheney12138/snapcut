@@ -759,17 +759,53 @@ final class OverlayView: NSView {
         return true
     }
 
-    /// 导出前统一 flush（唯一收口点，OverlayController 各导出路径调用）：
-    /// pending 用「当前光标位」定稿——触摸板拖拽后光标停在锚点上，mouseUp
-    /// 若因竞态未达，这里兜底提交，保证编辑器所见 = 导出所得。
+    /// 导出前统一 flush（唯一收口点，OverlayController 各导出路径调用）。
+    /// 病例二轮（2026-11-15 实录）：拖到 (273,103) 立即 Enter——mouseUp 缺席，
+    /// flush 用 cursorLocal（mouseMoved 旧值，≈起点）重算 → hypot<4 判「用户
+    /// 放弃」drop。正确语义：pendingAnnotation 的 shape 已随每次 drag 更新
+    /// （draw 渲染的就是它 = 用户所见），直接提交 pending 即可。
     func flushPendingAnnotationForExport() {
-        guard pendingAnnotation != nil else { return }
-        let p = cursorLocal
-        if !finalizePendingAnnotation(at: p) {
-            Log.event(.editor, "editor.shape.flush.drop", [:])
-        } else {
-            Log.event(.editor, "editor.shape.flush", [:])
+        guard let pending = pendingAnnotation, let session = editorSession else { return }
+        // 合法性只对「零尺寸」形状丢弃；已拖出的几何（drag 更新过）直接落库
+        var final = pending
+        switch pending.shape {
+        case .arrow(let from, let to):
+            if hypot(to.x - from.x, to.y - from.y) < 4 {
+                Log.event(.editor, "editor.shape.flush.drop", [:])
+                cancelPendingLocal()
+                return
+            }
+            final.shape = .arrow(from: from, to: to)
+        case .highlight(let from, let to):
+            if hypot(to.x - from.x, to.y - from.y) < 4 {
+                Log.event(.editor, "editor.shape.flush.drop", [:])
+                cancelPendingLocal()
+                return
+            }
+            final.shape = .highlight(from: from, to: to)
+        case .rect(let r), .mosaic(let r):
+            if r.width < 3 || r.height < 3 {
+                Log.event(.editor, "editor.shape.flush.drop", [:])
+                cancelPendingLocal()
+                return
+            }
+            final.shape = pending.shape
+        default:
+            return
         }
+        Log.event(.editor, "editor.shape.commit", [
+            "shape": "\(final.shape)", "color": "\(final.color)", "via": "flush",
+        ])
+        controller.addAnnotation(final)
+        pendingAnnotation = nil
+        pendingStartPoint = nil
+        needsDisplay = true
+    }
+
+    private func cancelPendingLocal() {
+        pendingAnnotation = nil
+        pendingStartPoint = nil
+        needsDisplay = true
     }
 
     // MARK: - 文字输入

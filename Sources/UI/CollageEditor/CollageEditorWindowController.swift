@@ -449,15 +449,38 @@ final class CollageEditorContentView: NSView {
         return true
     }
 
-    /// 导出前统一 flush（mouseUp/keyDown 竞态兜底，光标位定稿）
+    /// 导出前统一 flush（mouseUp/keyDown 竞态兜底）。
+    /// pending.shape 已随 drag 更新（= 用户所见），直接提交，不用光标位重算
+    /// （光标位是 mouseMoved 旧值，会误判「零位移」而 drop——同 Overlay 病例）。
     func flushPendingAnnotationForExport() {
-        guard pendingAnnotation != nil else { return }
-        // 光标位：ContentView 无 cursorLocal 跟踪，用 window 鼠标位换算
-        let mouse = NSEvent.mouseLocation
-        let inWin = window?.convertPoint(fromScreen: mouse) ?? .zero
-        let p = convert(inWin, from: nil)
-        let ok = finalizePendingAnnotation(at: p)
-        Log.event(.editor, ok ? "editor.shape.flush" : "editor.shape.flush.drop", [:])
+        guard let pending = pendingAnnotation else { return }
+        var final = pending
+        switch pending.shape {
+        case .arrow(let from, let to):
+            guard hypot(to.x - from.x, to.y - from.y) >= 4 else {
+                Log.event(.editor, "editor.shape.flush.drop", [:])
+                cancelPending(); return
+            }
+            final.shape = .arrow(from: from, to: to)
+        case .highlight(let from, let to):
+            guard hypot(to.x - from.x, to.y - from.y) >= 4 else {
+                Log.event(.editor, "editor.shape.flush.drop", [:])
+                cancelPending(); return
+            }
+            final.shape = .highlight(from: from, to: to)
+        case .rect(let r), .mosaic(let r):
+            guard r.width >= 3, r.height >= 3 else {
+                Log.event(.editor, "editor.shape.flush.drop", [:])
+                cancelPending(); return
+            }
+        default:
+            return
+        }
+        Log.event(.editor, "editor.shape.commit", [
+            "shape": "\(final.shape)", "color": "\(final.color)", "via": "flush",
+        ])
+        controller?.addAnnotation(final)
+        cancelPending()
     }
 
     private func cancelPending() {
