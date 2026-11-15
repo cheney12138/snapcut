@@ -51,7 +51,7 @@ case "${1:-}" in
 esac
 
 quit_gracefully
-echo "→ 启动 $(BUNDLE)..."
+echo "→ 启动 $BUNDLE..."
 open -n "$BUNDLE"
 sleep 2
 status
