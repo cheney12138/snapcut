@@ -31,7 +31,7 @@ enum TCCPermission {
             _ = CGRequestScreenCaptureAccess()
         }
         NSWorkspace.shared.open(
-            URL(string: "x-apple.system.preferences:com.apple.preference.security?Privacy_ScreenCapture")!
+            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!
         )
         Log.event(.permission, "permission.request", ["granted": "\(granted)"])
         // 浮窗待命：tick 找到系统设置窗口后自动显示
