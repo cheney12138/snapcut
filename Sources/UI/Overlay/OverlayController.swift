@@ -386,6 +386,7 @@ final class OverlayController {
                 toolbar?.orderFrontRegardless()
             } else {
                 toolbar?.orderOut(nil)
+                toolbar?.hideTooltip()
             }
             // 显隐按钮图标同步：隐藏态 = eye.slash，再次点/按 H 唤回时表达「当前收起」
             toolbar?.setToolbarHidden(!session.toolbarVisible)

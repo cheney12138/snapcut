@@ -523,6 +523,13 @@ final class ToolbarPanel: NSPanel {
     }
 
     /// 工具栏显隐态图标（隐藏时 eye.slash）
+    /// 工具栏隐藏时同步收起悬停提示（病例 2026-11-15：按 H 隐藏工具栏后
+    /// tooltip 永久滞留——tracking 区随窗 orderOut 消失，mouseExited 永不触发；
+    /// tooltip 是 screenSaver 层独立 NSPanel，宿主窗没了它还浮着）
+    func hideTooltip() {
+        tooltip?.hide()
+    }
+
     func setToolbarHidden(_ hidden: Bool) {
         eyeButton?.setSymbol(hidden ? "eye.slash" : "eye", fallback: "眼")
         Log.event(.editor, "toolbar.eye.icon", ["state": hidden ? "hidden" : "visible"])

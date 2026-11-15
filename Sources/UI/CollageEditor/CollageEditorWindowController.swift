@@ -158,6 +158,7 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
                 toolbar?.orderFrontRegardless()
             } else {
                 toolbar?.orderOut(nil)
+                toolbar?.hideTooltip()
             }
             toolbar?.setToolbarHidden(!session.toolbarVisible)
             Log.event(.editor, "editor.toolbar.\(session.toolbarVisible ? "show" : "hide")")
