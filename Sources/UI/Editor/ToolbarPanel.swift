@@ -628,7 +628,14 @@ final class ToolbarPanel: NSPanel {
         if inside, let button {
             if tooltip == nil { tooltip = ToolbarTooltipWindow() }
             let frameInWindow = button.convert(button.bounds, to: nil)
-            let screenRect = self.convertToScreen(frameInWindow)
+            var screenRect = self.convertToScreen(frameInWindow)
+            // 病例（用户 2026-11-16「label 在 bar 下面被遮一半」）：按钮顶之
+            // 上还有 bar 的 padding（12pt）——tooltip 贴按钮顶会嵌进 bar 内部，
+            // 与玻璃面板视觉混叠被「遮」。锚定改 panel 顶（窗顶）外 6pt 起
+            if let panelTop = window?.frame.maxY {
+                screenRect.origin.y = panelTop
+                screenRect.size.height = 0
+            }
             tooltip?.show(text: text, above: screenRect, after: 0.12)
         } else {
             tooltip?.hide()
