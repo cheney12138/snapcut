@@ -213,11 +213,11 @@ final class OverlayController {
         ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
         ocrCloseObserver = nil
         teardownScrollSession()
-        // 焦点归还延后 ~150ms（用户病例 2026-11-16：「Esc 不退出，反倒操作了
+        // 焦点归还延后 ~80ms（用户病例 2026-11-16：「Esc 不退出，反倒操作了
         // 我的 TUI，会话 abort 了」）：cancel 同步 yieldActivation 时，触发
         // cancel 的那次按键（keyUp/重投递）跨过焦点边界落进前一个 App——
         // TUI 把半截 Esc 当输入执行。延后让按键完整落在已关闭的 overlay 上。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             self?.restoreFocusRobust()
         }
     }
