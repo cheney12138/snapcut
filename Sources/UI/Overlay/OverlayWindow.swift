@@ -70,6 +70,11 @@ final class OverlayWindow: NSWindow {
         (contentView as? OverlayView)?.enterScrollMode()
     }
 
+    /// 退出编辑模式（enterEditor 幂等重入用：回蒙层态）
+    func exitEditorIfNeeded() {
+        (contentView as? OverlayView)?.exitEditorIfNeeded()
+    }
+
     func exitScrollMode() {
         (contentView as? OverlayView)?.exitScrollMode()
     }
@@ -221,6 +226,14 @@ final class OverlayView: NSView {
         scrollGlowView?.removeFromSuperview()
         scrollGlowView = nil
         needsDisplay = true
+    }
+
+    /// 退出编辑模式（enterEditor 幂等重入用）：phase 回蒙层态
+    func exitEditorIfNeeded() {
+        if case .editing = phase {
+            phase = .waitingForDrag
+            needsDisplay = true
+        }
     }
 
     /// 采集区域生长（全局矩形 → 本地）

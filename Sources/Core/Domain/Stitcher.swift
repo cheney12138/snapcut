@@ -64,6 +64,7 @@ enum Stitcher {
     // MARK: - 错误
 
     enum StitcherError: LocalizedError {
+        case cancelled
         case noFrames
         case widthMismatch(expected: Int, actual: Int, frameIndex: Int)
         case frameTooSmall(frameIndex: Int, height: Int, minOverlap: Int)
@@ -72,6 +73,7 @@ enum Stitcher {
 
         var errorDescription: String? {
             switch self {
+            case .cancelled: return "拼接被取消（超时）"
             case .noFrames:
                 return "帧序列为空，无法拼接"
             case .widthMismatch(let expected, let actual, let index):
@@ -114,6 +116,9 @@ enum Stitcher {
         var runningY = 0
 
         for (index, buffer) in buffers.enumerated() {
+            // 协作取消（compose 超时保险丝依赖）：detached 上下文里 cancelAll
+            // 才能真正中断拼接（reviewer Critical#1 配套——超时即走不等 stitch）
+            if index % 2 == 0, Task.isCancelled { throw StitcherError.cancelled }
             if index == 0 {
                 guard buffer.height > options.minOverlap else {
                     throw StitcherError.frameTooSmall(
@@ -167,6 +172,7 @@ enum Stitcher {
 
         // 重叠从大到小枚举：滚动捕获场景下最大可信重叠即真实重叠
         for overlap in stride(from: maxOverlap, through: options.minOverlap, by: -1) {
+            if Task.isCancelled { throw StitcherError.cancelled }
             let d = prev.height - overlap
             if alignmentPasses(prev: prev, cur: cur, d: d, overlap: overlap, options: options) {
                 return (overlap, d)

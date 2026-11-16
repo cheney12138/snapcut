@@ -65,6 +65,10 @@ final class OverlayController {
     private var scrollRefBuffer: PixelBuffer?
     /// 「滚动过快」HUD 提示的回落 work（1.2s）
     private var scrollDroppedHintWork: DispatchWorkItem?
+    /// compose 期 Esc 连按计数（3 次 = 强制取消逃生）
+    private var scrollEscForceCount = 0
+    /// overlay 会话代际（begin/end 各 +1）：compose 异步回填必须同代才有效
+    private var overlaySessionEpoch = 0
     /// 本次采集是否观测到过真实滚动（净贡献 > 0）：到底自动合成的前置条件——
     /// 从未滚动就静止 ≠ 到底（用户在读屏定位），不能自动合成
     private var scrollEverScrolled = false
@@ -88,6 +92,10 @@ final class OverlayController {
 
     func begin(completion: @escaping (Result) -> Void, onShown: (() -> Void)? = nil) {
         self.completion = completion
+        overlaySessionEpoch += 1
+        // 补丁 E（reviewer）：防御性清滚动残留（不依赖 coordinator state 门禁——
+        // 缺失边①：任何绕过路径留下的吞键/采样/HUD 状态一律清零）
+        teardownScrollSession()
         previousApp = NSWorkspace.shared.frontmostApplication
         if let prev = previousApp {
             previousAppPID = Int(prev.processIdentifier)
@@ -215,6 +223,7 @@ final class OverlayController {
     }
 
     func end() {
+        overlaySessionEpoch += 1
         dismissAll()
         editorSession = nil
         toolbar?.orderOut(nil)
@@ -285,6 +294,7 @@ final class OverlayController {
     /// 无条件拆滚动会话资源（热键/HUD/采样器）；不影响编辑会话
     private func teardownScrollSession() {
         isScrollComposing = false
+        scrollEscForceCount = 0
         unregisterScrollHotKeys()
         scrollBottomWork?.cancel()
         scrollBottomWork = nil
@@ -426,6 +436,16 @@ final class OverlayController {
     // MARK: - 编辑态
 
     private func enterEditor(base: CGImage, selection: CGRect, screen: NSScreen) {
+        // 幂等清理（病例 2026-11-16：enter.fromScroll 在 compose 回退链被调两次
+        // ——旧工具栏不拆、双面板 + panel 负坐标）：重入先撤旧编辑视觉
+        if editorSession != nil {
+            toolbar?.orderOut(nil)
+            toolbar = nil
+            for window in windows {
+                window.exitScrollMode()
+                (window.contentView as? OverlayView)?.exitEditorIfNeeded()
+            }
+        }
         // scale 用实测比例（px/pt），不信任 backingScale（BetterDisplay 病例）
         let realScale = CGFloat(base.width) / max(1, selection.width)
         let session = EditorSession(
@@ -673,6 +693,15 @@ final class OverlayController {
         } catch {
             Log.error(.scroll, "scroll.begin.fail", ["err": error.localizedDescription])
             CaptureToast.show(message: "滚动截图启动失败：\(error.localizedDescription)", status: .warn)
+            // reviewer 补丁 D：工具栏/焦点在 try 前已退场——不还原则编辑器
+            // 只剩蒙层无 UI（残态僵死）。回滚：清滚动状态 + 恢复工具栏与焦点
+            teardownScrollSession()
+            scrollSelectionRect = nil
+            scrollScreen = nil
+            if let session = editorSession {
+                toolbar?.place(below: session.selectionGlobal)
+                toolbar?.orderFrontRegardless()
+            }
         }
     }
 
@@ -701,7 +730,16 @@ final class OverlayController {
         ) { [weak self] in
             guard let self else { return }
             if self.isScrollComposing {
-                Log.event(.scroll, "scroll.composing.ignoreKey", ["key": "esc"])
+                // 逃生通道（病例 2026-11-16：compose 卡 6.7s 期间 Esc 全吞、
+                // 用户被锁死）：compose 期连按 3 次 Esc = 强制取消整个滚动会话
+                self.scrollEscForceCount += 1
+                Log.event(.scroll, "scroll.composing.ignoreKey", [
+                    "key": "esc", "force": "\(self.scrollEscForceCount)/3",
+                ])
+                if self.scrollEscForceCount >= 3 {
+                    self.teardownScrollSession()
+                    self.perform(action: .cancel)
+                }
                 return
             }
             self.cancelScrollCapture()
@@ -828,10 +866,15 @@ final class OverlayController {
         let scale = CGFloat(frame.width) / max(1, rect.width)
         let growPt = CGFloat(contributedPx) / max(scale, 0.001)
         var newRect = rect
-        // 采集区域不能长出屏幕（SCK 裁剪会越界）；到屏底后交给到底判定；
-        // x/宽 clamp 保证永不越出焦点屏（双屏病例：另一屏 1920 被算进选区宽）
+        // reviewer Critical#2（Y-up 方向修正）：长图顶行 = 首帧顶行 = 原选区
+        // **顶边**（maxY）——grow 固定顶边、向下（-y）扩展，clamp 到屏底。
+        // 旧实现固定 minY 向上长：① 画布整体上移 growPt 内容错位；② HUD
+        // reposition 贴 minY 恒不动（死代码）；③ clamp 用「选区底到屏顶」距离
+        // ——选区在屏上半部时区域完全不长
         let bounds = screen.frame
-        newRect.size.height = min(rect.height + growPt, bounds.maxY - rect.minY)
+        let newHeight = min(rect.height + growPt, rect.maxY - bounds.minY)
+        newRect = CGRect(x: rect.minX, y: rect.maxY - newHeight, width: rect.width, height: newHeight)
+        // x clamp 保证永不越出焦点屏（双屏病例：另一屏 1920 被算进选区宽）
         newRect.origin.x = max(bounds.minX, min(newRect.origin.x, bounds.maxX - newRect.width))
         if abs(newRect.height - rect.height) >= 0.5 {
             scrollSelectionRect = newRect
@@ -934,20 +977,34 @@ final class OverlayController {
         // 拼接窗口期：编辑器键全吞（OverlayView.keyDown 检查 isScrollComposing），
         // 防 Enter→done / Esc→cancel 在回填前销毁 editorSession；收尾热键同样吞
         isScrollComposing = true
+        scrollEscForceCount = 0
         let timeoutNs = UInt64(DesignTokens.Scroll.composeTimeout * 1_000_000_000)
         let composeStart = DispatchTime.now()
+        // 会话代际（reviewer 补丁 A/C）：Esc×3 逃生或取消后立刻开新截图时，
+        // 旧 compose Task 的长图绝不能回填新会话
+        let epoch = overlaySessionEpoch
         Task { @MainActor in
             enum ComposeOutcome {
                 case done(Stitcher.Result)
                 case timeout
                 case failed
             }
+            // ⚠️ 病例（ms=6772 timeoutMs=3000）两段根因（reviewer Critical#1）：
+            // ① @MainActor 上下文 addTask 继承隔离，stitch 堵主线程（UI/Esc 全卡）；
+            // ② withTaskGroup 返回前隐式 await 全部子任务——detached 的 value
+            //    对 cancelAll 不响应 ⇒ 拼接真卡死时 .timeout 分支仍要等它跑完。
+            // 修：detached + 主线程 20ms 轮询 isCompleted，到点即走、晚到结果丢弃。
+            // TaskGroup 竞速：stitch 子任务跑 detached 且协作可取消（Stitcher
+            // 循环内检查 Task.isCancelled）——timeout 分支 cancelAll 即刻中断
+            // 拼接并返回，不会隐式等待跑完（reviewer Critical#1 全量修复）
             let outcome: ComposeOutcome = await withTaskGroup(of: ComposeOutcome.self) { group in
                 group.addTask {
-                    if let result = try? Stitcher.stitch(frames: frames) {
-                        return .done(result)
-                    }
-                    return .failed
+                    await Task.detached(priority: .userInitiated) {
+                        if let result = try? Stitcher.stitch(frames: frames) {
+                            return .done(result)
+                        }
+                        return .failed
+                    }.value
                 }
                 group.addTask {
                     try? await Task.sleep(nanoseconds: timeoutNs)
@@ -961,6 +1018,12 @@ final class OverlayController {
                 Double(DispatchTime.now().uptimeNanoseconds - composeStart.uptimeNanoseconds)
                     / 1_000_000
             )
+            // 会话换代守卫：丢弃晚到的旧结果（不回填新会话）
+            guard epoch == self.overlaySessionEpoch else {
+                self.isScrollComposing = false
+                Log.event(.scroll, "scroll.compose.stale", ["ms": "\(elapsedMs)"])
+                return
+            }
             switch outcome {
             case .done(let result):
                 Log.event(.scroll, "scroll.compose.done", [
