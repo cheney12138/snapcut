@@ -710,6 +710,8 @@ final class OverlayController {
             let hud = ScrollCaptureHUDPanel()
             hud.show(below: rect, on: screen)
             scrollHUD = hud
+            // HUD 不进采样（病例「HUD 进了截图」）：注册 windowID 给采集器排除
+            ScrollFrameGrabber.excludedWindowIDs.insert(CGWindowID(hud.windowNumber))
             Log.event(.scroll, "scroll.enter", ["rect": "\(Int(rect.width))x\(Int(rect.height))"])
         } catch {
             Log.error(.scroll, "scroll.begin.fail", ["err": error.localizedDescription])
@@ -972,6 +974,9 @@ final class OverlayController {
         scrollBottomWork = nil
         controller.stop()
         scrollController = nil
+        if let hud = scrollHUD {
+            ScrollFrameGrabber.excludedWindowIDs.remove(CGWindowID(hud.windowNumber))
+        }
         scrollHUD?.hide()
         scrollHUD = nil
 
@@ -1051,7 +1056,20 @@ final class OverlayController {
                     "pxW": "\(result.image.width)", "pxH": "\(result.image.height)",
                     "seams": "\(result.seams.count)", "ms": "\(elapsedMs)",
                 ])
-                self.enterEditorAfterScroll(image: result.image, selection: selection, screen: screen)
+                // 选区按拼接结果实际尺寸延展（病例 2026-11-16「只截最后一帧」：
+                // selection 是采集窗口（固定），合成图 2171px 塞回 1084pt 窗口被
+                // 压扁。长图高度 = pxH/scale，顶边对齐原选区顶、向下延展——
+                // 编辑器选区 = 长图真实高度）
+                var grownSelection = selection
+                if selection.height > 0, result.image.width > 0 {
+                    let scale = CGFloat(result.image.width) / selection.width
+                    let grownH = CGFloat(result.image.height) / max(scale, 0.001)
+                    grownSelection = CGRect(
+                        x: selection.minX,
+                        y: selection.maxY - grownH,
+                        width: selection.width, height: grownH)
+                }
+                self.enterEditorAfterScroll(image: result.image, selection: grownSelection, screen: screen)
             case .timeout:
                 // 卡死保险丝：拼帧超时（病例：10s 无反馈）⇒ 回退单帧，不让用户干等
                 Log.error(.scroll, "scroll.compose.fail", [

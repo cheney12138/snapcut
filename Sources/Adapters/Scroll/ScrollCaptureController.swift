@@ -156,6 +156,8 @@ final class ScrollCaptureController {
 /// 线程语义：`capture` 为 async；SCShareableContent / SCScreenshotManager 的
 /// 异步接口自带并发安全，本类型无共享可变状态，可多任务并发调用。
 enum ScrollFrameGrabber {
+    /// 采样排除的自有浮层 windowID（HUD/滚动光晕窗等——OverlayController 注册）
+    nonisolated(unsafe) static var excludedWindowIDs: Set<CGWindowID> = []
 
     /// 抓取区域截图：整屏 SCK 截图 → 按 scale 裁剪到像素区域。
     /// region 为 AppKit 全局点坐标；displayID 为目标显示器。
@@ -167,7 +169,12 @@ enum ScrollFrameGrabber {
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
             throw ScrollCaptureController.ScrollCaptureError.displayNotFound
         }
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        // HUD/组框等自有浮层不进采样（用户病例 2026-11-16「HUD 进了截图」）：
+        // 按 windowID 排除（ScrollCaptureController.hudWindowIDs 注册）
+        let excluded = content.windows.filter { window in
+            Self.excludedWindowIDs.contains(window.windowID)
+        }
+        let filter = SCContentFilter(display: display, excludingWindows: excluded)
         let config = SCStreamConfiguration()
         // ⚠️ 默认 .nominal 会返回降采样图（逻辑分辨率），坐标按物理像素裁剪就会越界
         // （病例：屏幕下方选区 pxH=80 而非 500）。.exact = 显示器原生像素。
