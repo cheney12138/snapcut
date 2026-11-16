@@ -32,7 +32,11 @@ final class OverlayWindow: NSWindow {
         contentView = view
     }
 
-    /// 诊断：窗口层事件流总闸（定位鼠标事件在哪一层被吞）
+    /// 窗口层事件总闸 + 起拖兜底（用户病例 2026-11-16 三报「唤起后没立马框选」）
+    /// 根因（日志钉死）：mouseDown 落在 keyWin=false 的窗上（key 尚未稳定/
+    /// 光标屏判定竞速）——AppKit 丢弃非 key 窗的 down 到 responder，但拖拽
+    /// 会话继续把 drag 喂给窗（sendEvent 收到、view 收不到）。因此兜底必须
+    /// 在窗层：drag 到达且 view 仍在 waitingForDrag 时，窗直接驱动 view 起拖。
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown, .leftMouseUp, .leftMouseDragged:
@@ -44,6 +48,14 @@ final class OverlayWindow: NSWindow {
                 "active": "\(NSApp.isActive)",
             ])
         default: break
+        }
+        // 起拖兜底（down 或 drag 任一到达 + view 空闲）：view 的 mouseDown/
+        // mouseDragged 在非 key 窗时收不到，窗层补齐（起拖只做一次，view
+        // phase 变化后 guard 挡住）
+        if event.type == .leftMouseDown || event.type == .leftMouseDragged {
+            if let view = contentView as? OverlayView {
+                view.beginDragIfNeeded(from: convert(event.locationInWindow, to: contentView))
+            }
         }
         super.sendEvent(event)
     }
@@ -348,21 +360,17 @@ final class OverlayView: NSView {
 
     // MARK: - 手势
 
-    /// 冻结上屏前的「提前按下」补位（用户病例 2026-11-16：唤起面板立即拖拽
-    /// 无框选——⌘⇧A 冻结 ~180ms 期间 mouseDown 落在未上屏的窗上）。上屏后
-    /// 若主键仍按着，以当前鼠标位置合成框选起点，drag 事件无缝续上。
-    func beginDragIfPrimaryPressed() {
+    /// 窗层兜底起拖（幂等）：down/drag 到达窗时若还没起拖就立即起。
+    /// 覆盖两种丢 mouseDown 的时序：①冻结窗口期按下（窗未上屏）；②按下落在
+    /// keyWin=false 的窗（AppKit 丢弃到 responder 但拖拽会话仍喂窗）。
+    /// 由 OverlayWindow.sendEvent 调用（窗层事件总闸）；view 自己的
+    /// mouseDown 正常路径不受影响（phase guard 幂等）。
+    func beginDragIfNeeded(from point: CGPoint) {
         guard phase == .waitingForDrag else { return }
-        guard let src = CGEventSource(stateID: .combinedSessionState),
-              CGEventSource.buttonState(.combinedSessionState, button: .left) else { return }
-        let loc = NSEvent.mouseLocation
-        let local = window.flatMap { $0.convertPoint(fromScreen: loc) } ?? .zero
-        let point = convert(local, from: nil)
         phase = .dragging(start: point)
         selectionLocal = CGRect(origin: point, size: .zero)
         Log.event(.overlay, "overlay.drag.recover", ["pt": "\(Int(point.x)),\(Int(point.y))"])
         needsDisplay = true
-        _ = src
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -405,17 +413,6 @@ final class OverlayView: NSView {
             "viewId": "\(Unmanaged.passUnretained(self).toOpaque())",
             "sel": "\(Int(selectionLocal.width))x\(Int(selectionLocal.height))",
         ])
-        // 病例（用户 2026-11-16 二报「立即拖拽无框选」）：冻结窗口期的
-        // mouseDown 落在未上屏的窗上，上屏后 drag 序列直接到达（日志 win.event
-        // drag 有流、overlay.mousedown 无）——phase 还在 waitingForDrag。
-        // 这里自动以当前拖拽位起拖（补 mouseDown 语义，松手即正常确认）。
-        if case .waitingForDrag = phase {
-            let point = convert(event.locationInWindow, from: nil)
-            phase = .dragging(start: point)
-            selectionLocal = CGRect(origin: point, size: .zero)
-            Log.event(.overlay, "overlay.drag.recover", ["pt": "\(Int(point.x)),\(Int(point.y))"])
-            needsDisplay = true
-        }
         switch phase {
         case .dragging(let start):
             let point = convert(event.locationInWindow, from: nil)

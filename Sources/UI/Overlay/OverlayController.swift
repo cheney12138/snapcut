@@ -137,7 +137,11 @@ final class OverlayController {
         let cursorScreen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
             ?? NSScreen.main
             ?? NSScreen.screens.first
-        let ordered = NSScreen.screens.sorted { $0 == cursorScreen ? false : true }
+        let ordered = NSScreen.screens.sorted { a, b in
+            if a == cursorScreen { return false }
+            if b == cursorScreen { return true }
+            return false
+        }
         for screen in ordered {
             let window = OverlayWindow(screen: screen, controller: self)
             if let displayID = DisplayRegistry.displayID(of: screen),
@@ -147,10 +151,10 @@ final class OverlayController {
             window.orderFrontRegardless()
             windows.append(window)
         }
-        // 光标屏的窗收 key + 补位起拖（一次 makeKey，其他窗不抢——流畅）
+        // 光标屏的窗收 key（一次 makeKey，其他窗不抢——流畅）。
+        // 起拖兜底已挪到窗层 sendEvent（beginDragIfNeeded），无需上屏补位。
         if let key = windows.first(where: { $0.screen == cursorScreen }) {
             key.makeKey()
-            (key.contentView as? OverlayView)?.beginDragIfPrimaryPressed()
         }
     }
 
