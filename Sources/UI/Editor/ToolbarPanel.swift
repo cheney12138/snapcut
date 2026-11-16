@@ -635,7 +635,8 @@ final class ToolbarPanel: NSPanel {
             return
         }
         guard let tool = EditorSession.Tool(rawValue: sender.tag) else { return }
-        session?.currentTool = tool
+        // 再点已选工具 = 取消回 .none（与数字键同语义：默认无工具拖动=移动）
+        session?.currentTool = (session?.currentTool == tool) ? .none : tool
         Log.event(.editor, "annotate.tool.select", ["tool": tool.label])
         refreshSelectionState()
         onToolChange()
@@ -845,6 +846,7 @@ private final class TBToolButton: TBIconButton {
 
     private static func iconKind(for tool: EditorSession.Tool) -> TBIcon.Kind {
         switch tool {
+        case .none: return .arrow   // none 不建按钮（toolButtons 只建 1-6），fallback
         case .arrow: return .arrow
         case .rect: return .rect
         case .text: return .text
@@ -1170,6 +1172,7 @@ private final class ToolbarTooltipWindow: NSPanel {
 private extension EditorSession.Tool {
     var symbolName: String {
         switch self {
+        case .none: return "arrow.up.right"   // 同上：none 无按钮，fallback
         case .arrow: return "arrow.up.right"
         case .rect: return "square"
         case .text: return "textformat"          // 实际用自绘 "T"（见 TBToolButton）
@@ -1181,6 +1184,7 @@ private extension EditorSession.Tool {
 
     var tipText: String {
         switch self {
+        case .none: return "移动（无工具）"
         case .arrow: return "箭头 1"
         case .rect: return "矩形 2"
         case .text: return "文字 3"

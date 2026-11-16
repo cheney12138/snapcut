@@ -360,6 +360,8 @@ final class CollageEditorContentView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         let a = localToAnnotation(point)
         switch session.currentTool {
+        case .none:
+            break   // 拼贴编辑器的画布即整窗（无选区移动语义），none 空操作
         case .text:
             beginTextEditing(at: a)
         case .sequence:

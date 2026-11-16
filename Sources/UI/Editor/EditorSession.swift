@@ -10,6 +10,9 @@ import CoreGraphics
 @MainActor
 final class EditorSession {
     enum Tool: Int, CaseIterable {
+        /// 无工具（用户裁定 2026-11-16：编辑器默认态——拖动=移动选区；
+        /// 数字键选工具、再按同键取消回 none）
+        case none = 0
         case arrow = 1
         case rect = 2
         case text = 3
@@ -19,6 +22,7 @@ final class EditorSession {
 
         var label: String {
             switch self {
+            case .none: return "移动"
             case .arrow: return "箭头"
             case .rect: return "矩形"
             case .text: return "文字"
@@ -49,7 +53,7 @@ final class EditorSession {
 
     let store = AnnotationStore()
 
-    var currentTool: Tool = .arrow
+    var currentTool: Tool = .none
     var colorIndex = 0
     var strokeWidth: CGFloat = 2   // 连续 2-6pt（工具栏滑杆实时调节；下一个新标注用当前值）
     var toolbarVisible = true

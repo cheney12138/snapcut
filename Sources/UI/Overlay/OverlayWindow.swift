@@ -579,18 +579,14 @@ final class OverlayView: NSView {
             editGesture = .move(startRect: editorRectLocal, startPoint: point)
             return
         }
-        // 2.5) 边缘内侧带（12pt）直接拖 = 整体移动（用户病例 2026-11-16：
-        // 「截图完想移动，结果直接画上箭头」——直觉是拖边缘=挪位置；外缘
-        // 手柄 resize 之外的近边缘区域给 move，选区中心区仍归标注工具）
-        if !spacePressed, nearSelectionEdge(point, band: 12) {
-            editGesture = .move(startRect: editorRectLocal, startPoint: point)
-            return
-        }
 
         // 3) 常规标注：点击在选区外忽略（R7：移出选区不生效）
         guard editorRectLocal.contains(point) else { return }
 
         switch session.currentTool {
+        case .none:
+            // 无工具默认态（用户裁定）：拖动 = 整体移动选区（不用按空格）
+            editGesture = .move(startRect: editorRectLocal, startPoint: point)
         case .text:
             beginTextEditing(at: localToAnnotation(point))
         case .sequence:
@@ -628,14 +624,6 @@ final class OverlayView: NSView {
             )
         }
         needsDisplay = true
-    }
-
-    /// 点是否落在选区边缘内侧 band pt 的环形带内（不算外缘手柄区）
-    private func nearSelectionEdge(_ point: CGPoint, band: CGFloat) -> Bool {
-        let outer = editorRectLocal
-        let inner = outer.insetBy(dx: band, dy: band)
-        guard inner.width > band, inner.height > band else { return false }
-        return outer.contains(point) && !inner.contains(point)
     }
 
     private func handleEditorDragged(_ point: CGPoint) {
@@ -1086,10 +1074,11 @@ final class OverlayView: NSView {
                 super.keyDown(with: event)
             }
         default:
-            // 热键 1-6 直选工具（R6）
+            // 热键 1-6 直选工具（R6）；再按同键取消回 .none（用户裁定
+            // 2026-11-16：默认无工具拖动=移动选区，数字键即取即还）
             if phase == .editing,
                let tool = toolFor(keyCode: Int(event.keyCode)) {
-                editorSession?.currentTool = tool
+                editorSession?.currentTool = (editorSession?.currentTool == tool) ? .none : tool
                 controller.refreshToolbar()
                 needsDisplay = true
                 return
