@@ -230,7 +230,7 @@ final class ToolbarPanel: NSPanel {
         scrollButton.tag = 206
         scrollButton.target = self
         scrollButton.action = #selector(toolTapped(_:))
-        scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 \(self?.hotkeyTip("scroll"))") }
+        scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 \(Self.hotkeyTip("scroll"))") }
         stack.addArrangedSubview(scrollButton)
 
         stack.addArrangedSubview(makeSeparator())
@@ -278,14 +278,14 @@ final class ToolbarPanel: NSPanel {
         undoButton.target = self
         undoButton.action = #selector(actionTapped(_:))
         undoButton.tag = 100
-        undoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.undoButton, text: "撤销 \(self?.hotkeyTip("undo"))") }
+        undoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.undoButton, text: "撤销 \(Self.hotkeyTip("undo"))") }
         stack.addArrangedSubview(undoButton)
 
         redoButton = TBIconButton(icon: .redo, fallback: "↪︎")
         redoButton.target = self
         redoButton.action = #selector(actionTapped(_:))
         redoButton.tag = 101
-        redoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.redoButton, text: "重做 \(self?.hotkeyTip("redo"))") }
+        redoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.redoButton, text: "重做 \(Self.hotkeyTip("redo"))") }
         stack.addArrangedSubview(redoButton)
 
         stack.addArrangedSubview(makeSeparator())
@@ -295,14 +295,14 @@ final class ToolbarPanel: NSPanel {
         ocr.tag = 204
         ocr.target = self
         ocr.action = #selector(actionTapped(_:))
-        ocr.onHover = { [weak self] inside in self?.handleHover(inside, button: ocr, text: "取字 \(self?.hotkeyTip("ocr"))") }
+        ocr.onHover = { [weak self] inside in self?.handleHover(inside, button: ocr, text: "取字 \(Self.hotkeyTip("ocr"))") }
         stack.addArrangedSubview(ocr)
 
         let pin = TBIconButton(icon: .pin, fallback: "钉")
         pin.tag = 205
         pin.target = self
         pin.action = #selector(actionTapped(_:))
-        pin.onHover = { [weak self] inside in self?.handleHover(inside, button: pin, text: "贴图 \(self?.hotkeyTip("pin"))") }
+        pin.onHover = { [weak self] inside in self?.handleHover(inside, button: pin, text: "贴图 \(Self.hotkeyTip("pin"))") }
         stack.addArrangedSubview(pin)
 
         let eye = TBIconButton(icon: .eye, fallback: "眼")
@@ -310,7 +310,7 @@ final class ToolbarPanel: NSPanel {
         eyeButton = eye
         eye.target = self
         eye.action = #selector(actionTapped(_:))
-        eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 \(self?.hotkeyTip("toggleVisibility"))") }
+        eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 \(Self.hotkeyTip("toggleVisibility"))") }
         stack.addArrangedSubview(eye)
 
         stack.addArrangedSubview(makeSeparator())
@@ -321,21 +321,21 @@ final class ToolbarPanel: NSPanel {
         copy.tag = 201
         copy.target = self
         copy.action = #selector(actionTapped(_:))
-        copy.onHover = { [weak self] inside in self?.handleHover(inside, button: copy, text: "复制并完成 \(self?.hotkeyTip("done"))") }
+        copy.onHover = { [weak self] inside in self?.handleHover(inside, button: copy, text: "复制并完成 \(Self.hotkeyTip("done"))") }
         stack.addArrangedSubview(copy)
 
         let save = TBIconButton(icon: .save, fallback: "存")
         save.tag = 202
         save.target = self
         save.action = #selector(actionTapped(_:))
-        save.onHover = { [weak self] inside in self?.handleHover(inside, button: save, text: "保存 \(self?.hotkeyTip("save"))") }
+        save.onHover = { [weak self] inside in self?.handleHover(inside, button: save, text: "保存 \(Self.hotkeyTip("save"))") }
         stack.addArrangedSubview(save)
 
         let close = TBIconButton(icon: .cancel, fallback: "×")
         close.tag = 203
         close.target = self
         close.action = #selector(actionTapped(_:))
-        close.onHover = { [weak self] inside in self?.handleHover(inside, button: close, text: "取消 \(self?.hotkeyTip("cancel"))") }
+        close.onHover = { [weak self] inside in self?.handleHover(inside, button: close, text: "取消 \(Self.hotkeyTip("cancel"))") }
         stack.addArrangedSubview(close)
 
         contentView = outer
@@ -587,7 +587,7 @@ final class ToolbarPanel: NSPanel {
 
     /// 编辑器热键 tooltip 文案：当前设置值（用户病例 2026-11-16「贴图改 t 了
     /// toolbar 还显示 p」）——硬编码快捷键全部改为实时读
-    private func hotkeyTip(_ action: String) -> String {
+    private static func hotkeyTip(_ action: String) -> String {
         let combo = AppCoordinatorShared.coordinator?.settings.editorHotkey(for: action) ?? ""
         return HotkeySpec.display(combo)
     }
