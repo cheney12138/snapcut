@@ -19,11 +19,14 @@ final class EditorSession {
         case mosaic = 4
         case sequence = 5
         case highlight = 6
+        /// 椭圆/圆（圆心起拖：用户裁定 2026-11-16 新增「圆心圈选」）
+        case ellipse = 7
 
         var label: String {
             switch self {
             case .none: return "移动"
             case .arrow: return "箭头"
+            case .ellipse: return "椭圆"
             case .rect: return "矩形"
             case .text: return "文字"
             case .mosaic: return "马赛克"

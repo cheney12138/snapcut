@@ -622,6 +622,14 @@ final class OverlayView: NSView {
                 shape: .highlight(from: localToAnnotation(point), to: localToAnnotation(point)),
                 colorIndex: session.colorIndex, strokeWidth: session.strokeWidth, text: nil, index: nil
             )
+        case .ellipse:
+            // 圆心圈选：按下点 = 圆心，拖动半径实时更新
+            pendingStartPoint = localToAnnotation(point)
+            let c = localToAnnotation(point)
+            pendingAnnotation = AnnotationModel(
+                shape: .ellipse(center: c, radiusX: 0, radiusY: 0),
+                colorIndex: session.colorIndex, strokeWidth: session.strokeWidth, text: nil, index: nil
+            )
         }
         needsDisplay = true
     }
@@ -659,6 +667,12 @@ final class OverlayView: NSView {
             pending.shape = .rect(rectFromPoints(pendingStartPoint ?? a, a))
         case .mosaic:
             pending.shape = .mosaic(rectFromPoints(pendingStartPoint ?? a, a))
+        case .ellipse(let center, _, _):
+            pending.shape = .ellipse(
+                center: center,
+                radiusX: a.x - center.x,
+                radiusY: a.y - center.y
+            )
         default:
             break
         }
@@ -793,6 +807,9 @@ final class OverlayView: NSView {
             let rect = rectFromPoints(pendingStartPoint ?? a, a)
             if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return false }
             final.shape = .mosaic(rect)
+        case .ellipse(let center, let rx, let ry):
+            if abs(rx) < 2 || abs(ry) < 2 { pendingAnnotation = nil; needsDisplay = true; return false }
+            final.shape = .ellipse(center: center, radiusX: rx, radiusY: ry)
         default: return false
         }
         Log.event(.editor, "editor.shape.commit", [

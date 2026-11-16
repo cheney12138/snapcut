@@ -107,6 +107,7 @@ enum EditorKeyRouter {
             kVK_ANSI_4: .mosaic,
             kVK_ANSI_5: .sequence,
             kVK_ANSI_6: .highlight,
+            kVK_ANSI_7: .ellipse,
         ]
         return map[keyCode]
     }

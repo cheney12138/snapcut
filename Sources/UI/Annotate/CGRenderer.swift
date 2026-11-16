@@ -93,7 +93,18 @@ enum CGRenderer {
             context.move(to: from)
             context.addLine(to: to)
             context.strokePath()
+
+        case .ellipse(let center, let radiusX, let radiusY):
+            // 圆心圈选：center 起拖至边缘（用户裁定 2026-11-16 新增）
+            context.setStrokeColor(color.cgColor)
+            context.setLineWidth(width)
+            let r = CGRect(
+                x: center.x - abs(radiusX), y: center.y - abs(radiusY),
+                width: abs(radiusX) * 2, height: abs(radiusY) * 2)
+            context.strokeEllipse(in: normalized(r))
         }
+        // ⚠️ 翻转上下文（Y-down 宿主）里椭圆中心坐标与其他 shape 一致——
+        // 都在标注本地坐标系，无需单独处理
         context.restoreGState()
     }
 

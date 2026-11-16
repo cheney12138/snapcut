@@ -215,7 +215,7 @@ final class ToolbarPanel: NSPanel {
 
         // 1) 6 个绘图工具 + 滚动截图入口（用户裁定：进工具组，R6 六工具不破——
         //    滚动是动作不是标注工具，不占 EditorSession.Tool 序号，tag 206）
-        for tool in EditorSession.Tool.allCases {
+        for tool in EditorSession.Tool.allCases where tool != .none {
             let button = TBToolButton(tool: tool)
             button.target = self
             button.action = #selector(toolTapped(_:))
@@ -227,7 +227,7 @@ final class ToolbarPanel: NSPanel {
         scrollButton.tag = 206
         scrollButton.target = self
         scrollButton.action = #selector(toolTapped(_:))
-        scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 S") }
+        scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 \(self?.hotkeyTip("scroll"))") }
         stack.addArrangedSubview(scrollButton)
 
         stack.addArrangedSubview(makeSeparator())
@@ -275,14 +275,14 @@ final class ToolbarPanel: NSPanel {
         undoButton.target = self
         undoButton.action = #selector(actionTapped(_:))
         undoButton.tag = 100
-        undoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.undoButton, text: "撤销 ⌘Z") }
+        undoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.undoButton, text: "撤销 \(self?.hotkeyTip("undo"))") }
         stack.addArrangedSubview(undoButton)
 
         redoButton = TBIconButton(icon: .redo, fallback: "↪︎")
         redoButton.target = self
         redoButton.action = #selector(actionTapped(_:))
         redoButton.tag = 101
-        redoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.redoButton, text: "重做 ⇧⌘Z") }
+        redoButton.onHover = { [weak self] inside in self?.handleHover(inside, button: self?.redoButton, text: "重做 \(self?.hotkeyTip("redo"))") }
         stack.addArrangedSubview(redoButton)
 
         stack.addArrangedSubview(makeSeparator())
@@ -292,14 +292,14 @@ final class ToolbarPanel: NSPanel {
         ocr.tag = 204
         ocr.target = self
         ocr.action = #selector(actionTapped(_:))
-        ocr.onHover = { [weak self] inside in self?.handleHover(inside, button: ocr, text: "取字 O") }
+        ocr.onHover = { [weak self] inside in self?.handleHover(inside, button: ocr, text: "取字 \(self?.hotkeyTip("ocr"))") }
         stack.addArrangedSubview(ocr)
 
         let pin = TBIconButton(icon: .pin, fallback: "钉")
         pin.tag = 205
         pin.target = self
         pin.action = #selector(actionTapped(_:))
-        pin.onHover = { [weak self] inside in self?.handleHover(inside, button: pin, text: "贴图 P") }
+        pin.onHover = { [weak self] inside in self?.handleHover(inside, button: pin, text: "贴图 \(self?.hotkeyTip("pin"))") }
         stack.addArrangedSubview(pin)
 
         let eye = TBIconButton(icon: .eye, fallback: "眼")
@@ -307,7 +307,7 @@ final class ToolbarPanel: NSPanel {
         eyeButton = eye
         eye.target = self
         eye.action = #selector(actionTapped(_:))
-        eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 H") }
+        eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 \(self?.hotkeyTip("toggleVisibility"))") }
         stack.addArrangedSubview(eye)
 
         stack.addArrangedSubview(makeSeparator())
@@ -318,21 +318,21 @@ final class ToolbarPanel: NSPanel {
         copy.tag = 201
         copy.target = self
         copy.action = #selector(actionTapped(_:))
-        copy.onHover = { [weak self] inside in self?.handleHover(inside, button: copy, text: "复制并完成 ↩") }
+        copy.onHover = { [weak self] inside in self?.handleHover(inside, button: copy, text: "复制并完成 \(self?.hotkeyTip("done"))") }
         stack.addArrangedSubview(copy)
 
         let save = TBIconButton(icon: .save, fallback: "存")
         save.tag = 202
         save.target = self
         save.action = #selector(actionTapped(_:))
-        save.onHover = { [weak self] inside in self?.handleHover(inside, button: save, text: "保存 ⌘S") }
+        save.onHover = { [weak self] inside in self?.handleHover(inside, button: save, text: "保存 \(self?.hotkeyTip("save"))") }
         stack.addArrangedSubview(save)
 
         let close = TBIconButton(icon: .cancel, fallback: "×")
         close.tag = 203
         close.target = self
         close.action = #selector(actionTapped(_:))
-        close.onHover = { [weak self] inside in self?.handleHover(inside, button: close, text: "取消 Esc") }
+        close.onHover = { [weak self] inside in self?.handleHover(inside, button: close, text: "取消 \(self?.hotkeyTip("cancel"))") }
         stack.addArrangedSubview(close)
 
         contentView = outer
@@ -581,6 +581,13 @@ final class ToolbarPanel: NSPanel {
     }
 
     // MARK: - 状态刷新
+
+    /// 编辑器热键 tooltip 文案：当前设置值（用户病例 2026-11-16「贴图改 t 了
+    /// toolbar 还显示 p」）——硬编码快捷键全部改为实时读
+    private func hotkeyTip(_ action: String) -> String {
+        let combo = AppCoordinatorShared.coordinator?.settings.editorHotkey(for: action) ?? ""
+        return HotkeySpec.display(combo)
+    }
 
     func refreshSelectionState() {
         guard let session else { return }
@@ -846,7 +853,8 @@ private final class TBToolButton: TBIconButton {
 
     private static func iconKind(for tool: EditorSession.Tool) -> TBIcon.Kind {
         switch tool {
-        case .none: return .arrow   // none 不建按钮（toolButtons 只建 1-6），fallback
+        case .none: return .arrow   // none 不建按钮，fallback
+        case .ellipse: return .ellipse
         case .arrow: return .arrow
         case .rect: return .rect
         case .text: return .text
@@ -1173,6 +1181,7 @@ private extension EditorSession.Tool {
     var symbolName: String {
         switch self {
         case .none: return "arrow.up.right"   // 同上：none 无按钮，fallback
+        case .ellipse: return "circle"
         case .arrow: return "arrow.up.right"
         case .rect: return "square"
         case .text: return "textformat"          // 实际用自绘 "T"（见 TBToolButton）
@@ -1185,6 +1194,7 @@ private extension EditorSession.Tool {
     var tipText: String {
         switch self {
         case .none: return "移动（无工具）"
+        case .ellipse: return "椭圆 7"
         case .arrow: return "箭头 1"
         case .rect: return "矩形 2"
         case .text: return "文字 3"

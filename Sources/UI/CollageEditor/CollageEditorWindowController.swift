@@ -391,6 +391,14 @@ final class CollageEditorContentView: NSView {
                 text: nil, index: nil
             )
             needsDisplay = true
+        case .ellipse:
+            // 圆心圈选（与截图编辑器同款语义）
+            pendingStartPoint = a
+            pendingAnnotation = AnnotationModel(
+                shape: .ellipse(center: a, radiusX: 0, radiusY: 0),
+                colorIndex: session.colorIndex, strokeWidth: session.strokeWidth, text: nil, index: nil
+            )
+            needsDisplay = true
         }
     }
 
@@ -406,6 +414,9 @@ final class CollageEditorContentView: NSView {
             pending.shape = .rect(rectFromPoints(start, a))
         case .mosaic:
             pending.shape = .mosaic(rectFromPoints(start, a))
+        case .ellipse(let center, _, _):
+            pending.shape = .ellipse(
+                center: center, radiusX: a.x - center.x, radiusY: a.y - center.y)
         default:
             break
         }
@@ -440,6 +451,9 @@ final class CollageEditorContentView: NSView {
             let rect = rectFromPoints(pendingStartPoint ?? a, a)
             guard rect.width >= 3, rect.height >= 3 else { cancelPending(); return false }
             final.shape = .mosaic(rect)
+        case .ellipse(let center, let rx, let ry):
+            guard abs(rx) >= 2, abs(ry) >= 2 else { cancelPending(); return false }
+            final.shape = .ellipse(center: center, radiusX: rx, radiusY: ry)
         default:
             return false
         }

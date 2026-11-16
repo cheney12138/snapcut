@@ -13,7 +13,7 @@ import CoreGraphics
 enum TBIcon {
     /// 图标全集（tag 顺序 = 设计稿工具栏序）
     enum Kind {
-        case arrow, rect, text, mosaic, sequence, highlight
+        case arrow, rect, text, mosaic, sequence, highlight, ellipse
         case undo, redo, ocr, pin, eye
         case save, cancel, copy, scroll
     }
@@ -76,6 +76,12 @@ enum TBIcon {
             let p = CGPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerWidth: r, cornerHeight: r, transform: nil)
             stroke(p, alpha: alpha)
         }
+        func strokeEllipseAt(_ cx: CGFloat, _ cy: CGFloat, rx: CGFloat, ry: CGFloat) {
+            let p = CGMutablePath()
+            p.addEllipse(in: CGRect(x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2))
+            stroke(p)
+        }
+
         func strokeCircle(_ cx: CGFloat, _ cy: CGFloat, r: CGFloat) {
             let p = CGMutablePath()
             p.addArc(center: CGPoint(x: cx, y: cy), radius: r, startAngle: 0, endAngle: .pi * 2, clockwise: false)
@@ -214,6 +220,11 @@ enum TBIcon {
             back.addCurve(to: CGPoint(x: 3.9, y: 10.1), control1: CGPoint(x: 2.3, y: 9.4), control2: CGPoint(x: 3.1, y: 10.1))
             back.addLine(to: CGPoint(x: 5.5, y: 10.1))
             stroke(back)
+        case .ellipse:
+            // 椭圆工具（7）：圆 + 中心点（圆心圈选语义）
+            strokeEllipseAt(8, 8, rx: 5.2, ry: 4.2)
+            strokeLine(7.2, 8, 8.8, 8)
+            strokeLine(8, 7.2, 8, 8.8)
         case .scroll:
             // 滚动截图（设计稿无此按钮，新增同风格自绘：长条选区 + 下生长箭头）
             strokeRoundedRect(3, 2.5, 10, 11, r: 1.6)

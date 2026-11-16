@@ -13,6 +13,8 @@ struct AnnotationModel: Equatable {
         case mosaic(CGRect)
         case sequence(anchor: CGPoint)   // 序号：1,2,3... 自动递增
         case highlight(from: CGPoint, to: CGPoint) // 高亮笔（半透明粗线）
+        /// 椭圆/圆（center 起拖到边缘：用户裁定「圆心圈选」；rect 为外接矩形）
+        case ellipse(center: CGPoint, radiusX: CGFloat, radiusY: CGFloat)
     }
 
     var shape: Shape
@@ -49,6 +51,11 @@ struct AnnotationModel: Equatable {
             copy.shape = .highlight(
                 from: CGPoint(x: from.x + dx, y: from.y + dy),
                 to: CGPoint(x: to.x + dx, y: to.y + dy)
+            )
+        case .ellipse(let center, let radiusX, let radiusY):
+            copy.shape = .ellipse(
+                center: CGPoint(x: center.x + dx, y: center.y + dy),
+                radiusX: radiusX, radiusY: radiusY
             )
         }
         return copy
