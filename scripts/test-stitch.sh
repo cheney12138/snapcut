@@ -11,7 +11,7 @@ echo "[test-stitch] 编译 (swift-version 6, -Wall)..."
 # 注：本机 Swift 6.3 工具链已移除 -Wall 参数（unknown argument），改用
 # 默认告警集 + -warnings-as-errors，效果等同且更严格：任何 warning 都判失败。
 swiftc -swift-version 6 -warnings-as-errors -O \
-    Sources/Scroll/Stitcher.swift \
+    Sources/Core/Domain/Stitcher.swift \
     scripts/TestStitchMain.swift \
     -o "$OUT_DIR/test-stitch"
 

@@ -58,11 +58,18 @@ final class OverlayController {
     private var scrollBottomWork: DispatchWorkItem?
     /// 拼接进度（最新帧净贡献占比，驱动 HUD 进度条）
     private var scrollProgress: CGFloat = 0
-    /// 前一帧行签名缓存（到底判定 / 区域生长的重叠检测用）
-    private var scrollPrevBuffer: PixelBuffer?
+    /// 参考帧缓冲 = 最后一帧入拼接序列的帧（静止判定 / 区域生长的重叠检测基准）。
+    /// ⚠️ 必须与「上一交付帧」区分：慢滚/滚动中停顿的交付帧与上一帧近似但与参
+    /// 考帧有净贡献——拿上一交付帧做基准会把慢滚全部误判静止丢帧（病例：用户
+    /// 滚动 11s 只有 2 帧，交 delivered=3 计 frames=2）。仅在入列时更新。
+    private var scrollRefBuffer: PixelBuffer?
     /// 本次采集是否观测到过真实滚动（净贡献 > 0）：到底自动合成的前置条件——
     /// 从未滚动就静止 ≠ 到底（用户在读屏定位），不能自动合成
     private var scrollEverScrolled = false
+    /// 进入滚动采集时的原选区（grow 之前）：拼接失败回退单帧时恢复它，
+    /// 而不是保留 grow 后的选区（病例：grow 扩到全屏 → compose 失败 →
+    /// enter.fromScroll pxH=2098 pxW=3840 全屏选区，另一屏也被框住）
+    private var scrollInitialSelection: CGRect?
     /// 滚动会话专用热键（采集态焦点在别的 App，普通 keyDown 收不到——e2e 实测病例）
     /// ⚠️ 终止键 = settings.editorHotkeys["scroll"]（默认 s）+ Enter；取消 = Esc
     private var scrollFinishHotKey: UInt32?
@@ -284,11 +291,17 @@ final class OverlayController {
         scrollHUD?.hide()
         scrollHUD = nil
         scrollFrames = []
-        scrollPrevBuffer = nil
+        scrollRefBuffer = nil
+        scrollInitialSelection = nil
         scrollBottomDetected = false
         scrollNoProgressCount = 0
         scrollProgress = 0
-        for window in windows { window.exitScrollMode() }
+        // 焦点屏语义：滚动态只可能挂在 scrollScreen 上，其余屏窗口不换态
+        // （防御：scrollScreen 为空时仍全量清扫，保证会话结束无残留）
+        let focal = scrollScreen
+        for window in windows where focal == nil || window.owningScreen == focal {
+            window.exitScrollMode()
+        }
     }
 
     private func unregisterScrollHotKeys() {
@@ -623,11 +636,12 @@ final class OverlayController {
         }
         scrollFrames = []
         scrollSelectionRect = rect
+        scrollInitialSelection = rect
         scrollScreen = screen
         scrollNoProgressCount = 0
         scrollBottomDetected = false
         scrollProgress = 0
-        scrollPrevBuffer = nil
+        scrollRefBuffer = nil
         scrollEverScrolled = false
 
         // 编辑态 UI 退场（会话保留）
@@ -658,7 +672,13 @@ final class OverlayController {
         }
     }
 
-    /// 采集态收尾热键：editorHotkeys["scroll"]（默认 s，可自定义/清空）+ Enter 兕底
+    /// 采集态收尾热键：editorHotkeys["scroll"]（默认 s，可自定义/清空）+ Enter 兕底。
+    /// ⚠️ 热键活到 compose 完/失败为止（unregister 挪到 enterEditorAfterScroll /
+    /// teardownScrollSession）——compose 是 stop 之后的异步窗口期（卡 10s 病例），
+    /// stop 时就撤会让用户在整个 compose 期按 Enter/Esc 全无反应。
+    /// compose 期间（isScrollComposing）S/Enter/Esc 一律吞掉：Enter=手动收尾只在
+    /// 采集态有效；此时 editorSession 还挂着旧底图，任何收尾/取消动作都会把
+    /// 合成结果弄丢（病例：scroll.compose.begin 后 editor.hotkey done → noSession）。
     private func registerScrollHotKeys() {
         unregisterScrollHotKeys()
         let center = CarbonHotKeyCenter.shared
@@ -667,47 +687,101 @@ final class OverlayController {
         if !combo.isEmpty, let spec = HotkeySpec.parse(combo, allowBare: true) {
             scrollFinishHotKey = center.register(
                 keyCode: Int(spec.keyCode), modifiers: EditorKeyRouter.nsEventFlags(spec.modifiers)
-            ) { [weak self] in self?.finishScrollCapture(mode: .manual) }
+            ) { [weak self] in self?.finishHotKeyFired() }
         }
         scrollFinishReturnHotKey = center.register(
             keyCode: kVK_Return, modifiers: []
-        ) { [weak self] in self?.finishScrollCapture(mode: .manual) }
+        ) { [weak self] in self?.finishHotKeyFired() }
         scrollCancelHotKey = center.register(
             keyCode: kVK_Escape, modifiers: []
-        ) { [weak self] in self?.cancelScrollCapture() }
-    }
-
-    // MARK: 采样帧处理：区域生长 + 到底判定
-
-    private func handleScrollFrame(_ frame: CGImage) {
-        let buffer = PixelBuffer(cgImage: frame)
-        defer { scrollPrevBuffer = buffer }
-
-        if let prev = scrollPrevBuffer {
-            if Self.framesNearIdentical(prev, buffer) {
-                // 静止帧（没滚动 / 已到底）：不入拼接序列。
-                // ⚠️ 完全相同的帧会让 Stitcher.findOverlap 无解（它要求 cur 至少
-                // 净贡献 1 行 ⇒ 排除 d=0 的真实对齐）⇒ stitch.noOverlap ——
-                // 静止 ≠ 失败：丢弃重复帧继续采，只累计到底判定（病例：用户
-                // 进采集态后先读了 0.8s 屏，帧 2/3 与帧 1 全同 ⇒ 拼接直接炸）。
-                scrollNoProgressCount += 1
-                scrollProgress = 0
-                scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
-                if scrollNoProgressCount >= DesignTokens.Scroll.bottomConfirmSamples {
-                    detectScrollBottom()
-                }
+        ) { [weak self] in
+            guard let self else { return }
+            if self.isScrollComposing {
+                Log.event(.scroll, "scroll.composing.ignoreKey", ["key": "esc"])
                 return
             }
-            scrollNoProgressCount = 0
-            scrollBottomDetected = false
-            growRegionIfPossible(prev: prev, cur: buffer, frame: frame)
+            self.cancelScrollCapture()
         }
+    }
+
+    /// 收尾热键公共入口：compose 期忽略，采集态手动收尾
+    private func finishHotKeyFired() {
+        if isScrollComposing {
+            Log.event(.scroll, "scroll.composing.ignoreKey", ["key": "enter"])
+            return
+        }
+        finishScrollCapture(mode: .manual)
+    }
+
+    // MARK: 采样帧处理：净贡献帧序列 + 到底判定
+
+    /// 采样帧入列。拼接序列只收「净贡献帧」：
+    /// ① 首帧直接入列；② 与参考帧（上一入列帧）近似 ⇒ 静止，不入列只累计到底判定；
+    /// ③ 与参考帧能找到可信重叠（findOverlap 成功）⇒ 入列 + 区域生长；
+    /// ④ 找不到可信重叠（跳屏/内容突变）⇒ 不入列——否则 compose 必败
+    ///   （病例：1 静止帧 + 1 滚动新帧凑成 2 帧序列，中间内容全丢 ⇒ stitch.noOverlap）。
+    /// 慢滚不再被 0.98 阈值误杀：判静止阈值降到 0.95，且基准是参考帧而不是上一
+    /// 交付帧，滚动中停顿/慢滚的净贡献帧正常计入（HUD 帧数该涨）。
+    private func handleScrollFrame(_ frame: CGImage) {
+        // stop 之后在途帧不入列（拼接序列已定格；且 scrollFrames/refBuffer 已清空，
+        // 此时入列会被当成下个会话的首帧污染状态）
+        guard scrollController != nil else {
+            Log.event(.scroll, "scroll.frame.dropAfterStop")
+            return
+        }
+        let buffer = PixelBuffer(cgImage: frame)
+        guard let ref = scrollRefBuffer else {
+            scrollRefBuffer = buffer
+            scrollFrames.append(frame)
+            Log.event(.scroll, "scroll.frame.n", ["n": "1"])
+            scrollHUD?.update(frames: scrollFrames.count, progress: 0)
+            return
+        }
+        if Self.framesNearIdentical(ref, buffer) {
+            // 静止帧（没滚动 / 已到底）：不入拼接序列。
+            // ⚠️ 完全相同的帧会让 Stitcher.findOverlap 无解（它要求 cur 至少
+            // 净贡献 1 行 ⇒ 排除 d=0 的真实对齐）⇒ stitch.noOverlap ——
+            // 静止 ≠ 失败：丢弃重复帧继续采，只累计到底判定（病例：用户
+            // 进采集态后先读了 0.8s 屏，帧 2/3 与帧 1 全同 ⇒ 拼接直接炸）。
+            scrollNoProgressCount += 1
+            scrollProgress = 0
+            scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
+            if scrollNoProgressCount >= DesignTokens.Scroll.bottomConfirmSamples {
+                detectScrollBottom()
+            }
+            return
+        }
+        // 与参考帧找可信重叠：成功才入列（净贡献帧序列，stitch 的相邻对全部预验证）
+        let overlap: Int
+        do {
+            overlap = try Stitcher.findOverlap(
+                prev: ref, cur: buffer, options: Stitcher.Options(), frameIndex: scrollFrames.count
+            ).overlap
+        } catch {
+            // 跳屏（0.4s 内滚超过一帧）/ 内容突变：与参考帧无重叠，本帧不可拼接，
+            // 丢弃不计数（不算静止，不推进到底判定）
+            Log.event(.scroll, "scroll.frame.skipNoOverlap", [
+                "afterN": "\(scrollFrames.count)", "err": "\(error.localizedDescription)",
+            ])
+            scrollProgress = 0
+            scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
+            return
+        }
+        scrollNoProgressCount = 0
+        scrollBottomDetected = false
+        growRegionIfPossible(ref: ref, cur: buffer, frame: frame, overlap: overlap)
+        scrollRefBuffer = buffer
         scrollFrames.append(frame)
         Log.event(.scroll, "scroll.frame.n", ["n": "\(scrollFrames.count)"])
         scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
     }
 
-    /// 两帧是否几乎一致（抽 60 行签名比对，≥98% 行匹配 = 没滚动）
+    /// 两帧是否几乎一致（抽 60 行签名比对，≥95% 行匹配 = 没滚动）。
+    /// 0.98 病例：慢速滚动 / 滚动中停顿被误判静止 ⇒ 11s 采样只入列 2 帧
+    /// （用户实测 2026-11-17 日志：sampler.stop delivered=3 vs frames=2），
+    /// 降到 0.95 让真实新帧计入。
+    private static let nearIdenticalRowRatio: CGFloat = 0.95
+
     private static func framesNearIdentical(_ a: PixelBuffer, _ b: PixelBuffer) -> Bool {
         guard a.height == b.height, a.width == b.width else { return false }
         let threshold = Stitcher.Options().rowDiffThreshold
@@ -722,22 +796,17 @@ final class OverlayController {
             }
             row += stride
         }
-        return total > 0 && CGFloat(matched) / CGFloat(total) >= 0.98
+        return total > 0 && CGFloat(matched) / CGFloat(total) >= nearIdenticalRowRatio
     }
 
-    /// 区域生长：与上一帧找可信重叠 → 净贡献行数（px）→ pt，选区向下扩展；
-    /// 同时更新覆盖层画布矩形与 HUD 位置。找不到可信重叠的本帧不生长。
-    private func growRegionIfPossible(prev: PixelBuffer, cur: PixelBuffer, frame: CGImage) {
+    /// 区域生长：用预计算的重叠行数 → 净贡献行数（px）→ pt，选区向下扩展；
+    /// 同时更新覆盖层画布矩形与 HUD 位置。
+    /// 焦点屏语义：grow 只允许在 selectionScreen 内（clamp 到 screen.frame），
+    /// 绝不跨屏把相邻显示器算进选区。
+    private func growRegionIfPossible(
+        ref: PixelBuffer, cur: PixelBuffer, frame: CGImage, overlap: Int
+    ) {
         guard let screen = scrollScreen, let rect = scrollSelectionRect else { return }
-        let overlap: Int
-        do {
-            overlap = try Stitcher.findOverlap(
-                prev: prev, cur: cur, options: Stitcher.Options(), frameIndex: scrollFrames.count
-            ).overlap
-        } catch {
-            scrollProgress = 0
-            return
-        }
         let contributedPx = cur.height - overlap
         scrollProgress = CGFloat(contributedPx) / CGFloat(max(1, cur.height))
         guard contributedPx > 0 else { return }
@@ -746,15 +815,21 @@ final class OverlayController {
         let scale = CGFloat(frame.width) / max(1, rect.width)
         let growPt = CGFloat(contributedPx) / max(scale, 0.001)
         var newRect = rect
-        // 采集区域不能长出屏幕（SCK 裁剪会越界）；到屏底后交给到底判定
-        newRect.size.height = min(rect.height + growPt, screen.frame.maxY - rect.minY)
+        // 采集区域不能长出屏幕（SCK 裁剪会越界）；到屏底后交给到底判定；
+        // x/宽 clamp 保证永不越出焦点屏（双屏病例：另一屏 1920 被算进选区宽）
+        let bounds = screen.frame
+        newRect.size.height = min(rect.height + growPt, bounds.maxY - rect.minY)
+        newRect.origin.x = max(bounds.minX, min(newRect.origin.x, bounds.maxX - newRect.width))
         if abs(newRect.height - rect.height) >= 0.5 {
             scrollSelectionRect = newRect
             for window in windows where window.owningScreen == screen {
                 window.updateScrollRegion(newRect)
             }
             scrollHUD?.reposition(below: newRect, on: screen)
-            Log.event(.scroll, "scroll.region.grow", ["ptH": "\(Int(newRect.height))"])
+            Log.event(.scroll, "scroll.region.grow", [
+                "ptH": "\(Int(newRect.height))",
+                "screen": "\(Int(bounds.width))x\(Int(bounds.height))@\(Int(bounds.minX)),\(Int(bounds.minY))",
+            ])
         }
     }
 
@@ -810,15 +885,16 @@ final class OverlayController {
         case autoBottom    // 到底 0.6s 自动
     }
 
-    /// 收尾：停采样 → 后台拼接 → 合成长图进标注编辑器（与普通截图同一条流：
-    /// Enter/⌘S/工具 1–6/撤销栈含长图整体）
+    /// 收尾：停采样 → 后台拼接（≤ composeTimeout，超时回退单帧）→ 合成长图进
+    /// 标注编辑器（与普通截图同一条流：Enter/⌘S/工具 1–6/撤销栈含长图整体）。
+    /// ⚠️ 收尾热键在 compose 期不撤（活到 enterEditorAfterScroll / teardown），
+    /// 但回调里吞掉——用户在整个 compose 期按键不能无反应也不能破坏会话。
     private func finishScrollCapture(mode: ScrollFinishMode) {
         guard let controller = scrollController else { return }
         scrollBottomWork?.cancel()
         scrollBottomWork = nil
         controller.stop()
         scrollController = nil
-        unregisterScrollHotKeys()
         scrollHUD?.hide()
         scrollHUD = nil
 
@@ -826,9 +902,13 @@ final class OverlayController {
         let selection = scrollSelectionRect
         let screen = scrollScreen
         scrollFrames = []
-        scrollPrevBuffer = nil
+        scrollRefBuffer = nil
         scrollBottomDetected = false
-        for window in windows { window.exitScrollMode() }
+        // 焦点屏语义：只退焦点屏窗口的滚动态（其余屏从未进入）
+        let focal = scrollScreen
+        for window in windows where focal == nil || window.owningScreen == focal {
+            window.exitScrollMode()
+        }
 
         guard frames.count > 0, let selection, let screen else {
             Log.error(.scroll, "scroll.compose.fail", ["err": "no frames"])
@@ -839,23 +919,62 @@ final class OverlayController {
             "frames": "\(frames.count)", "mode": mode == .autoBottom ? "auto" : "manual",
         ])
         // 拼接窗口期：编辑器键全吞（OverlayView.keyDown 检查 isScrollComposing），
-        // 防 Enter→done / Esc→cancel 在回填前销毁 editorSession
+        // 防 Enter→done / Esc→cancel 在回填前销毁 editorSession；收尾热键同样吞
         isScrollComposing = true
+        let timeoutNs = UInt64(DesignTokens.Scroll.composeTimeout * 1_000_000_000)
+        let composeStart = DispatchTime.now()
         Task { @MainActor in
-            let result = try? await Task.detached(priority: .userInitiated) {
-                try Stitcher.stitch(frames: frames)
-            }.value
-            if let result {
+            enum ComposeOutcome {
+                case done(Stitcher.Result)
+                case timeout
+                case failed
+            }
+            let outcome: ComposeOutcome = await withTaskGroup(of: ComposeOutcome.self) { group in
+                group.addTask {
+                    if let result = try? Stitcher.stitch(frames: frames) {
+                        return .done(result)
+                    }
+                    return .failed
+                }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: timeoutNs)
+                    return .timeout
+                }
+                let first = await group.next() ?? ComposeOutcome.timeout
+                group.cancelAll()
+                return first
+            }
+            let elapsedMs = Int(
+                Double(DispatchTime.now().uptimeNanoseconds - composeStart.uptimeNanoseconds)
+                    / 1_000_000
+            )
+            switch outcome {
+            case .done(let result):
                 Log.event(.scroll, "scroll.compose.done", [
                     "pxW": "\(result.image.width)", "pxH": "\(result.image.height)",
-                    "seams": "\(result.seams.count)",
+                    "seams": "\(result.seams.count)", "ms": "\(elapsedMs)",
                 ])
                 self.enterEditorAfterScroll(image: result.image, selection: selection, screen: screen)
-            } else {
-                // 拼接失败（静止画面/无可信重叠）：明确回退单帧进编辑器 + toast 告知
-                Log.error(.scroll, "scroll.compose.fail", ["err": "stitch.noOverlap"])
+            case .timeout:
+                // 卡死保险丝：拼帧超时（病例：10s 无反馈）⇒ 回退单帧，不让用户干等
+                Log.error(.scroll, "scroll.compose.fail", [
+                    "err": "compose.timeout", "timeoutMs": "\(Int(DesignTokens.Scroll.composeTimeout * 1000))",
+                    "ms": "\(elapsedMs)",
+                ])
+                CaptureToast.show(message: "拼接超时，已回退为单帧", status: .warn)
+                self.enterEditorAfterScroll(
+                    image: frames[0], selection: self.scrollInitialSelection ?? selection, screen: screen)
+            case .failed:
+                // 拼接失败（静止画面/无可信重叠）：明确回退单帧进编辑器 + toast 告知。
+                // ⚠️ 恢复 grow 前的原选区（scrollInitialSelection）——回退图 frames[0]
+                // 就是以原选区尺寸抓的，保留 grown 选区会出现底图/选区尺寸错位，
+                // 且用户看到选区被扩成全屏（另一屏也被框住）的假象。
+                Log.error(.scroll, "scroll.compose.fail", [
+                    "err": "stitch.noOverlap", "ms": "\(elapsedMs)",
+                ])
                 CaptureToast.show(message: "滚动拼接未找到重叠内容，已回退为单帧", status: .warn)
-                self.enterEditorAfterScroll(image: frames[0], selection: selection, screen: screen)
+                self.enterEditorAfterScroll(
+                    image: frames[0], selection: self.scrollInitialSelection ?? selection, screen: screen)
             }
         }
     }
@@ -864,6 +983,11 @@ final class OverlayController {
     /// 工具栏贴新选区下缘并夺回键盘焦点
     private func enterEditorAfterScroll(image: CGImage, selection: CGRect, screen: NSScreen) {
         isScrollComposing = false
+        // 收尾热键活到 compose 完/失败为止：现在会话已定型，撤掉
+        unregisterScrollHotKeys()
+        scrollSelectionRect = nil
+        scrollScreen = nil
+        scrollInitialSelection = nil
         guard let session = editorSession else {
             Log.error(.scroll, "scroll.compose.noSession")
             // 会话已被外部销毁（如拼接窗口期用户开了新截图会话）：拼接结果不能丢，

@@ -361,6 +361,9 @@ enum DesignTokens {
         // 还没开滚就自动合成单帧）——提到 4（静止 1.6s）才敢说「停止滚动」
         static let bottomConfirmSamples = 4                      // 连续 4 次采样无新增 → 到底
         static let sampleInterval: TimeInterval = 0.4            // 采样周期
+        // 拼帧超时上限（病例：3840×2098 两帧 compose 卡 10s 后才 fail——超时
+        // 直接回退单帧+恢复原选区，不让用户在无反馈的收尾期干等）
+        static let composeTimeout: TimeInterval = 3
     }
 }
 

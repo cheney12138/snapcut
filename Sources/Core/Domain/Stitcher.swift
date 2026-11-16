@@ -91,7 +91,8 @@ enum Stitcher {
     /// 拼接帧序列为纵向长图。
     ///
     /// - Parameters:
-    ///   - frames: 按时间顺序排列的帧，宽度必须一致；相邻帧需存在垂直重叠。
+    ///   - frames: 按时间顺序排列的帧，宽度必须一致（行数可以不等——滚动区域
+    ///     grow 后新帧更高是正常序列，纵向拼接按内容行对齐）；相邻帧需存在垂直重叠。
     ///   - options: 可调参数，见 `Options`。
     /// - Returns: 长图与每帧接缝信息。
     /// - Throws: `StitcherError`。
@@ -176,13 +177,31 @@ enum Stitcher {
 
     /// 校验对齐假设：prev 第 d+i 行 ≈ cur 第 i 行（i ∈ [0, overlap)）。
     /// 行级容差见 `Options.rowDiffThreshold` / `maxMismatchRatio`；不匹配行超限即刻短路返回。
+    ///
+    /// 性能（病例：3840×2098 两帧候选 ~2080 个 × 全行比对 ⇒ compose 卡 10s）：
+    /// 两阶段扫描——① 粗筛探针：每 overlap/24 行抽 1 行（行签名本身已是灰度降采样，
+    /// 64 采样点/行），伪候选在 ~几行内即被否掉（绝大多数候选在此剪枝，成本 ~24 次
+    /// rowMatch）；② 细验：只对通过粗筛的候选补齐其余行，最终判据与逐行全查完全
+    /// 一致（不匹配行总数 ≤ maxMismatch），无误放行。
     /// 线程语义：纯函数，任意线程可调用。
     private static func alignmentPasses(
         prev: PixelBuffer, cur: PixelBuffer, d: Int, overlap: Int, options: Options
     ) -> Bool {
         var mismatches = 0
         let maxMismatch = Int(Double(overlap) * options.maxMismatchRatio)
-        for i in 0..<overlap {
+        let probeStride = max(1, overlap / 24)
+        // ① 粗筛探针（剪枝）
+        var row = 0
+        while row < overlap {
+            if !PixelBuffer.rowMatches(prev.signature[d + row], cur.signature[row],
+                                       threshold: options.rowDiffThreshold) {
+                mismatches += 1
+                if mismatches > maxMismatch { return false }
+            }
+            row += probeStride
+        }
+        // ② 细验：粗筛未覆盖的行（保持与全量逐行一致的判据）
+        for i in 0..<overlap where i % probeStride != 0 {
             if !PixelBuffer.rowMatches(prev.signature[d + i], cur.signature[i],
                                        threshold: options.rowDiffThreshold) {
                 mismatches += 1

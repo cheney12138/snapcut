@@ -82,6 +82,39 @@ struct TestStitchMain {
         } catch let e as Stitcher.StitcherError {
             print("[TestStitch] 用例3 PASS: 无重叠正确报错 → \(e.localizedDescription)")
         }
+
+        // ---- 用例 4：行数不等（region grow 后新帧更高）+ 2 帧 ----
+        // 病例：滚动区域 grow 后新旧帧行数不同，纵向拼接必须按内容行对齐
+        // （宽度一致、行数不等允许拼接）。
+        let page3 = try renderPage(width: width, height: 1300, seed: 3)
+        let g0 = try cropped(page3, y: 0, height: 600, name: "grow-0")
+        let g1 = try cropped(page3, y: 500, height: 700, name: "grow-1")
+        let truth4 = 100
+        print("[TestStitch] 用例4: 帧g0=800x600, 帧g1=800x700（行数不等）, 真值重叠=\(truth4)")
+        let result4 = try Stitcher.stitch(frames: [g0, g1])
+        try assertEquals(result4.seams[1].overlapRows, truth4, "用例4 重叠行数")
+        try assertEquals(result4.image.width, width, "用例4 拼接宽度")
+        try assertEquals(result4.image.height, 600 + 700 - truth4, "用例4 拼接高度")
+        try verifyRows(result4.image, against: page3, rows: [0, 599, 600, 900, 1199])
+        print("[TestStitch] 用例4 PASS: 行数不等帧拼接 OK")
+
+        // ---- 用例 5：大帧性能（4K 级两帧，compose 卡 10s 病例）----
+        // findOverlap 粗筛探针剪枝后：~4000 候选 × ~24 次探针 rowMatch，
+        // 全程应在亚秒级完成（含 PixelBuffer 解码）。硬上限 2s 断言。
+        let bigPage = try renderPage(width: 3000, height: 4200, seed: 11)
+        let b0 = try cropped(bigPage, y: 0, height: 2098, name: "big-0")
+        let b1 = try cropped(bigPage, y: 1798, height: 2098, name: "big-1")
+        print("[TestStitch] 用例5: 两张 3000x2098 大帧（真值重叠 300 行），计时拼接")
+        let perfStart = DispatchTime.now()
+        let result5 = try Stitcher.stitch(frames: [b0, b1])
+        let perfMs = Int(Double(DispatchTime.now().uptimeNanoseconds - perfStart.uptimeNanoseconds) / 1_000_000)
+        try assertEquals(result5.seams[1].overlapRows, 300, "用例5 重叠行数")
+        try assertEquals(result5.image.height, 2098 * 2 - 300, "用例5 拼接高度")
+        print("[TestStitch] 用例5 耗时: \(perfMs)ms")
+        guard perfMs < 2000 else {
+            throw TestError("用例5：大帧拼接耗时 \(perfMs)ms ≥ 2000ms（剪枝失效？）")
+        }
+        print("[TestStitch] 用例5 PASS: 大帧拼接亚秒级完成")
     }
 
     // MARK: - 整页渲染
@@ -102,14 +135,19 @@ struct TestStitchMain {
         ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
 
         // CGContext 原点在左下；第 row 行（图像坐标，顶部为 0）对应 ctx y = height-row-1
+        // ⚠️ 行色不能用平滑/单一通道函数：黄金比例相位在 Δ=Fibonacci（1597 等）
+        // 时几乎重合，且亮度落在蓝通道（luma 权重仅 0.11）⇒ 相隔千行的两行
+        // 亮度签名几乎相同，findOverlap 伪对齐（大帧用例5 实锤，d=201 胜过
+        // 真值 d=1798）。改为 RGB 三通道独立哈希：任意两行 luma 平均差
+        // ≈ ⅓×255 ≈ 84 ≫ 容差 24，伪对齐必被否。
         for row in 0..<height {
-            var hue = CGFloat((Double(row + seed) * 0.6180339887).truncatingRemainder(dividingBy: 1.0))
-            var brightness = 0.45 + 0.15 * sin(Double(row) / 17.0 + Double(seed))
-            if invert {
-                hue = (1.0 - hue).truncatingRemainder(dividingBy: 1.0)
-                brightness = 1.0 - brightness
-            }
-            ctx.setFillColor(CGColor(srgbRed: hue, green: 0.45, blue: CGFloat(brightness), alpha: 1))
+            let r0 = Double((UInt64(row + seed) &* 6_364_136_223_846_793_005) >> 33 % 1000) / 1000
+            let g0 = Double((UInt64(row + seed) &* 28_629_335_559_573_927) >> 33 % 1000) / 1000
+            let b0 = Double((UInt64(row + seed) &* 9_767_878_279_757_191) >> 33 % 1000) / 1000
+            var r = r0, g = g0, b = b0
+            if invert { r = 1.0 - r; g = 1.0 - g; b = 1.0 - b }
+            ctx.setFillColor(CGColor(srgbRed: CGFloat(r), green: CGFloat(g),
+                                     blue: CGFloat(b), alpha: 1))
             ctx.fill(CGRect(x: 0, y: CGFloat(height - row - 1), width: CGFloat(width), height: 1))
         }
         // 叠加一些「内容」形状，让图看起来像真实页面
