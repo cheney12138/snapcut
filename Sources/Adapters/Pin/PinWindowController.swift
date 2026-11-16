@@ -71,6 +71,9 @@ final class PinWindowController {
         var members: [(pin: PinWindowController, startFrame: CGRect)]
         /// ⌥拆组延迟提交（真实拖动 >3pt 才算，防 ⌥单击误拆）
         var pendingDetach: Bool = false
+        /// 磁吸手感（任务 B）：落位/分离缓动器 + 重吸防抖（每次拖动新建 → 自动重置）
+        var easer = SnapEaser()
+        var resnap = SnapResnapGuard()
     }
 
     private var drag: DragState?
@@ -209,7 +212,10 @@ final class PinWindowController {
         }
     }
 
-    /// 单卡拖（含组内单卡重排）：移动盒 = 本卡外框
+    /// 单卡拖（含组内单卡重排）：移动盒 = 本卡外框。
+    /// 磁吸手感（任务 B）：落位 ease-out 缓动 + 分离阻力 + 重吸防抖（SnapFeel）。
+    /// 性能推演：snapCandidates O(n) + snap O(4n)，n≤10 时每帧 ≈40 个矩形运算，
+    /// 主线程逐帧无压力，无需节流/空间分桶（>10 再议）。
     private func dragSoloMoved(state: inout DragState, origin: CGPoint) {
         let candidate = CGRect(origin: origin, size: window.frame.size)
         let padTotal = inGroup ? 0 : Self.groupPadTotal
@@ -219,17 +225,27 @@ final class PinWindowController {
             ignoreGroupOf: state.detach ? self : nil
         )
         let active = state.snapped.map { (PinMagnetRegistry.id(of: $0.partner), $0.edge) }
+        let now = CACurrentMediaTime()
 
-        guard let outcome = MagnetGroup.snap(candidate: candidateOuter, others: others, active: active) else {
-            if state.snapped != nil {
+        guard let outcome = MagnetGroup.snap(candidate: candidateOuter, others: others, active: active),
+              // 重吸防抖：刚分离 200ms 内同伙伴同边不重吸
+              !state.resnap.shouldSuppress(partnerID: outcome.partnerID, edge: outcome.edge, now: now)
+        else {
+            if let snapped = state.snapped {
                 Log.event(Self.logCategory, "collage.magnet.release", [:])
-                state.snapped?.partner.contentView.setSnapGlow(false)
+                snapped.partner.contentView.setSnapGlow(false)
+                state.resnap.noteRelease(
+                    partnerID: PinMagnetRegistry.id(of: snapped.partner),
+                    edge: snapped.edge,
+                    now: now
+                )
                 state.snapped = nil
                 drag = state
                 contentView.setSnapGlow(false)
                 showHUD("已分离")
             }
-            window.setFrameOrigin(candidate.origin)
+            let rendered = state.easer.freeFrame(target: candidate.origin, now: now)
+            window.setFrameOrigin(rendered)
             PinMagnetRegistry.shared.notifyLayoutChanged(self)
             return
         }
@@ -238,12 +254,21 @@ final class PinWindowController {
             width: outcome.frame.minX - candidateOuter.minX,
             height: outcome.frame.minY - candidateOuter.minY
         )
-        window.setFrameOrigin(candidate.origin.offsetBy(total))
+        // 分离阻力：拖出方向与吸附边相反时，跟随比从 1:1 渐变到 0.6:1
+        let resist = SnapFeel.resistOffset(candidate: candidateOuter, outcome: outcome)
+        let target = candidate.origin.offsetBy(total).offsetBy(resist)
+        let partner = PinMagnetRegistry.shared.pin(byID: outcome.partnerID)
+        let isNewSnap = state.snapped.map {
+            $0.partner !== partner || $0.edge != outcome.edge
+        } ?? true
+        let rendered = state.easer.snapFrame(target: target, newSnap: isNewSnap, now: now)
+        window.setFrameOrigin(rendered)
         applySnapPreview(state: &state, outcome: outcome)
         PinMagnetRegistry.shared.notifyLayoutChanged(self)
     }
 
-    /// ⌘组拖：所在组 union rect 整体平移（外框空间），吸附判定 = 整组包围盒
+    /// ⌘组拖：所在组 union rect 整体平移（外框空间），吸附判定 = 整组包围盒。
+    /// 磁吸手感同单卡拖（SnapFeel：落位缓动 + 分离阻力 + 重吸防抖）。
     private func dragGroupMoved(state: inout DragState, selfOrigin: CGPoint) {
         guard !state.members.isEmpty else {
             dragSoloMoved(state: &state, origin: selfOrigin)
@@ -257,25 +282,47 @@ final class PinWindowController {
         let candidate = startUnion.offsetBy(dx: selfDelta.width, dy: selfDelta.height)
         let others = PinMagnetRegistry.shared.snapCandidates(excluding: state.members.map { $0.pin })
         let active = state.snapped.map { (PinMagnetRegistry.id(of: $0.partner), $0.edge) }
+        let now = CACurrentMediaTime()
 
-        guard let outcome = MagnetGroup.snap(candidate: candidate, others: others, active: active) else {
-            if state.snapped != nil {
+        guard let outcome = MagnetGroup.snap(candidate: candidate, others: others, active: active),
+              !state.resnap.shouldSuppress(partnerID: outcome.partnerID, edge: outcome.edge, now: now)
+        else {
+            if let snapped = state.snapped {
                 Log.event(Self.logCategory, "collage.magnet.release", [:])
-                state.snapped?.partner.contentView.setSnapGlow(false)
+                snapped.partner.contentView.setSnapGlow(false)
+                state.resnap.noteRelease(
+                    partnerID: PinMagnetRegistry.id(of: snapped.partner),
+                    edge: snapped.edge,
+                    now: now
+                )
                 state.snapped = nil
                 drag = state
                 showHUD("已分离")
             }
-            moveMembers(state, delta: selfDelta)
+            let rendered = state.easer.freeFrame(target: candidate.origin, now: now)
+            moveMembers(state, delta: CGSize(
+                width: rendered.x - startUnion.origin.x,
+                height: rendered.y - startUnion.origin.y
+            ))
             PinMagnetRegistry.shared.notifyLayoutChanged(self)
             return
         }
 
-        let total = CGSize(
-            width: selfDelta.width + (outcome.frame.minX - candidate.minX),
-            height: selfDelta.height + (outcome.frame.minY - candidate.minY)
-        )
-        moveMembers(state, delta: total)
+        // 分离阻力 + 落位缓动：union 空间算出渲染目标，成员按渲染 delta 落位
+        let resist = SnapFeel.resistOffset(candidate: candidate, outcome: outcome)
+        let target = candidate.origin.offsetBy(CGSize(
+            width: outcome.frame.minX - candidate.minX,
+            height: outcome.frame.minY - candidate.minY
+        )).offsetBy(resist)
+        let partner = PinMagnetRegistry.shared.pin(byID: outcome.partnerID)
+        let isNewSnap = state.snapped.map {
+            $0.partner !== partner || $0.edge != outcome.edge
+        } ?? true
+        let rendered = state.easer.snapFrame(target: target, newSnap: isNewSnap, now: now)
+        moveMembers(state, delta: CGSize(
+            width: rendered.x - startUnion.origin.x,
+            height: rendered.y - startUnion.origin.y
+        ))
         applySnapPreview(state: &state, outcome: outcome)
         PinMagnetRegistry.shared.notifyLayoutChanged(self)
     }

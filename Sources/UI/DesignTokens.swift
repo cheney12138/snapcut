@@ -220,8 +220,9 @@ enum DesignTokens {
         static let kbd: CGFloat = 5   // kbd 胶囊
         static let primaryButton: CGFloat = 8   // 引导卡主按钮
         static let hudSmall: CGFloat = 9         // 滚动 HUD
-        static let badge: CGFloat = 11           // 组框徽标
-        static let assemble: CGFloat = 12        // 组框合成按钮
+        static let badge: CGFloat = 11           // 组框徽标（22 高胶囊 = 高/2）
+        static let assemble: CGFloat = 7         // 组框合成按钮（r.md，原 12 孤儿尺寸回收进 token 阶）
+        static let collageFrame: CGFloat = 12    // 组框（Stage Manager 式极细框，原 14 → 12）
     }
 
     // MARK: - 5. 间距（8pt 栅格）
@@ -320,18 +321,45 @@ enum DesignTokens {
         static let cardGap: CGFloat = 12
     }
 
-    // MARK: - 组框规格
+    // MARK: - 组框规格（重设计真源：snapcut-collage-ui/index.html §06 token 差异清单）
 
     @MainActor
     enum GroupFrame {
-        static let dashWidth: CGFloat = 1.5
-        static let dashPattern: [CGFloat] = [5, 4]
-        static let dashAlpha: CGFloat = 0.75
-        static let innerTintAlpha: CGFloat = 0.03
+        /// 组框线：0.5pt 极细实线（替代 1.5pt dash[5,4] 虚线——Stage Manager 语气）
+        static let strokeWidth: CGFloat = 0.5
+        /// 组框线色：暗 白.26 / 亮 黑.18（GroupBorderPanel 钉 darkAqua 时解析暗值）
+        static let stroke = NSColor(name: "dt.groupStroke") { ap in
+            ap.isDark ? NSColor.white.withAlphaComponent(0.26)
+                      : NSColor.black.withAlphaComponent(0.18)
+        }
+        /// 组框圆角（corner 14 → 12）
+        static let cornerRadius: CGFloat = Radius.collageFrame
+        /// 组框窗体外扩：10 → 22（修复浮标骑顶被窗缘裁切病例；浮标骑框顶外 −11pt 后
+        /// 需 ≥ 11 + 浮标半高 11 + 呼吸 = 22）
+        static let panelOutset: CGFloat = 22
+        /// 浮标骑框顶外偏移（badge/button top = 框顶 −11）
+        static let rideOffset: CGFloat = 11
+        /// 徽标（mat.hud 玻璃胶囊）：22 高 / radius 11 / 0.5pt 白.16 stroke /
+        /// label-1 文字「拼贴 N」+ tabular-nums（原 accent 实心 α.92「拼贴空间 · N 张」删除）
         static let badgeHeight: CGFloat = 22
-        static let badgeFont = NSFont.systemFont(ofSize: 10.5, weight: .semibold) // 10.5/600
-        static let assembleHeight: CGFloat = 24
-        static let assembleFont = NSFont.systemFont(ofSize: 11.5, weight: .semibold) // 11.5/600
+        static let badgeStroke = NSColor(name: "dt.badgeStroke") { ap in
+            ap.isDark ? NSColor.white.withAlphaComponent(0.16)
+                      : NSColor.black.withAlphaComponent(0.14)
+        }
+        static let badgeFont = NSFont.systemFont(ofSize: 10.5, weight: .medium)          // t.caption 10.5/500
+        static let badgeNumberFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold) // tabular-nums 600
+        /// 合成按钮（全画面唯一 accent）：22 高（ctl.h.sm）/ radius 7（r.md）/
+        /// SF Symbol arrow.triangle.merge + 「合成」/ 11pt·500 / inset-hi-strong / hover accent-hover
+        /// （原 24 高 / radius 12 孤儿尺寸 + 纯文字「合成整体」删除）
+        static let assembleHeight: CGFloat = 22
+        static let assembleFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        /// 吸附反馈（对齐 Scroll 选区语言，替代 blur12 α.9 蓝色光晕 + 硬编码 #4C8DFF）：
+        /// 1.5pt accent outline + 3.5pt soft ring，ring α.10↔.22 做 1.2s autoreverse 透明度脉冲
+        static let snapOutlineWidth: CGFloat = Scroll.outlineWidth        // 1.5
+        static let snapRingWidth: CGFloat = Scroll.outlineSoftRing       // 3.5
+        static let snapRingAlphaMin: CGFloat = 0.10
+        static let snapRingAlphaMax: CGFloat = 0.22
+        static let snapPulseDuration: CFTimeInterval = 1.2
     }
 
     // MARK: - Toast 规格

@@ -28,6 +28,9 @@ final class PinMagnetRegistry {
         let startFrames: [ObjectIdentifier: CGRect]
         let startUnion: CGRect
         var snap: (partner: PinWindowController, edge: MagnetEdge)?
+        /// 磁吸手感（任务 B，同 PinWindowController.DragState）
+        var easer = SnapEaser()
+        var resnap = SnapResnapGuard()
     }
 
     // MARK: - pin 身份（MagnetSnapItem.id：进程内唯一即可）
@@ -164,7 +167,9 @@ final class PinMagnetRegistry {
         for member in members { member.setInGroup(true) }
         let union = MagnetGroup.unionRect(members.map { $0.windowFrame })
         let panel = borderPanels[gid] ?? makeBorderPanel(gid)
-        panel.setFrame(union.insetBy(dx: -10, dy: -10), display: true)
+        // 窗体外扩 22（GroupFrame.panelOutset）：浮标骑框顶外 −11pt 不再被窗缘裁切
+        let outset = DesignTokens.GroupFrame.panelOutset
+        panel.setFrame(union.insetBy(dx: -outset, dy: -outset), display: true)
         panel.orderFrontRegardless()
         panel.refresh(count: members.count)
     }
@@ -215,16 +220,42 @@ final class PinMagnetRegistry {
         let candidate = state.startUnion.offsetBy(dx: delta.width, dy: delta.height)
         let others = snapCandidates(excluding: members)
         let active = state.snap.map { (Self.id(of: $0.partner), $0.edge) }
-        if let outcome = MagnetGroup.snap(candidate: candidate, others: others, active: active) {
-            let total = CGSize(
-                width: outcome.frame.minX - candidate.minX,
-                height: outcome.frame.minY - candidate.minY
+        let now = CACurrentMediaTime()
+
+        func applyFree() {
+            let rendered = state.easer.freeFrame(target: candidate.origin, now: now)
+            let moveDelta = CGSize(
+                width: rendered.x - state.startUnion.origin.x,
+                height: rendered.y - state.startUnion.origin.y
             )
             for member in members {
                 let start = state.startFrames[ObjectIdentifier(member)] ?? member.windowFrame
-                member.setFrameOrigin(start.origin.offsetBy(total))
+                member.setFrameOrigin(start.origin.offsetBy(moveDelta))
             }
+        }
+
+        if let outcome = MagnetGroup.snap(candidate: candidate, others: others, active: active),
+           // 重吸防抖：刚分离 200ms 内同伙伴同边不重吸
+           !state.resnap.shouldSuppress(partnerID: outcome.partnerID, edge: outcome.edge, now: now) {
+            // 分离阻力 + 落位缓动（同 PinWindowController.dragGroupMoved）
+            let resist = SnapFeel.resistOffset(candidate: candidate, outcome: outcome)
+            let target = candidate.origin.offsetBy(CGSize(
+                width: outcome.frame.minX - candidate.minX,
+                height: outcome.frame.minY - candidate.minY
+            )).offsetBy(resist)
             let partner = pin(byID: outcome.partnerID)
+            let isNewSnap = state.snap.map {
+                $0.partner !== partner || $0.edge != outcome.edge
+            } ?? true
+            let rendered = state.easer.snapFrame(target: target, newSnap: isNewSnap, now: now)
+            let moveDelta = CGSize(
+                width: rendered.x - state.startUnion.origin.x,
+                height: rendered.y - state.startUnion.origin.y
+            )
+            for member in members {
+                let start = state.startFrames[ObjectIdentifier(member)] ?? member.windowFrame
+                member.setFrameOrigin(start.origin.offsetBy(moveDelta))
+            }
             if state.snap?.partner !== partner {
                 state.snap?.partner.contentView.setSnapGlow(false)
                 partner?.contentView.setSnapGlow(true)
@@ -232,16 +263,18 @@ final class PinMagnetRegistry {
             state.snap = partner.map { ($0, outcome.edge) }
             borderDrag = state
         } else {
-            if state.snap != nil {
+            if let snapped = state.snap {
                 Log.event(.pin, "collage.magnet.release", [:])
-                state.snap?.partner.contentView.setSnapGlow(false)
+                snapped.partner.contentView.setSnapGlow(false)
+                state.resnap.noteRelease(
+                    partnerID: Self.id(of: snapped.partner),
+                    edge: snapped.edge,
+                    now: now
+                )
                 state.snap = nil
                 borderDrag = state
             }
-            for member in members {
-                let start = state.startFrames[ObjectIdentifier(member)] ?? member.windowFrame
-                member.setFrameOrigin(start.origin.offsetBy(delta))
-            }
+            applyFree()
         }
         refreshLayout(groupID: state.groupID)
     }

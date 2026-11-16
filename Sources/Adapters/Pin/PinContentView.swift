@@ -1,12 +1,16 @@
 import AppKit
 import CoreGraphics
+import QuartzCore
 
 /// 贴图内容视图：1:1 像素精确绘制（不重采样）+ 6pt 圆角 + 1px 白描边 + 交互转发。
 /// isFlipped 场景：CGContext.draw 假设 Y-up，本视图 Y-down ⇒ 局部镜像一次再 draw
 /// （同 Sources/Overlay/OverlayWindow.swift drawEditor 的翻转处理）。
 ///
-/// 成组视觉（设计定稿 §1.3，inGroup 标志位驱动，摘组即回纯图）：
-/// 8pt 白垫 + 1px 描边 + 10pt 圆角（窗体已由 controller.setInGroup 外扩 9pt）。
+/// 成组视觉（重设计：成员白垫保留，描边收进 token）：8pt 白垫 + 1px hair 描边
+/// + 10pt 圆角（窗体已由 controller.setInGroup 外扩 9pt）。
+/// 吸附反馈（snapcut-collage-ui §03 重设计）：1.5pt accent outline + 3.5pt soft ring
+/// α.10↔.22 透明度脉冲（CABasicAnimation autoreverse 1.2s，对齐 Scroll 选区语言）——
+/// 删除 blur 12 α.9 蓝色外发光与硬编码 #4C8DFF。
 @MainActor
 final class PinContentView: NSView {
     static let cornerRadius: CGFloat = 6
@@ -18,10 +22,12 @@ final class PinContentView: NSView {
     /// 右下角百分比读数（缩放 / ⌥透明度共用）
     let hud = PinHUDView(frame: .zero)
 
-    /// 吸附预览发光（拖动中贴合：移动卡与目标卡都亮）
-    private var snapGlow = false {
-        didSet { needsDisplay = true }
-    }
+    /// 吸附预览（拖动中贴合：移动卡与目标卡都亮）；视觉由 CAShapeLayer 承担
+    private var snapGlow = false
+
+    /// 吸附高亮图层：1.5pt accent outline + 3.5pt soft ring（透明度脉冲）
+    private var snapOutlineLayer: CAShapeLayer?
+    private var snapRingLayer: CAShapeLayer?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -41,7 +47,65 @@ final class PinContentView: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     func setSnapGlow(_ on: Bool) {
+        guard snapGlow != on else { return }
         snapGlow = on
+        if on {
+            installSnapHighlight()
+        } else {
+            removeSnapHighlight()
+        }
+    }
+
+    /// 重设计吸附反馈（对齐 Scroll 选区语言）：1.5pt accent outline + 3.5pt soft ring，
+    /// ring α.10↔.22 做 1.2s autoreverse 透明度脉冲（GroupFrame.snap* token）。
+    /// ring 画在窗体内侧：NSWindow 不渲染 frame 外内容，外扩 ring 会被窗体裁切
+    /// （散件窗体 = 图像矩形，无外扩余量）。
+    private func installSnapHighlight() {
+        wantsLayer = true
+        removeSnapHighlight()
+        let base = (controller?.inGroup ?? false) ? Self.groupCornerRadius : Self.cornerRadius
+
+        let outline = CAShapeLayer()
+        outline.frame = bounds
+        outline.path = CGPath(
+            roundedRect: bounds.insetBy(dx: 0.75, dy: 0.75),
+            cornerWidth: max(base - 0.75, 1), cornerHeight: max(base - 0.75, 1), transform: nil
+        )
+        outline.strokeColor = DesignTokens.accent.cgColor
+        outline.fillColor = NSColor.clear.cgColor
+        outline.lineWidth = DesignTokens.GroupFrame.snapOutlineWidth
+        layer?.addSublayer(outline)
+        snapOutlineLayer = outline
+
+        let ringInset = DesignTokens.GroupFrame.snapOutlineWidth + DesignTokens.GroupFrame.snapRingWidth / 2
+        let ring = CAShapeLayer()
+        ring.frame = bounds
+        ring.path = CGPath(
+            roundedRect: bounds.insetBy(dx: ringInset, dy: ringInset),
+            cornerWidth: max(base - ringInset, 1), cornerHeight: max(base - ringInset, 1), transform: nil
+        )
+        ring.strokeColor = DesignTokens.accent.cgColor
+        ring.fillColor = NSColor.clear.cgColor
+        ring.lineWidth = DesignTokens.GroupFrame.snapRingWidth
+        ring.opacity = Float(DesignTokens.GroupFrame.snapRingAlphaMin)
+        // 透明度脉冲：α .10↔.22，1.2s ease-in-out autoreverse 往复
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = DesignTokens.GroupFrame.snapRingAlphaMin
+        pulse.toValue = DesignTokens.GroupFrame.snapRingAlphaMax
+        pulse.duration = DesignTokens.GroupFrame.snapPulseDuration
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        ring.add(pulse, forKey: "snapRingPulse")
+        layer?.addSublayer(ring)
+        snapRingLayer = ring
+    }
+
+    private func removeSnapHighlight() {
+        snapOutlineLayer?.removeFromSuperlayer()
+        snapRingLayer?.removeFromSuperlayer()
+        snapOutlineLayer = nil
+        snapRingLayer = nil
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -142,25 +206,10 @@ final class PinContentView: NSView {
         let borderPath = CGPath(
             roundedRect: borderRect, cornerWidth: radius, cornerHeight: radius, transform: nil
         )
-        ctx.setStrokeColor(inGroup ? NSColor.black.withAlphaComponent(0.15).cgColor : NSColor.white.cgColor)
+        ctx.setStrokeColor(inGroup ? DesignTokens.hair.cgColor : NSColor.white.cgColor)
         ctx.setLineWidth(Self.borderWidth)
         ctx.addPath(borderPath)
         ctx.strokePath()
-
-        // 4. 吸附预览发光（贴合瞬间：边框高亮 + 外发光）
-        if snapGlow {
-            let glowRect = rect.insetBy(dx: 1, dy: 1)
-            let glowPath = CGPath(
-                roundedRect: glowRect, cornerWidth: radius, cornerHeight: radius, transform: nil
-            )
-            ctx.saveGState()
-            ctx.setShadow(offset: .zero, blur: 12, color: NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 0.9).cgColor)
-            ctx.setStrokeColor(NSColor(srgbRed: 0.298, green: 0.553, blue: 1.0, alpha: 1).cgColor)
-            ctx.setLineWidth(2)
-            ctx.addPath(glowPath)
-            ctx.strokePath()
-            ctx.restoreGState()
-        }
     }
 
     // MARK: - HUD
