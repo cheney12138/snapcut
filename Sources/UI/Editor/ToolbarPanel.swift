@@ -1116,7 +1116,10 @@ private final class ToolbarTooltipWindow: NSPanel {
             backing: .buffered,
             defer: false
         )
-        level = .screenSaver
+        // ⚠️ 病例（用户「tooltip 被 bar 遮一半」）：工具栏 panel 自己是
+        // screenSaver+1——tooltip 若同级/低于它会被压在下面。tooltip 永远
+        // 比 bar 高一层
+        level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 2)
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false
