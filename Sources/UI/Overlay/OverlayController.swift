@@ -706,12 +706,16 @@ final class OverlayController {
             for window in windows where window.owningScreen == screen {
                 window.enterScrollMode()
             }
-            // 采集 HUD（档 1 钉暗，贴选区下缘 8pt）
+            // 采集 HUD（档 1 钉暗，贴选区下缘 8pt）。病例二轮（用户「HUD 进了
+            // 截图」——windowID 排除对 NSPanel 不可靠）：改为「进入后短暂提示
+            // 1.2s 即隐藏」——采集中 HUD 不在场，物理上不可能入镜；到底/收尾
+            // 短暂显示结论
             let hud = ScrollCaptureHUDPanel()
             hud.show(below: rect, on: screen)
             scrollHUD = hud
-            // HUD 不进采样（病例「HUD 进了截图」）：注册 windowID 给采集器排除
-            ScrollFrameGrabber.excludedWindowIDs.insert(CGWindowID(hud.windowNumber))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.scrollHUD?.orderOut(nil)
+            }
             Log.event(.scroll, "scroll.enter", ["rect": "\(Int(rect.width))x\(Int(rect.height))"])
         } catch {
             Log.error(.scroll, "scroll.begin.fail", ["err": error.localizedDescription])
@@ -974,9 +978,6 @@ final class OverlayController {
         scrollBottomWork = nil
         controller.stop()
         scrollController = nil
-        if let hud = scrollHUD {
-            ScrollFrameGrabber.excludedWindowIDs.remove(CGWindowID(hud.windowNumber))
-        }
         scrollHUD?.hide()
         scrollHUD = nil
 
@@ -1069,7 +1070,12 @@ final class OverlayController {
                         y: selection.maxY - grownH,
                         width: selection.width, height: grownH)
                 }
-                self.enterEditorAfterScroll(image: result.image, selection: grownSelection, screen: screen)
+                // 用户裁定（2026-11-16「滚动截图完应该自动关闭面板，为什么还
+                // 要点一下回车」）：滚完直接完成——合成结果直接走 afterCapture
+                // 动作（复制/保存/贴图，同普通截图的完成流），不进编辑器。
+                // 要标注的用户在滚动前的编辑态标注（会话一直保留）
+                self.finishScrollWithResult(image: result.image)
+                _ = grownSelection
             case .timeout:
                 // 卡死保险丝：拼帧超时（病例：10s 无反馈）⇒ 回退单帧，不让用户干等
                 Log.error(.scroll, "scroll.compose.fail", [
@@ -1096,6 +1102,51 @@ final class OverlayController {
 
     /// 合成长图回填标注会话：底图替换、选区随内容生长、画布矩形重算、
     /// 工具栏贴新选区下缘并夺回键盘焦点
+    /// 滚动合成结果直接完成（不进编辑器——用户裁定「滚完自动关闭面板」）
+    private func finishScrollWithResult(image: CGImage) {
+        isScrollComposing = false
+        unregisterScrollHotKeys()
+        scrollSelectionRect = nil
+        scrollScreen = nil
+        scrollInitialSelection = nil
+        Log.event(.scroll, "scroll.compose.autoFinish", [
+            "pxW": "\(image.width)", "pxH": "\(image.height)",
+        ])
+        // 走与普通截图一致的完成流（afterCapture 设置驱动：复制+toast/
+        // 保存/贴图）
+        let settings = AppCoordinatorShared.coordinator?.settings ?? .defaultSettings
+        switch settings.afterCapture {
+        case .copy:
+            AppCoordinatorShared.deps?.history.record(image)
+            AppCoordinatorShared.deps?.clipboard.writeImage(image)
+            if settings.showCopyNotification {
+                CaptureToast.show(image: image, message: "长图已复制")
+            }
+            let completion = self.completion
+            end()
+            self.completion = nil
+            completion?(.copy(image))
+        case .save:
+            AppCoordinatorShared.deps?.history.record(image)
+            AppCoordinatorShared.coordinator?.quickSaveScroll(image: image)
+            let completion = self.completion
+            end()
+            self.completion = nil
+            completion?(.save(image))
+        case .pin:
+            AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: sessionPinRect() ?? .zero)
+            let completion = self.completion
+            end()
+            self.completion = nil
+            completion?(.cancelled)
+        }
+    }
+
+    /// 滚动前编辑会话的选区（贴图落位用）
+    private func sessionPinRect() -> CGRect? {
+        editorSession?.selectionGlobal
+    }
+
     private func enterEditorAfterScroll(image: CGImage, selection: CGRect, screen: NSScreen) {
         isScrollComposing = false
         // 收尾热键活到 compose 完/失败为止：现在会话已定型，撤掉

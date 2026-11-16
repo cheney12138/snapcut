@@ -251,6 +251,11 @@ final class AppCoordinator {
         }
     }
 
+    /// 滚动长图的保存面板入口（ScrollController 调；exporter 私有经此转发）
+    func quickSaveScroll(image: CGImage) {
+        exporter.savePanel(image)
+    }
+
     func beginRegionCapture() {
         guard state == .idle else {
             Log.event(.app, "capture.ignored", ["state": state.rawValue])
