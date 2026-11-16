@@ -231,29 +231,91 @@ final class OnboardingWindow: NSPanel {
     }
 
     /// 居中显示（若权限已授权且已完成引导，调用方不应显示）
+    /// 入场 motion.enter.center：0.28s spring + rise 10pt + scale .96→1 + fade
+    /// （居中卡离参照物远，浮起幅度比贴边浮层大；原仅 alpha 显影）
     func showCentered(on screen: NSScreen) {
         let visible = screen.visibleFrame
         let size = frame.size
-        setFrameOrigin(CGPoint(
+        let finalFrame = CGRect(
             x: visible.midX - size.width / 2,
-            y: visible.midY - size.height / 2 + 40
-        ))
+            y: visible.midY - size.height / 2 + 40,
+            width: size.width, height: size.height
+        )
+        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - DesignTokens.Motion.enterRise))
         alphaValue = 0
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DMakeScale(DesignTokens.Motion.enterCenterScale,
+                                                     DesignTokens.Motion.enterCenterScale, 1)
+            CATransaction.commit()
+        }
         orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = DesignTokens.Motion.springDuration
-            ctx.timingFunction = CAMediaTimingFunction(
-                controlPoints: DesignTokens.Motion.springControlPoints.0,
-                DesignTokens.Motion.springControlPoints.1,
-                DesignTokens.Motion.springControlPoints.2,
-                DesignTokens.Motion.springControlPoints.3
-            )
+            ctx.duration = DesignTokens.Motion.enterCenterDuration
+            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
+            self.animator().setFrame(finalFrame, display: true)
             self.animator().alphaValue = 1
+        }
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(DesignTokens.Motion.enterCenterDuration)
+            CATransaction.setAnimationTimingFunction(DesignTokens.Motion.springTimingFunction)
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
         }
     }
 
+    /// motion.exit 退场：fade + scale→.98 + 下沉 6pt，0.16s ease-in；
+    /// orderOut 延迟到动画尾（完成 / 权限跳转共用；completionHandler 强持有 self，
+    /// 调用方同步置 nil 也不会中断动画）
+    func dismissAnimated() {
+        guard isVisible else {
+            orderOut(nil)
+            return
+        }
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(DesignTokens.Motion.exitDuration)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeIn))
+            layer.transform = CATransform3DMakeScale(0.98, 0.98, 1)
+            CATransaction.commit()
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = DesignTokens.Motion.exitDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            self.animator().alphaValue = 0
+            var sinkFrame = frame
+            sinkFrame.origin.y -= 6
+            self.animator().setFrame(sinkFrame, display: true)
+        }, completionHandler: {
+            self.orderOut(nil)
+            if let layer = self.contentView?.layer {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.transform = CATransform3DIdentity
+                CATransaction.commit()
+            }
+        })
+    }
+
     func updatePermission(granted: Bool) {
-        permissionDot?.layer?.backgroundColor = (granted ? DesignTokens.statusOK : DesignTokens.statusWarn).cgColor
+        // 权限状态过渡：0.3s 颜色过渡 + 状态点 1.2x 弹一下（状态变化有重量转移感）
+        if let dot = permissionDot, let layer = dot.layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.3)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
+            layer.backgroundColor = (granted ? DesignTokens.statusOK : DesignTokens.statusWarn).cgColor
+            let bounce = CABasicAnimation(keyPath: "transform.scale")
+            bounce.fromValue = 1.0
+            bounce.toValue = 1.2
+            bounce.duration = 0.15
+            bounce.autoreverses = true
+            bounce.repeatCount = 2
+            bounce.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            layer.add(bounce, forKey: "permBounce")
+            CATransaction.commit()
+        }
         permissionLabel?.stringValue = granted ? "已授权" : "未授权"
         permissionLabel?.textColor = granted ? DesignTokens.statusOK : DesignTokens.statusWarn
         permissionButton?.isHidden = granted
@@ -262,7 +324,7 @@ final class OnboardingWindow: NSPanel {
     @objc private func permissionTapped() {
         // 点完引导卡要让位：TCC 确认框/系统设置立刻弹出，引导卡挡在最前面挡住授权流程。
         // 隐藏而非关闭：权限轮询 granted 后由 controller 恢复或走完成。
-        orderOut(nil)
+        dismissAnimated()
         onPermissionTap()
     }
 
@@ -271,7 +333,7 @@ final class OnboardingWindow: NSPanel {
     }
 }
 
-// MARK: - kbd 键位胶囊（§7：22 高 / min 22 宽、radius 5、fill.kbd、内下 1px 黑 .28 + 内上白 .10）
+// MARK: - kbd 键位胶囊（§7：22 高 / min 22 宽、radius 5、fill.kbd、内上白 .10；内下阴影已删）
 
 @MainActor
 final class KbdCapsuleView: NSView {
@@ -292,15 +354,11 @@ final class KbdCapsuleView: NSView {
             ap.isDark ? NSColor.white.withAlphaComponent(0.16)
                       : NSColor.black.withAlphaComponent(0.16)
         }.cgColor
-        // 内上白 .10 / 内下黑 .28：两条 1pt 线模拟（AppKit 内阴影的轻量替代）
+        // 内上白 .10 一条 1pt 线模拟（审查：22pt 胶囊双内阴影过雕，内下黑 .28 删除）
         let top = NSView(frame: NSRect(x: 3, y: height - 2, width: width - 6, height: 1))
         top.wantsLayer = true
         top.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.10).cgColor
         addSubview(top)
-        let bottom = NSView(frame: NSRect(x: 3, y: 1, width: width - 6, height: 1))
-        bottom.wantsLayer = true
-        bottom.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
-        addSubview(bottom)
 
         label.font = DesignTokens.Font.kbd
         label.textColor = DesignTokens.label2

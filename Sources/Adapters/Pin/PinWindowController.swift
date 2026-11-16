@@ -482,9 +482,14 @@ final class PinWindowController {
     }
 
     private func fadeHUDOut() {
+        // 退场：fade + 下沉 2pt（审查：读数「沉回图片里」；翻转坐标 y+2 = 视觉向下）
+        let hud = contentView.hud
+        let sinkFrame = hud.frame
         NSAnimationContext.runAnimationGroup { context in
             context.duration = Self.hudFadeDuration
-            self.contentView.hud.animator().alphaValue = 0
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            hud.animator().alphaValue = 0
+            hud.animator().setFrameOrigin(CGPoint(x: sinkFrame.minX, y: sinkFrame.minY + 2))
         }
     }
 }

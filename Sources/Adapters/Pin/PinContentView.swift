@@ -15,7 +15,10 @@ import QuartzCore
 final class PinContentView: NSView {
     static let cornerRadius: CGFloat = 6
     static let groupCornerRadius: CGFloat = 10
-    static let borderWidth: CGFloat = 1
+    /// 贴图描边宽度：0.5pt（审查：1px 纯白是全产品最硬的边 → 0.5 阶）
+    static let borderWidth: CGFloat = 0.5
+    /// 未成组贴图描边色：white .55（原 alpha 1.0 纯白；分离度改由 0.5pt 半透线承担）
+    static let looseBorderAlpha: CGFloat = 0.55
 
     weak var controller: PinWindowController?
 
@@ -106,11 +109,26 @@ final class PinContentView: NSView {
         snapRingLayer = ring
     }
 
+    /// 吸附解除：outline/ring 0.12s fade-out（审查：磁性松开不应闪断瞬消）
     private func removeSnapHighlight() {
-        snapOutlineLayer?.removeFromSuperlayer()
-        snapRingLayer?.removeFromSuperlayer()
+        guard let outline = snapOutlineLayer, let ring = snapRingLayer else {
+            snapOutlineLayer = nil
+            snapRingLayer = nil
+            return
+        }
         snapOutlineLayer = nil
         snapRingLayer = nil
+        ring.removeAnimation(forKey: "snapRingPulse")
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.12)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        outline.opacity = 0
+        ring.opacity = 0
+        CATransaction.setCompletionBlock {
+            outline.removeFromSuperlayer()
+            ring.removeFromSuperlayer()
+        }
+        CATransaction.commit()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -205,13 +223,15 @@ final class PinContentView: NSView {
         ctx.draw(controller.image, in: imageRect)
         ctx.restoreGState()
 
-        // 3. 描边：未成组 1px 白描边（内缩 0.5pt 让描边完整落在窗口内，深浅背景都可见）；
-        //    成组 1px 深色发丝线骑在白垫外缘（白垫在深色桌面上自身已可见）
+        // 3. 描边：未成组 0.5pt white .55（原 1px 纯白 alpha 1.0 ——审查：全不透明白线
+        //    在深色壁纸上偏硬，比组框的 白.26 重一个数量级）；
+        //    成组 hair 发丝线骑在白垫外缘（白垫在深色桌面上自身已可见）
         let borderRect = rect.insetBy(dx: Self.borderWidth / 2, dy: Self.borderWidth / 2)
         let borderPath = CGPath(
             roundedRect: borderRect, cornerWidth: radius, cornerHeight: radius, transform: nil
         )
-        ctx.setStrokeColor(inGroup ? DesignTokens.hair.cgColor : NSColor.white.cgColor)
+        ctx.setStrokeColor(inGroup ? DesignTokens.hair.cgColor
+                                   : NSColor.white.withAlphaComponent(Self.looseBorderAlpha).cgColor)
         ctx.setLineWidth(Self.borderWidth)
         ctx.addPath(borderPath)
         ctx.strokePath()
@@ -251,10 +271,16 @@ final class PinHUDView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let path = CGPath(roundedRect: bounds, cornerWidth: 4, cornerHeight: 4, transform: nil)
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.75).cgColor)
+        // 深胶囊家族（与尺寸角标/tooltip 同族减实）：rgba(24,24,27,.62) + r5 + 0.5pt 白.14
+        // （原 black α.75 / r4 实心黑块）
+        let path = CGPath(roundedRect: bounds, cornerWidth: 5, cornerHeight: 5, transform: nil)
+        ctx.setFillColor(DesignTokens.capsuleDark.cgColor)
         ctx.addPath(path)
         ctx.fillPath()
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.14).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(path)
+        ctx.strokePath()
 
         let textSize = (text as NSString).size(withAttributes: Self.textAttributes)
         let origin = CGPoint(

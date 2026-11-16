@@ -172,6 +172,7 @@ final class PinMagnetRegistry {
         panel.setFrame(union.insetBy(dx: -outset, dy: -outset), display: true)
         panel.orderFrontRegardless()
         panel.refresh(count: members.count)
+        panel.playEntranceIfNeeded()
     }
 
     private func dissolve(groupID gid: Int, members: [PinWindowController]) {
@@ -182,7 +183,7 @@ final class PinMagnetRegistry {
     }
 
     private func closePanel(_ gid: Int) {
-        borderPanels[gid]?.orderOut(nil)
+        borderPanels[gid]?.dismissAnimated()   // 退场 fade 0.15s（completion 持有面板收窗）
         borderPanels[gid] = nil
     }
 

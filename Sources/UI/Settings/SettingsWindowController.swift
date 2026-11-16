@@ -105,7 +105,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         windowBuilt = true
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 640),
+            contentRect: NSRect(origin: .zero, size: DesignTokens.Settings.windowSize),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -129,7 +129,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         win.toolbar = toolbar
         win.delegate = self  // 需要 NSWindowDelegate（windowWillClose）
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 640))
+        let container = NSView(frame: NSRect(origin: .zero, size: DesignTokens.Settings.windowSize))
         // 档 3 窗底：全窗磨砂铺底（内容三层之下，含 titlebar 区域）
         let windowGlass = NSVisualEffectView()
         windowGlass.material = DesignTokens.Mat.window
@@ -158,12 +158,40 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         selectTab(0)
     }
 
-    // MARK: - Tab 切换（等大小子视图切 isHidden，无闪烁）
+    // MARK: - Tab 切换（motion.crossfade：0.15s fade + 新 pane rise 4pt，不再瞬切）
 
     private func selectTab(_ index: Int) {
-        generalPane.isHidden = index != 0
-        hotkeyPane.isHidden = index != 1
-        aboutPane.isHidden = index != 2
+        let panes = [generalPane, hotkeyPane, aboutPane]
+        guard panes.indices.contains(index) else { return }
+        let incoming = panes[index]
+        let wasHidden = incoming.isHidden
+        for (i, pane) in panes.enumerated() where i != index {
+            pane.isHidden = true
+        }
+        if wasHidden {
+            incoming.isHidden = false
+            incoming.alphaValue = 0
+            incoming.wantsLayer = true
+            if let layer = incoming.layer {
+                // rise 4pt 起步（layer 未翻转 y-up：-4 = 视觉在下方）
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.transform = CATransform3DMakeTranslation(0, -4, 0)
+                CATransaction.commit()
+            }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = DesignTokens.Motion.crossfadeDuration
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                incoming.animator().alphaValue = 1
+            }
+            if let layer = incoming.layer {
+                CATransaction.begin()
+                CATransaction.setAnimationDuration(DesignTokens.Motion.crossfadeDuration)
+                CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+                layer.transform = CATransform3DIdentity
+                CATransaction.commit()
+            }
+        }
         let id: NSToolbarItem.Identifier = index == 0
             ? Self.tabGeneral : (index == 1 ? Self.tabHotkeys : Self.tabAbout)
         window?.toolbar?.selectedItemIdentifier = id
@@ -847,12 +875,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
 
 // MARK: - 玻璃基元（分组卡 / 分隔线；token：fillCard / stroke / hair，明暗双值）
 
-/// 分组卡：radius 10 + fillCard 底（暗 白.045 / 亮 黑.04）+ 0.5pt stroke + 顶缘 inset.hi
-/// （窗底已是档 3 磨砂，卡自身不再叠材质；跟随系统外观）
+/// 分组卡：radius 10 + fillCard 底（暗 白.045 / 亮 黑.04）+ 0.5pt 卡专属描边（暗 白.10 / 亮 黑.08）
+/// （窗底已是档 3 磨砂，卡自身不再叠材质；跟随系统外观。
+///  轻盈感审查：描边 白.14 → 白.10 ——卡是区域不是盒子；inset.hi 顶缘高光删除——
+///  α.045 层级差上的高光是装饰不是信息，玻璃三档的卡容器才需要）
 @MainActor
 private final class GlassCardView: NSView {
-    private let highlight = CAGradientLayer()
-
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -869,25 +897,14 @@ private final class GlassCardView: NSView {
     override func layout() {
         super.layout()
         applyChrome()
-        // 顶缘 1pt 高光（layer 几何 Y 向上：顶部 = bounds.height - 1）
-        highlight.frame = CGRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1)
     }
 
     private func applyChrome() {
         layer?.cornerRadius = DesignTokens.Radius.lg
         layer?.masksToBounds = true
         layer?.borderWidth = 0.5
-        layer?.borderColor = DesignTokens.stroke.cgColor
+        layer?.borderColor = DesignTokens.Settings.cardStroke.cgColor
         layer?.backgroundColor = DesignTokens.fillCard.cgColor
-        // inset.hi：顶缘 1pt 白 .10（亮 .65）渐隐
-        highlight.colors = [
-            NSColor.white.withAlphaComponent(DesignTokens.Inset.hiAlpha.0).cgColor,
-            NSColor.white.withAlphaComponent(0).cgColor,
-        ]
-        highlight.startPoint = CGPoint(x: 0, y: 0.5)
-        highlight.endPoint = CGPoint(x: 1, y: 0.5)
-        highlight.locations = [0, 0.25]
-        if highlight.superlayer == nil { layer?.addSublayer(highlight) }
     }
 
     static var isDarkAppearance: Bool {
@@ -1035,10 +1052,18 @@ private final class HotkeyRecorderView: NSButton {
             .font: DesignTokens.Font.kbd,
             .foregroundColor: isRecording ? DesignTokens.label1 : DesignTokens.label2,
         ])
-        // 录制态：accent.ring 2.5pt 外环；常态 fill 底 + 0.5pt 内描边
-        layer?.backgroundColor = (isRecording ? DesignTokens.fill : DesignTokens.fill).cgColor
-        layer?.borderWidth = isRecording ? 2.5 : 0.5
-        layer?.borderColor = (isRecording ? DesignTokens.accentRing : DesignTokens.stroke).cgColor
+        // 录制态：accent.ring 1.5pt 外环（审查：2.5pt 占 22pt 控件高 11% 比例失真，
+        // 降到 1.5 阶内 + α.55 补偿）；常态透明 + 0.5pt stroke（审查：22pt 控件加底
+        // 色显「块」，系统热键录制是空框语气）。描边变化 0.18s ease-out 过渡
+        if let layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.18)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+            layer.backgroundColor = NSColor.clear.cgColor
+            layer.borderWidth = isRecording ? 1.5 : 0.5
+            layer.borderColor = (isRecording ? DesignTokens.accentRing : DesignTokens.stroke).cgColor
+            CATransaction.commit()
+        }
         recordingDot?.isHidden = !isRecording
     }
 

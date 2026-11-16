@@ -9,7 +9,7 @@ import CoreGraphics
 /// - 面板：padding 10（内容高 56）、radius 14、
 ///   mat.hud（hudWindow 钉暗，**不再叠 60% 深色着色**——材质本身已够暗）、
 ///   border 0.5pt stroke（白 .14）、inset.hi 顶缘内高光 白 .10、
-///   shadow.float 双层投影（radius 15 offset(0,10) α.50 / radius 32 offset(0,28) α.55）
+///   shadow.float 单层投影（radius 44 offset(0,18) α.30 spread 20，高而淡）
 /// - 按钮：28×28、radius 7、图标 16pt（SF Symbol pointSize 14/medium）、默认白 85%、
 ///   hover fill.hover（灰 α.36）**不上移**；选中 accent 实心 + 白图标 + inset.hi.strong，
 ///   **删除蓝色外发光**
@@ -45,8 +45,9 @@ private enum TBStyle {
     static let separatorMargin: CGFloat = DesignTokens.Toolbar.separatorMargin // 4
     /// 窗口四周投影留白：NSWindow 会把 contentView 外的绘制裁掉，
     /// 面板投影要溢出面板边界就得多给窗口留画布；留白区 hitTest 穿透。
-    /// 尺寸校验：底部阴影最远 ~ offset 28 + radius 32 − spread 24 = 36pt
-    static let shadowMargin: CGFloat = 40
+    /// 尺寸校验：轻盈感审查新值（shadowMargin 40→28）——单层影上缘仅 offset 18 −
+    /// (radius 44 − spread 20) = −6（收进面板），左右 24、下缘 42（尾部 α.30 极淡）
+    static let shadowMargin: CGFloat = 28
     static let dotSide: CGFloat = DesignTokens.Toolbar.dotSide       // 14
     static let dotGap: CGFloat = DesignTokens.Toolbar.dotGap         // 6
     static let sliderWidth: CGFloat = DesignTokens.Control.sliderWidth // 76
@@ -150,27 +151,18 @@ final class ToolbarPanel: NSPanel {
             root.bottomAnchor.constraint(equalTo: outer.bottomAnchor, constant: -m),
         ])
 
-        // 1) 面板投影（shadow.float 双层，照 tokens.md 顺序画在最底）
-        //    0 10 30 −8 .50 → radius 15 offset(0,-10) spread 8
-        let shadowFar = makeShadowView(radius: 15, offset: CGSize(width: 0, height: -10),
-                                       alpha: 0.50, spread: 8)
-        //    0 28 64 −24 .55 → radius 32 offset(0,-28) spread 24
-        let shadowNear = makeShadowView(radius: 32, offset: CGSize(width: 0, height: -28),
-                                        alpha: 0.55, spread: 24)
-        root.addSubview(shadowFar)
-        root.addSubview(shadowNear)
+        // 1) 面板投影（shadow.float 单层，高而淡：r44 · offset(0,-18) · α.30 · spread 20）
+        let shadowFloat = makeShadowView(radius: 44, offset: CGSize(width: 0, height: -18),
+                                         alpha: 0.30, spread: 20)
+        root.addSubview(shadowFloat)
         // ⚠️ 旧版病例：投影视图只创建没加约束（frame 恒为 0），且窗口=面板大小，
         // 阴影被窗口边界裁掉——投影从来没画出来过。现在铺满面板本体，
         // shadowPath 用自身 bounds（见 applyPanelShadowPaths）
         NSLayoutConstraint.activate([
-            shadowFar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            shadowFar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            shadowFar.topAnchor.constraint(equalTo: root.topAnchor),
-            shadowFar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            shadowNear.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            shadowNear.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            shadowNear.topAnchor.constraint(equalTo: root.topAnchor),
-            shadowNear.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            shadowFloat.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            shadowFloat.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            shadowFloat.topAnchor.constraint(equalTo: root.topAnchor),
+            shadowFloat.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
 
         // 2) 玻璃容器（mat.hud：hudWindow 磨砂，**不再叠深色着色**——材质本身已够暗）；
@@ -368,7 +360,7 @@ final class ToolbarPanel: NSPanel {
         return view
     }
 
-    /// 布局完成后给两个投影视图设置 shadowPath（含 -8px spread：路径内缩 8）。
+    /// 布局完成后给投影视图设置 shadowPath（含 spread 20：路径内缩 20）。
     /// 投影视图已铺满面板本体，路径直接取自身 bounds，无跨视图坐标系换算
     private func applyPanelShadowPaths() {
         guard let root = panelRoot else { return }
@@ -461,19 +453,97 @@ final class ToolbarPanel: NSPanel {
         origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - panelSize.height - 8)
         origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - panelSize.width - 8)
 
-        // 原型入场：translateY(8px)→0 + scale(.985)→1 + 淡入，240ms spring
-        // 窗口原点 = 面板原点 - 留白；入场平移量不变
+        // motion.enter 入场：rise 10pt + scale .97→1 + fade，0.26s spring
+        // （注释里的 scale 承诺已兑现；窗体 frame 动画走 NSAnimationContext，
+        //  scale 在根视图 layer transform 上同步动画）
         let finalFrame = CGRect(origin: CGPoint(x: origin.x - margin, y: origin.y - margin),
                                 size: frame.size)
-        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - 8))
+        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - DesignTokens.Motion.enterRise))
         alphaValue = 0
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DMakeScale(DesignTokens.Motion.enterScale,
+                                                     DesignTokens.Motion.enterScale, 1)
+            CATransaction.commit()
+        }
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.24
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.3, 0.5, 1)
+            ctx.duration = DesignTokens.Motion.enterDuration
+            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
             self.animator().setFrame(finalFrame, display: true)
             self.animator().alphaValue = 1
         })
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(DesignTokens.Motion.enterDuration)
+            CATransaction.setAnimationTimingFunction(DesignTokens.Motion.springTimingFunction)
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+        }
         scheduleButtonDump()
+    }
+
+    /// H 显隐唤回时的复用入场（与 place() 同语言：fade + rise 10pt + scale .97→1）
+    func playEnter() {
+        guard isVisible else { return }
+        let finalFrame = frame
+        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - DesignTokens.Motion.enterRise))
+        alphaValue = 0
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DMakeScale(DesignTokens.Motion.enterScale,
+                                                     DesignTokens.Motion.enterScale, 1)
+            CATransaction.commit()
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = DesignTokens.Motion.enterDuration
+            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
+            self.animator().setFrame(finalFrame, display: true)
+            self.animator().alphaValue = 1
+        })
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(DesignTokens.Motion.enterDuration)
+            CATransaction.setAnimationTimingFunction(DesignTokens.Motion.springTimingFunction)
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+        }
+    }
+
+    /// motion.exit 退场：fade + scale→.97 + 下沉 4pt，0.16s ease-in；
+    /// orderOut 延迟到动画尾（completionHandler 强持有 self，调用方同步置 nil
+    /// 也不会让动画中断）。H 显隐、会话结束共用。
+    func dismiss() {
+        tooltip?.hide()
+        guard isVisible else {
+            orderOut(nil)
+            return
+        }
+        if let layer = contentView?.layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(DesignTokens.Motion.exitDuration)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeIn))
+            layer.transform = CATransform3DMakeScale(DesignTokens.Motion.exitScale,
+                                                     DesignTokens.Motion.exitScale, 1)
+            CATransaction.commit()
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = DesignTokens.Motion.exitDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            self.animator().alphaValue = 0
+            var sinkFrame = frame
+            sinkFrame.origin.y -= DesignTokens.Motion.exitSink
+            self.animator().setFrame(sinkFrame, display: true)
+        }, completionHandler: {
+            self.orderOut(nil)
+            if let layer = self.contentView?.layer {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.transform = CATransform3DIdentity
+                CATransaction.commit()
+            }
+        })
     }
 
     // 诊断打点（真机验证坐标来源）
@@ -829,7 +899,7 @@ private final class TBColorButton: NSButton {
         title = ""
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        // 命中区 = 色点本身（原型 .dot 无 hover 底色，只有 scale 1.18）
+        // 命中区 = 色点本身（原型 .dot 无 hover 底色，只有 scale 1.12）
         widthAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
         heightAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
 
@@ -888,7 +958,7 @@ private final class TBColorButton: NSButton {
         CATransaction.begin()
         CATransaction.setAnimationDuration(0.16)
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(controlPoints: 0.34, 1.3, 0.5, 1))
-        dot.layer?.transform = CATransform3DMakeScale(1.18, 1.18, 1)
+        dot.layer?.transform = CATransform3DMakeScale(1.12, 1.12, 1) // 审查：14pt 点放大 18% 近邻冲突 → 1.12
         CATransaction.commit()
     }
 
@@ -1007,6 +1077,7 @@ private final class TBPrimaryButton: NSButton {
 private final class ToolbarTooltipWindow: NSPanel {
     private let label = NSTextField(labelWithString: "")
     private var work: DispatchWorkItem?
+    private var hideEpoch = 0
 
     init() {
         super.init(
@@ -1029,11 +1100,11 @@ private final class ToolbarTooltipWindow: NSPanel {
         bg.layer?.backgroundColor = NSColor(srgbRed: 0.094, green: 0.094, blue: 0.106, alpha: 0.86).cgColor
         bg.layer?.borderWidth = 0.5
         bg.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
-        // 0 6px 16px rgba(0,0,0,.35)
-        bg.layer?.shadowColor = NSColor.black.withAlphaComponent(0.35).cgColor
+        // 0 4px 8px rgba(0,0,0,.22)（审查：描边+深底已够分离，阴影减淡收窄）
+        bg.layer?.shadowColor = NSColor.black.withAlphaComponent(0.22).cgColor
         bg.layer?.shadowOpacity = 1
         bg.layer?.shadowRadius = 8
-        bg.layer?.shadowOffset = CGSize(width: 0, height: -6)
+        bg.layer?.shadowOffset = CGSize(width: 0, height: -4)
 
         label.font = .systemFont(ofSize: 10.5, weight: .medium)
         label.textColor = NSColor.white.withAlphaComponent(0.94)
@@ -1049,6 +1120,7 @@ private final class ToolbarTooltipWindow: NSPanel {
 
     func show(text: String, above rect: CGRect, after delay: TimeInterval) {
         work?.cancel()
+        hideEpoch += 1   // 使未完成的 hide 退场动画失效（快速扫过按钮时 hide/show 交错）
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             label.stringValue = text
@@ -1076,7 +1148,20 @@ private final class ToolbarTooltipWindow: NSPanel {
 
     func hide() {
         work?.cancel()
-        orderOut(nil)
+        // 退场补 fade 0.12s（原 orderOut 直切）：cancel work 后动画出再收窗。
+        // epoch 守卫：退场动画期间又 show() 时，旧的 completion 不再收窗
+        hideEpoch += 1
+        let epoch = hideEpoch
+        guard isVisible else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            self.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self, epoch == self.hideEpoch else { return }
+            self.orderOut(nil)
+            self.alphaValue = 1   // 复位，下次 show() 从 0 起动画
+        })
     }
 }
 

@@ -65,6 +65,28 @@ final class GroupBorderPanel: NSPanel {
         borderView.needsDisplay = true
         borderView.layoutChrome()
     }
+
+    /// 成组诞生动效（幂等）：框线 α 0→1（0.25s ease-out）+ 徽标/合成钮 fade + rise 6pt spring。
+    /// 「组」的诞生是全画面最值得有动画的时刻（原瞬跳）
+    func playEntranceIfNeeded() {
+        borderView.playEntranceIfNeeded()
+    }
+
+    /// 退场：fade 0.15s 后 orderOut（原 orderOut 直切）
+    func dismissAnimated() {
+        guard isVisible else {
+            orderOut(nil)
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            self.animator().alphaValue = 0
+        }, completionHandler: {
+            self.orderOut(nil)
+            self.alphaValue = 1   // 复位（面板可能被复用重建路径再次引用）
+        })
+    }
 }
 
 /// 组框内容视图：0.5pt 极细框 + 玻璃徽标 + accent 合成按钮；
@@ -91,6 +113,8 @@ final class GroupBorderView: NSView {
     private let badgeView: NSVisualEffectView
     private let badgeField = NSTextField(labelWithString: "")
     private let assembleButton = NSButton(title: "合成", target: nil, action: nil)
+    /// 成组诞生动效只播一次（union rect 刷新会反复调 layoutChrome，不能重播）
+    private var entrancePlayed = false
 
     override var isFlipped: Bool { true }
 
@@ -251,6 +275,32 @@ final class GroupBorderView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         panel?.onDragEnd?()
+    }
+
+    // MARK: - 成组诞生动效（motion.enter 缩小版）
+
+    /// 框线 α 0→1（0.25s ease-out）+ 徽标/合成钮 fade + rise 6pt spring。
+    /// 在 layoutChrome 落位之后调用（registry：orderFront + refresh 后）
+    func playEntranceIfNeeded() {
+        guard !entrancePlayed else { return }
+        entrancePlayed = true
+        alphaValue = 0
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            animator().alphaValue = 1
+        }
+        // 徽标/合成钮 rise 6pt spring：翻转坐标 y+6 = 视觉在下方，起步后上浮落定
+        let badgeFinal = badgeView.frame
+        let buttonFinal = assembleButton.frame
+        badgeView.frame = badgeFinal.offsetBy(dx: 0, dy: 6)
+        assembleButton.frame = buttonFinal.offsetBy(dx: 0, dy: 6)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
+            badgeView.animator().setFrameOrigin(badgeFinal.origin)
+            assembleButton.animator().setFrameOrigin(buttonFinal.origin)
+        }
     }
 
     // MARK: - 绘制

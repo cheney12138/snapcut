@@ -165,9 +165,12 @@ final class OverlayView: NSView {
     private var trackingAreaRef: NSTrackingArea?
 
     // 视觉常量
-    private let dimAlpha: CGFloat = 0.25
+    /// 蒙层：0.22（审查：0.25 → 轻 12%，选区提亮不变）
+    private let dimAlpha: CGFloat = 0.22
     private let borderWidth: CGFloat = 1.5
     private let minSelectionSize: CGFloat = 4
+    /// 窗口悬停高亮淡入起点（审查：悬停反馈应「亮起」不是「出现」，0.12s）
+    private var hoverFadeStart: CFTimeInterval = 0
 
     init(frame frameRect: NSRect, controller: OverlayController) {
         self.controller = controller
@@ -342,6 +345,7 @@ final class OverlayView: NSView {
         let found = WindowLocator.window(atGlobalPoint: global, excludingPID: getpid())
         guard found != hovered else { return }
         hovered = found
+        if found != nil { hoverFadeStart = CACurrentMediaTime() }
         hoveredLocalRect = found.map {
             CGRect(
                 x: $0.rectGlobal.minX - frame.minX,
@@ -356,6 +360,7 @@ final class OverlayView: NSView {
     private func clearHover() {
         hovered = nil
         hoveredLocalRect = nil
+        hoverFadeStart = 0
         needsDisplay = true
     }
 
@@ -862,28 +867,60 @@ final class OverlayView: NSView {
         let pointSize = CGFloat(editorSession?.textFontSize
             ?? OverlayView.textFontSizes[1])
         let localPoint = annotationToLocal(annotationPoint)
-        // v0.5 文字输入重做：高 32（旧 24）、玻璃深底 + 白字（深色主题）、
-        // 聚焦 #0A84FF 1.5pt 描边（GlassTextField 内部处理）、placeholder 白 55% 可读
+        // §10-9 落地：无底透明框 + 0.5pt 当前标注色 α.60 描边（描边色 =「这段字会用
+        // 什么颜色」的语义）；placeholder 删除（空框 + caret 即最强「请输入」）
         let field = GlassTextField(frame: NSRect(
             x: localPoint.x, y: localPoint.y - 16,
             width: max(160, editorRectLocal.width - localPoint.x),
             height: 32
         ))
         field.font = .systemFont(ofSize: pointSize, weight: .medium)
-        field.textColor = .white   // 玻璃深底默认白字；选了画笔色则用画笔色（实时预览语义不变）
+        field.textColor = .white
         if let colorIndex = editorSession?.colorIndex, AnnotationModel.palette.indices.contains(colorIndex) {
-            field.textColor = NSColor(cgColor: AnnotationModel.palette[colorIndex].cgColor) ?? .red
+            let paletteColor = NSColor(cgColor: AnnotationModel.palette[colorIndex].cgColor) ?? .red
+            field.textColor = paletteColor
+            field.annotationColor = paletteColor
         }
-        field.placeholderString = "输入文字，Enter 确认"
         field.target = self
         field.action = #selector(textFieldCommit(_:))
         field.delegate = self
         addSubview(field)
+        playTextFieldEntrance(field)
         window?.makeFirstResponder(field)
         textField = field
         installFontSizePicker(near: field.frame)
         // 记录落点（确认时生成标注）
         textFieldAnchor = annotationPoint
+    }
+
+    /// 文字件入场（motion.enter 缩小版）：fade + rise 8pt，0.22s spring
+    private func playTextFieldEntrance(_ view: NSView) {
+        let finalFrame = view.frame
+        view.frame = finalFrame.offsetBy(dx: 0, dy: 8)   // 翻转坐标 y+8 = 视觉在下方，起 步后上浮
+        view.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
+            view.animator().setFrameOrigin(finalFrame.origin)
+            view.animator().alphaValue = 1
+        }
+    }
+
+    /// 文字件退场：fade 0.12s（原瞬删）——completionHandler 持有视图至移除
+    private func fadeOutTextField(_ view: NSView) {
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            view.animator().alphaValue = 0
+        }, completionHandler: { view.removeFromSuperview() })
+    }
+
+    /// Esc 取消文字输入：框与字号条 fade 退场，不落标注
+    private func cancelTextEditing() {
+        if let field = textField { fadeOutTextField(field) }
+        textField = nil
+        textFieldAnchor = nil
+        removeFontSizePicker()
     }
 
     /// 浮动 4 档字号选择条（Aa12/Aa14/Aa17/Aa21）：贴在输入框上方 8pt（不遮挡输入框），
@@ -907,6 +944,7 @@ final class OverlayView: NSView {
         origin.y = min(max(origin.y, 4), bounds.height - size.height - 4)
         bar.frame = CGRect(origin: origin, size: size)
         addSubview(bar)
+        playTextFieldEntrance(bar)   // 字号件与输入框同源入场（fade + rise 8pt）
         fontSizePicker = bar
     }
 
@@ -919,7 +957,7 @@ final class OverlayView: NSView {
     private func commitTextFieldIfNeeded() {
         guard let field = textField, let anchor = textFieldAnchor, let session = editorSession else { return }
         let text = field.stringValue
-        field.removeFromSuperview()
+        fadeOutTextField(field)
         removeFontSizePicker()
         if !text.isEmpty {
             controller.addAnnotation(AnnotationModel(
@@ -936,10 +974,11 @@ final class OverlayView: NSView {
         window?.makeFirstResponder(self)
     }
 
-    /// Esc/提交后一并拆掉浮动字号条
+    /// Esc/提交后一并拆掉浮动字号条（fade 0.12s）
     private func removeFontSizePicker() {
-        fontSizePicker?.removeFromSuperview()
+        guard let picker = fontSizePicker else { return }
         fontSizePicker = nil
+        fadeOutTextField(picker)
     }
 
     override func keyUp(with event: NSEvent) {
@@ -1006,10 +1045,7 @@ final class OverlayView: NSView {
             }
             if textField != nil {
                 // 文字输入态的 Esc：取消文字（R4 语义在编辑器内优先作用于文字）
-                textField?.removeFromSuperview()
-                textField = nil
-                textFieldAnchor = nil
-                removeFontSizePicker()
+                cancelTextEditing()
                 window?.makeFirstResponder(self)
                 return
             }
@@ -1176,14 +1212,23 @@ final class OverlayView: NSView {
         ctx.fill(bounds)
 
         // 1.5 窗口悬停高亮：挖出该窗口区域（提亮）+ 系统蓝描边 + 应用名角标
+        // 审查：悬停是未确认态，层级低于主选区 —— accent α.85 · 1.5pt（原 2pt α.95）
+        // + 0.12s alpha 淡入（draw 路径用时间插值，未满 1 时保持重绘）
         let selectionEmpty = selectionLocal.width <= 0 && selectionLocal.height <= 0
         if selectionEmpty, let rect = hoveredLocalRect, let target = hovered {
+            let elapsed = hoverFadeStart > 0 ? CACurrentMediaTime() - hoverFadeStart : 1
+            let hoverAlpha = min(1, CGFloat(elapsed / 0.12))
+            if hoverAlpha < 1 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in
+                    self?.needsDisplay = true
+                }
+            }
             ctx.saveGState()
             ctx.setBlendMode(.clear)
             ctx.fill(rect)
             ctx.restoreGState()
-            ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.95).cgColor)
-            ctx.setLineWidth(2)
+            ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.85 * hoverAlpha).cgColor)
+            ctx.setLineWidth(1.5)
             ctx.stroke(rect.insetBy(dx: 1, dy: 1))
             let label = target.title.isEmpty ? target.ownerName : "\(target.ownerName) · \(target.title)"
             drawWindowBadge(text: label, below: rect)
@@ -1275,9 +1320,9 @@ final class OverlayView: NSView {
         CGRenderer.render(annotations: annotations, in: editorRectLocal.size, context: ctx, contextIsYDown: true)
         ctx.restoreGState()
 
-        // 4. 选区描边（编辑态的画布边界）
-        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
-        ctx.setLineWidth(1)
+        // 4. 选区描边（编辑态的画布边界；审查：与框选态统一线宽阶梯 white .85 · 1.5pt）
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.85).cgColor)
+        ctx.setLineWidth(borderWidth)
         ctx.stroke(editorRectLocal)
 
         // 4.5 手柄（选区足够大时）：8 个白色方块，悬停的加粗
@@ -1333,11 +1378,14 @@ final class OverlayView: NSView {
             let isHot = hoverEdge == edge
             let s = isHot ? size + 3 : size
             let box = CGRect(x: center.x - s / 2, y: center.y - s / 2, width: s, height: s)
+            // 审查：删 black .45 描边（white 方块在冻结底图上自带对比，黑边是噪音）；
+            // 改 shadow(black .30, r2, offset 0 1) 承担分离度。翻转上下文 y+1 = 视觉向下
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 2,
+                          color: NSColor.black.withAlphaComponent(0.30).cgColor)
             ctx.setFillColor(NSColor.white.cgColor)
             ctx.fill(box)
-            ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.45).cgColor)
-            ctx.setLineWidth(1)
-            ctx.stroke(box)
+            ctx.restoreGState()
         }
     }
 
@@ -1358,11 +1406,12 @@ final class OverlayView: NSView {
         )
     }
 
-    /// 尺寸角标：原型 `.size-badge`（黑 72% 胶囊 + 11pt semibold 白字）
+    /// 尺寸角标：深胶囊 rgba(24,24,27,.62) + 0.5pt stroke 白 .14（并入 tooltip 深胶囊家族；
+    /// 原 black .72 实心胶囊），文字 white .94
     private func drawBadge(text: String, below rect: CGRect) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.96),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.94),
         ]
         let textSize = (text as NSString).size(withAttributes: attributes)
         let padding: CGFloat = 7
@@ -1374,9 +1423,13 @@ final class OverlayView: NSView {
         let badgeRect = CGRect(origin: origin, size: size)
         let path = CGPath(roundedRect: badgeRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
         let ctx = NSGraphicsContext.current?.cgContext
-        ctx?.setFillColor(NSColor.black.withAlphaComponent(0.72).cgColor)
+        ctx?.setFillColor(DesignTokens.capsuleDark.cgColor)
         ctx?.addPath(path)
         ctx?.fillPath()
+        ctx?.setStrokeColor(NSColor.white.withAlphaComponent(0.14).cgColor)
+        ctx?.setLineWidth(0.5)
+        ctx?.addPath(path)
+        ctx?.strokePath()
         (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + padding / 2), withAttributes: attributes)
     }
 
@@ -1414,10 +1467,7 @@ extension OverlayView: NSTextFieldDelegate {
                 commitTextFieldIfNeeded()
                 return true
             case #selector(NSResponder.cancelOperation(_:)):
-                textField?.removeFromSuperview()
-                textField = nil
-                textFieldAnchor = nil
-                removeFontSizePicker()
+                cancelTextEditing()
                 window?.makeFirstResponder(self)
                 return true
             default:
@@ -1434,73 +1484,54 @@ private extension NSRect {
     func minus(_ other: NSRect) -> NSRect { self }
 }
 
-// MARK: - 文字输入视觉件（v0.5 重做：与 ToolbarPanel 同一玻璃视觉家族）
+// MARK: - 文字输入视觉件（§10-9 落地：透明底 + 标注色描边；glass 不叠色、无发光）
 //
-// 视觉 token 对齐 ToolbarPanel.TBStyle（Sources/UI/Editor/ToolbarPanel.swift）：
-// - 容器：hudWindow 磨砂 + rgba(38,38,43,.60) 深着色、radius 12/10、border 0.5pt 白 16%
-// - 按钮档：高 28、radius 8、文字 13pt medium、默认白 82%、hover 白 12% 底
-// - 选中档：#0A84FF 底 + 白字 + inset 白高光 + 蓝色外发光 rgba(10,132,255,.42)
-// - 输入框：rgba(38,38,43,.72) 玻璃深底、白字、placeholder 白 55%、聚焦 #0A84FF 1.5pt
+// 视觉 token 对齐 tokens.md §10-9（轻盈感审查后落地）：
+// - 输入框：无底透明，唯一指示 = 0.5pt 当前标注色 α.60 描边（placeholder 删除）
+// - 字号条：hudWindow 玻璃（不叠 60% tint）+ 0.5pt 白 16% 描边；选中档不发光
 
 @MainActor
 private enum TextUIStyle {
     static let accent = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1)        // #0A84FF
     static let accentHover = NSColor(srgbRed: 0.102, green: 0.549, blue: 1.0, alpha: 1)   // #1A8CFF
-    static let accentGlow = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 0.42) // rgba(10,132,255,.42)
-    static let glassTint = NSColor(srgbRed: 0.149, green: 0.149, blue: 0.169, alpha: 0.60) // rgba(38,38,43,.60)
     static let borderIdle = NSColor.white.withAlphaComponent(0.16)
     static let textIdle = NSColor.white.withAlphaComponent(0.82)
     static let textActive = NSColor.white
     static let hoverFill = NSColor.white.withAlphaComponent(0.12)
+    /// 标注色描边 α .60（描边色即「这段字会用什么颜色」的语义，比通用蓝多一层信息）
+    static let annotationBorderAlpha: CGFloat = 0.60
 }
 
-// MARK: - 玻璃输入框（深色主题：玻璃深底 + 白字；聚焦 #0A84FF 1.5pt 描边）
+// MARK: - 文字输入框（§10-9：透明底 + 0.5pt 标注色 α.60 描边；无 placeholder 无聚焦框）
 
 @MainActor
 private final class GlassTextField: NSTextField {
+    /// 当前画笔色（描边语义色；未设置时回落 accent）
+    var annotationColor: NSColor = TextUIStyle.accent
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         isBordered = false
         drawsBackground = false
         focusRingType = .none
-        placeholderAttributedString = NSAttributedString(
-            string: "输入文字，Enter 确认",
-            attributes: [
-                // placeholder 提亮到 secondaryLabel 级以上（白 55% ≈ 深色主题 secondaryLabel 60% 白）
-                .font: NSFont.systemFont(ofSize: 14, weight: .medium),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.55),
-            ])
         wantsLayer = true
         layer?.cornerRadius = 10
         layer?.masksToBounds = true
-        layer?.backgroundColor = NSColor(srgbRed: 0.149, green: 0.149, blue: 0.169, alpha: 0.72).cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor   // 实心底已判死（token §10-9）
         layer?.borderWidth = 0.5
-        layer?.borderColor = TextUIStyle.borderIdle.cgColor
+        applyAnnotationBorder()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) 不支持") }
 
-    private func setFocused(_ focused: Bool) {
+    private func applyAnnotationBorder() {
         guard let layer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.borderWidth = focused ? 1.5 : 0.5
-        layer.borderColor = focused
-            ? TextUIStyle.accent.cgColor
-            : TextUIStyle.borderIdle.cgColor
+        layer.borderWidth = 0.5
+        layer.borderColor = annotationColor.withAlphaComponent(TextUIStyle.annotationBorderAlpha).cgColor
         CATransaction.commit()
-    }
-
-    override func becomeFirstResponder() -> Bool {
-        let ok = super.becomeFirstResponder()
-        if ok { setFocused(true) }
-        return ok
-    }
-
-    override func resignFirstResponder() -> Bool {
-        setFocused(false)
-        return super.resignFirstResponder()
     }
 }
 
@@ -1529,7 +1560,7 @@ private final class FontSizeBarView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
 
-        // 玻璃容器（工具栏同款：hudWindow 磨砂 + 60% 深着色 + 0.5pt 白 16% 描边）
+        // 玻璃容器（工具栏同款：hudWindow 磨砂 + 0.5pt 白 16% 描边；60% 叠色已判死，不再叠 tint）
         effect.material = .hudWindow
         effect.blendingMode = .behindWindow
         effect.state = .active
@@ -1538,7 +1569,6 @@ private final class FontSizeBarView: NSView {
         effect.layer?.masksToBounds = true
         effect.layer?.borderWidth = 0.5
         effect.layer?.borderColor = TextUIStyle.borderIdle.cgColor
-        effect.layer?.backgroundColor = TextUIStyle.glassTint.cgColor
         addSubview(effect)
 
         stack.orientation = .horizontal
@@ -1575,7 +1605,7 @@ private final class FontSizeBarView: NSView {
     }
 }
 
-// MARK: - 字号档按钮（28 高「Aa14」胶囊：选中 #0A84FF 高亮 + 蓝色外发光，hover 变亮）
+// MARK: - 字号档按钮（28 高「Aa14」胶囊：选中 #0A84FF 高亮，hover 变亮；蓝色 glow 已删）
 
 @MainActor
 private final class FontSizeOptionButton: NSButton {
@@ -1595,7 +1625,6 @@ private final class FontSizeOptionButton: NSButton {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 8
-        // 外发光不能被裁剪
         layer?.masksToBounds = false
         widthAnchor.constraint(equalToConstant: FontSizeBarView.buttonSize.width).isActive = true
         heightAnchor.constraint(equalToConstant: FontSizeBarView.buttonSize.height).isActive = true
@@ -1641,13 +1670,8 @@ private final class FontSizeOptionButton: NSButton {
         if isSelectedState {
             layer.backgroundColor = (isHot ? TextUIStyle.accentHover : TextUIStyle.accent).cgColor
             setStyledTitle(TextUIStyle.textActive, size: 13)
-            // 蓝色外发光：0 2px 8px rgba(10,132,255,.42) → radius 4 / offset -2（向下）
-            layer.shadowColor = TextUIStyle.accentGlow.cgColor
-            layer.shadowOpacity = 1
-            layer.shadowRadius = 4
-            layer.shadowOffset = CGSize(width: 0, height: -2)
-            layer.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                      cornerWidth: 8, cornerHeight: 8, transform: nil)
+            // 蓝色外发光已删（token §1.1 删除项）：唯一彩块语义由 accent 底承担
+            layer.shadowOpacity = 0
             if !highlightInstalled {
                 layer.addSublayer(highlightGradient)
                 highlightInstalled = true
@@ -1671,10 +1695,6 @@ private final class FontSizeOptionButton: NSButton {
         mask.path = path
         highlightGradient.frame = bounds
         highlightGradient.mask = mask
-        if isSelectedState {
-            layer?.shadowPath = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
-                                       cornerWidth: 8, cornerHeight: 8, transform: nil)
-        }
     }
 
     override func updateTrackingAreas() {

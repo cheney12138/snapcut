@@ -116,7 +116,7 @@ final class OverlayController {
             Log.event(.app, "focus.begin.record", ["pid": "-1", "bundle": "nil"])
         }
         editorSession = nil
-        toolbar?.orderOut(nil)
+        toolbar?.dismiss()   // motion.exit；completion 持有面板至收窗
         toolbar = nil
         dismissAll()
         frozenImages.removeAll()
@@ -233,7 +233,7 @@ final class OverlayController {
         overlaySessionEpoch += 1
         dismissAll()
         editorSession = nil
-        toolbar?.orderOut(nil)
+        toolbar?.dismiss()   // motion.exit；completion 持有面板至收窗
         toolbar = nil
         ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
         ocrCloseObserver = nil
@@ -446,7 +446,7 @@ final class OverlayController {
         // 幂等清理（病例 2026-11-16：enter.fromScroll 在 compose 回退链被调两次
         // ——旧工具栏不拆、双面板 + panel 负坐标）：重入先撤旧编辑视觉
         if editorSession != nil {
-            toolbar?.orderOut(nil)
+            toolbar?.dismiss()   // motion.exit；completion 持有面板至收窗
             toolbar = nil
             for window in windows {
                 window.exitScrollMode()
@@ -549,9 +549,10 @@ final class OverlayController {
             session.toolbarVisible.toggle()
             if session.toolbarVisible {
                 toolbar?.orderFrontRegardless()
+                toolbar?.playEnter()   // H 显隐复用同一对入退场动画（拿起/放下闭环）
             } else {
-                toolbar?.orderOut(nil)
                 toolbar?.hideTooltip()
+                toolbar?.dismiss()     // motion.exit：fade + scale→.97 + 下沉 4pt
             }
             // 显隐按钮图标同步：隐藏态 = eye.slash，再次点/按 H 唤回时表达「当前收起」
             toolbar?.setToolbarHidden(!session.toolbarVisible)
@@ -675,9 +676,9 @@ final class OverlayController {
         scrollRefBuffer = nil
         scrollEverScrolled = false
 
-        // 编辑态 UI 退场（会话保留）
-        toolbar?.orderOut(nil)
+        // 编辑态 UI 退场（会话保留；motion.exit 替代 orderOut 直切）
         toolbar?.hideTooltip()
+        toolbar?.dismiss()
 
         let controller = ScrollCaptureController()
         controller.onFrame = { [weak self] frame in self?.handleScrollFrame(frame) }

@@ -129,16 +129,17 @@ final class ScrollCaptureHUDPanel: NSPanel {
         ])
     }
 
-    /// 呼吸点：opacity .22↔1 的 1.2s pulse，三点依次延迟 0.2s（scene 06 .s6-spin）
+    /// 呼吸点：opacity .35↔1 的 1.2s pulse，三点依次延迟 0.2s（scene 06 .s6-spin；
+    /// 审查：.22↔1 满幅闪烁 → .35↔1 呼吸）
     private func installBreathingAnimation(on view: NSView) {
         let anim = CABasicAnimation(keyPath: "opacity")
-        anim.fromValue = 0.22
+        anim.fromValue = DesignTokens.Scroll.breathingAlphaMin
         anim.toValue = 1.0
         anim.duration = 1.2
         anim.autoreverses = true
         anim.repeatCount = .infinity
         anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        view.layer?.opacity = 0.22
+        view.layer?.opacity = DesignTokens.Scroll.breathingAlphaMin
         view.layer?.add(anim, forKey: "breathing")
     }
 
@@ -156,7 +157,12 @@ final class ScrollCaptureHUDPanel: NSPanel {
     /// - waiting：等待首次滚动（刚进入，还没净贡献帧）
     /// - capturing(n)：采集中——已入列 n 帧（净贡献帧，非采样数）
     /// - fastScroll(hint)：滚动过快提示（帧被丢弃，请放慢）——短暂显示后回落
+    private var lastStateKind: String = ""
+
     func update(frames: Int, progress: CGFloat, droppedHint: Bool = false) {
+        let kind = frames <= 0 ? "waiting" : (droppedHint ? "dropped" : "capturing")
+        let stateChanged = kind != lastStateKind
+        lastStateKind = kind
         if frames <= 0 {
             countLabel.attributedStringValue = Self.hintText("等待滚动…")
         } else if droppedHint {
@@ -168,7 +174,22 @@ final class ScrollCaptureHUDPanel: NSPanel {
         progressFillWidthConstraint?.constant =
             DesignTokens.Scroll.progressSize.width * min(max(progress, 0), 1)
         contentView?.layoutSubtreeIfNeeded()
+        if stateChanged {
+            // 三态切换 crossfade（motion.crossfade 0.15s ease-out）：等待/采集/过快
+            // 不再瞬跳，像一块连续的东西
+            crossfade(capturingStack)
+        }
         adjustWindowSize()
+    }
+
+    /// motion.crossfade：内容态切换 0.15s 透明度过渡（新内容淡入）
+    private func crossfade(_ view: NSView) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = DesignTokens.Motion.crossfadeDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            view.alphaValue = 0
+            view.animator().alphaValue = 1
+        }
     }
 
     private static func hintText(_ text: String) -> NSAttributedString {
@@ -178,12 +199,27 @@ final class ScrollCaptureHUDPanel: NSPanel {
         ])
     }
 
-    /// 到底：切确认态（呼吸点/帧数/进度条隐藏，OK 图标 + 绿字）
+    /// 到底：切确认态（呼吸点/帧数/进度条 crossfade 出、OK 态 crossfade 入）
     func setBottomState() {
-        capturingStack.isHidden = true
-        okStack.isHidden = false
-        contentView?.layoutSubtreeIfNeeded()
-        adjustWindowSize()
+        guard okStack.isHidden else { return }   // 已在确认态，幂等
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = DesignTokens.Motion.crossfadeDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            capturingStack.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            self.capturingStack.isHidden = true
+            self.capturingStack.alphaValue = 1   // 复位，下次进入采集态可直接显示
+            self.okStack.isHidden = false
+            self.okStack.alphaValue = 0
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = DesignTokens.Motion.crossfadeDuration
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.okStack.animator().alphaValue = 1
+            }
+            self.contentView?.layoutSubtreeIfNeeded()
+            self.adjustWindowSize()
+        })
     }
 
     /// HUD 贴选区下缘 8pt 居中（§9：贴选区下缘 8pt）
@@ -207,19 +243,35 @@ final class ScrollCaptureHUDPanel: NSPanel {
         contentView?.layoutSubtreeIfNeeded()
         adjustWindowSize()
         reposition(below: selectionGlobal, on: screen)
+        // 入场：fade + rise 6pt（0.2s spring，与 toast 同语言；原仅 fade）
+        let finalFrame = frame
+        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - 6))
         alphaValue = 0
         orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = DesignTokens.Motion.fadeDuration
+            ctx.duration = 0.2
+            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
+            self.animator().setFrame(finalFrame, display: true)
             self.animator().alphaValue = 1
         }
     }
 
+    /// 退场：fade 0.12s 后 orderOut（原 orderOut 直切；completion 强持有 self——
+    /// 调用方同步置 nil 也不会让窗口在动画中途被释放）
     func hide() {
-        orderOut(nil)
+        guard isVisible else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            self.animator().alphaValue = 0
+        }, completionHandler: {
+            self.orderOut(nil)
+            self.alphaValue = 1   // 复位，下次 show() 从 0 起动画
+        })
     }
 
-    /// 内容自适应窗口尺寸（栈 fitting + padding）
+    /// 内容自适应窗口尺寸（栈 fitting + padding）；宽度变化走 0.2s spring
+    /// （审查：三态内容宽度跳变 → spring 平滑）
     private func adjustWindowSize() {
         guard let glass = contentView else { return }
         glass.layoutSubtreeIfNeeded()
@@ -230,7 +282,15 @@ final class ScrollCaptureHUDPanel: NSPanel {
         frame.origin.x += (frame.width - width) / 2
         frame.origin.y += frame.height - height
         frame.size = NSSize(width: width, height: height)
-        setFrame(frame, display: true)
+        guard frame.size != self.frame.size else {
+            setFrameOrigin(frame.origin)
+            return
+        }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.2
+            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
+            self.animator().setFrame(frame, display: true)
+        }
     }
 }
 

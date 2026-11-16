@@ -138,7 +138,7 @@ final class AppCoordinator {
                                 t.invalidate()
                                 self.onboardingPollTimer = nil
                                 UserDefaults.standard.set(true, forKey: Self.onboardingKey)
-                                self.onboardingWindow?.orderOut(nil)
+                                self.onboardingWindow?.dismissAnimated()
                                 self.onboardingWindow = nil
                                 Log.event(.app, "onboarding.finish", ["granted": "true", "via": "poll"])
                             } else if tick > 45 {
@@ -152,7 +152,7 @@ final class AppCoordinator {
                 },
                 onFinish: { [weak self] in
                     UserDefaults.standard.set(true, forKey: Self.onboardingKey)
-                    created?.orderOut(nil)
+                    created?.dismissAnimated()
                     self?.onboardingWindow = nil
                     Log.event(.app, "onboarding.finish", ["granted": "\(self?.deps.permission.isGranted() ?? false)"])
                 }

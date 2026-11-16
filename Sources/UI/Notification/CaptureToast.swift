@@ -39,12 +39,38 @@ enum CaptureToast {
     private static var current: NSPanel?
     private static var dismissWork: DispatchWorkItem?
 
+    /// 退场动效：fade 0.18s + 下滑 6pt（motion.exit 的 toast 变体，兑现注释承诺）；
+    /// completionHandler 里才 orderOut（不能只做动画不收窗）
+    private static func playExit(panel: NSPanel, duration: TimeInterval, completion: (() -> Void)? = nil) {
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().alphaValue = 0
+            var sinkFrame = panel.frame
+            sinkFrame.origin.y -= 6   // 下滑 6pt：AppKit y 向上，origin.y 减小 = 视觉向下
+            panel.animator().setFrameOrigin(sinkFrame.origin)
+        }, completionHandler: {
+            panel.orderOut(nil)
+            completion?()
+        })
+    }
+
+    /// 连续截图替换旧 toast：0.1s 快 fade 再上新（避免叠影硬切）
+    private static func retireCurrentToast() {
+        guard let old = current else { return }
+        current = nil
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.1
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            old.animator().alphaValue = 0
+        }, completionHandler: { old.orderOut(nil) })
+    }
+
     /// 纯文案 toast（无缩略图）：系统级提示用（如菜单栏溢出告知 / 滚动回退告知）。
     /// 同样不抢焦点，2.5 秒自动消失。status 缺省 nil = 不带状态图标。
     static func show(message: String, status: Status? = nil) {
         dismissWork?.cancel()
-        current?.orderOut(nil)
-        current = nil
+        retireCurrentToast()
 
         guard let screen = NSScreen.main else { return }
         let visible = screen.visibleFrame
@@ -128,11 +154,7 @@ enum CaptureToast {
         current = panel
 
         let work = DispatchWorkItem {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = DesignTokens.Motion.fadeDuration
-                panel.animator().alphaValue = 0
-            } completionHandler: {
-                panel.orderOut(nil)
+            playExit(panel: panel, duration: 0.18) {
                 if current === panel { current = nil }
             }
         }
@@ -142,10 +164,9 @@ enum CaptureToast {
     }
 
     static func show(image: CGImage, message: String = "已复制到剪贴板") {
-        // 连续截图：先关旧的，避免堆叠
+        // 连续截图：旧 toast 0.1s 快 fade 再上新，避免叠影硬切
         dismissWork?.cancel()
-        current?.orderOut(nil)
-        current = nil
+        retireCurrentToast()
 
         guard let screen = NSScreen.main else { return }
         let visible = screen.visibleFrame
@@ -217,13 +238,9 @@ enum CaptureToast {
         }
         current = panel
 
-        // 2 秒后淡出
+        // 2 秒后退场：fade 0.18s + 下滑 6pt
         let work = DispatchWorkItem {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.20
-                panel.animator().alphaValue = 0
-            } completionHandler: {
-                panel.orderOut(nil)
+            playExit(panel: panel, duration: 0.18) {
                 if current === panel { current = nil }
             }
         }

@@ -35,8 +35,12 @@ enum DesignTokens {
         ap.isDark ? NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 0.16)
                   : NSColor(srgbRed: 0, green: 0.478, blue: 1.0, alpha: 0.12)
     }
-    /// accent.ring：热键录制态 2.5pt 外环（α .45）
-    static let accentRing = accent.withAlphaComponent(0.45)
+    /// accent.ring：热键录制态 1.5pt 外环（α .55）
+    /// 轻盈感审查：2.5pt 在 22pt 控件上占高 11% 比例失真 → 1.5pt（与选区同阶）+ α.55 补偿可读性
+    static let accentRing = accent.withAlphaComponent(0.55)
+
+    /// 深胶囊家族底色 rgba(24,24,27,.62)：尺寸角标 / PinHUD 读数（α.72/.75 实心黑块 → 材质语气）
+    static let capsuleDark = NSColor(srgbRed: 24 / 255.0, green: 24 / 255.0, blue: 27 / 255.0, alpha: 0.62)
 
     // MARK: - 1.2 status（语义状态色，只表达状态不做装饰）
 
@@ -177,13 +181,13 @@ enum DesignTokens {
 
     @MainActor
     enum Shadow {
-        /// shadow.float：0 10 30 −8 .50 + 0 28 64 −24 .55（双 shadow）
+        /// shadow.float：单层 0 18 44 −20 .30（「高而淡」，贴合系统浮窗单层影）
+        /// 轻盈感审查：双层 r15/α.50 + r32/α.55 叠加合成峰值 ≈.7+，比系统浮窗还沉 → 砍单层
         static let float = [
-            LayerShadow(radius: 15, offset: CGSize(width: 0, height: -10), alpha: 0.50, spread: 8),
-            LayerShadow(radius: 30, offset: CGSize(width: 0, height: -28), alpha: 0.55, spread: 24),
+            LayerShadow(radius: 44, offset: CGSize(width: 0, height: -18), alpha: 0.30, spread: 20),
         ]
-        /// shadow.card：0 8 24 −8 .40（单层）
-        static let card = LayerShadow(radius: 12, offset: CGSize(width: 0, height: -8), alpha: 0.40, spread: 8)
+        /// shadow.card：0 6 16 −8 .28（单层，层级低于 float；卡片类浮层复用）
+        static let card = LayerShadow(radius: 16, offset: CGSize(width: 0, height: -6), alpha: 0.28, spread: 8)
         /// shadow.knob：滑杆旋钮 0 1 3 .45
         static let knob = LayerShadow(radius: 3, offset: CGSize(width: 0, height: -1), alpha: 0.45, spread: 0)
 
@@ -194,7 +198,8 @@ enum DesignTokens {
             let spread: CGFloat
         }
 
-        /// 把 shadow.float 双层投影铺到一组铺满容器的透明视图上（ToolbarPanel 配方）
+        /// 把 shadow.float 投影铺到一组铺满容器的透明视图上（ToolbarPanel 配方；
+        /// v0.6 起单层，数组兼容多层调用方）
         static func applyFloat(to layers: [(NSView, LayerShadow)], cornerRadius: CGFloat) {
             for (view, spec) in layers {
                 guard let layer = view.layer else { continue }
@@ -282,6 +287,25 @@ enum DesignTokens {
         static let pulseAlphaMax: Float = 0.70
         /// hover 反馈 0.15s（不再上移）
         static let hoverDuration: CFTimeInterval = 0.15
+
+        /// motion.enter：0.26s spring + rise 10pt + scale .97→1 + fade（贴边浮层入场：
+        /// 工具栏/HUD/toast/文字件；入场 = fade + rise + scale 三件套）
+        static let enterDuration: TimeInterval = 0.26
+        static let enterRise: CGFloat = 10
+        static let enterScale: CGFloat = 0.97
+        /// motion.enter.center：0.28s spring + rise 10pt + scale .96→1（居中卡入场：引导卡）
+        static let enterCenterDuration: TimeInterval = 0.28
+        static let enterCenterScale: CGFloat = 0.96
+        /// motion.exit：0.16s ease-in + sink 4pt + scale→.97 + fade（一切退场；
+        /// 杜绝 orderOut 直切。toast 下滑 6pt / 引导卡下沉 6pt 用同 token 另调 sink）
+        static let exitDuration: TimeInterval = 0.16
+        static let exitSink: CGFloat = 4
+        static let exitScale: CGFloat = 0.97
+        /// motion.crossfade：0.15s ease-out（内容态/页面切换：设置 tab、HUD 三态）
+        static let crossfadeDuration: TimeInterval = 0.15
+
+        /// 统一 spring timing（NSAnimationContext / CATransaction 共用）
+        nonisolated(unsafe) static let springTimingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.3, 0.5, 1)
     }
 
     // MARK: - 工具栏规格（§9 场景速查）
@@ -313,12 +337,18 @@ enum DesignTokens {
     // MARK: - 设置窗规格
 
     enum Settings {
-        static let windowSize = CGSize(width: 560, height: 480)
+        static let windowSize = CGSize(width: 560, height: 640)
         static let rowHeight: CGFloat = 38
         static let cardPaddingH: CGFloat = 16
         static let cardPaddingTop: CGFloat = 4
         static let cardPaddingBottom: CGFloat = 6
         static let cardGap: CGFloat = 12
+        /// 分组卡描边（settings 局部覆写，不动全局 stroke）：暗 白.10 / 亮 黑.08
+        /// ——卡是区域不是盒子（System Settings 语气）
+        static let cardStroke = NSColor(name: "dt.settingsCardStroke") { ap in
+            ap.isDark ? NSColor.white.withAlphaComponent(0.10)
+                      : NSColor.black.withAlphaComponent(0.08)
+        }
     }
 
     // MARK: - 组框规格（重设计真源：snapcut-collage-ui/index.html §06 token 差异清单）
@@ -369,7 +399,8 @@ enum DesignTokens {
         static let textHeight: CGFloat = 40
         static let thumbSide: CGFloat = 56
         static let screenMargin: CGFloat = 20
-        static let thumbStrokeAlpha: CGFloat = 0.22
+        /// 缩略图描边：0.5pt 白 .16（对齐 stroke token 档位；装饰边界不是内容边界）
+        static let thumbStrokeAlpha: CGFloat = 0.16
     }
 
     // MARK: - 滚动截图规格（§9 场景 06）
@@ -380,6 +411,8 @@ enum DesignTokens {
         static let hudPaddingV: CGFloat = 6
         static let progressSize = CGSize(width: 44, height: 3)   // 44×3pt 进度条
         static let breathingDotSide: CGFloat = 4                 // 呼吸点×3
+        /// 呼吸点透明度下限：.35↔1（原 .22↔1 满幅闪烁 → 呼吸）
+        static let breathingAlphaMin: Float = 0.35
         static let bottomBarHeight: CGFloat = 2                  // 底缘 2pt 绿条
         static let outlineWidth: CGFloat = 1.5                   // 选区 outline
         static let outlineSoftRing: CGFloat = 3.5                // 3.5pt soft 外圈
