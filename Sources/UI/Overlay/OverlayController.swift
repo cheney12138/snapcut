@@ -205,10 +205,22 @@ final class OverlayController {
     private func restoreFocusRobust() {
         // 延后窗口内若用户已手动切换 App，不打扰（frontmost 已不是自己）
         guard NSApp.isActive else { return }
-        let prev = previousApp
-            ?? NSWorkspace.shared.frontmostApplication
-        if let prev, !prev.isTerminated,
-           prev.processIdentifier != NSRunningApplication.current.processIdentifier {
+        // 病例（hadPrev=true prevAlive=false 二报）：记录的前台 App 引用已失效
+        // （TUI 重启/pid 复用）——失效时回落「当前」frontmost（Snapcut 退激活
+        // 后它就是正主），而不是直接 deactivate 吞掉焦点
+        let prev: NSRunningApplication? = {
+            if let p = previousApp, !p.isTerminated,
+               p.processIdentifier != NSRunningApplication.current.processIdentifier {
+                return p
+            }
+            let current = NSWorkspace.shared.frontmostApplication
+            if let c = current, !c.isTerminated,
+               c.processIdentifier != NSRunningApplication.current.processIdentifier {
+                return c
+            }
+            return nil
+        }()
+        if let prev {
             NSApp.yieldActivation(to: prev)
             Log.event(.app, "focus.restored", ["to": prev.bundleIdentifier ?? "?", "via": "robust"])
         } else {

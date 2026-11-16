@@ -405,6 +405,17 @@ final class OverlayView: NSView {
             "viewId": "\(Unmanaged.passUnretained(self).toOpaque())",
             "sel": "\(Int(selectionLocal.width))x\(Int(selectionLocal.height))",
         ])
+        // 病例（用户 2026-11-16 二报「立即拖拽无框选」）：冻结窗口期的
+        // mouseDown 落在未上屏的窗上，上屏后 drag 序列直接到达（日志 win.event
+        // drag 有流、overlay.mousedown 无）——phase 还在 waitingForDrag。
+        // 这里自动以当前拖拽位起拖（补 mouseDown 语义，松手即正常确认）。
+        if case .waitingForDrag = phase {
+            let point = convert(event.locationInWindow, from: nil)
+            phase = .dragging(start: point)
+            selectionLocal = CGRect(origin: point, size: .zero)
+            Log.event(.overlay, "overlay.drag.recover", ["pt": "\(Int(point.x)),\(Int(point.y))"])
+            needsDisplay = true
+        }
         switch phase {
         case .dragging(let start):
             let point = convert(event.locationInWindow, from: nil)
