@@ -997,31 +997,26 @@ private final class HotkeyRecorderView: NSButton {
         window?.makeFirstResponder(nil)
     }
 
-    /// 录制成功确认脉冲（用户病例 2026-11-16「改了没有确认感」）：
-    /// accent 底色闪现 0.6s 渐隐 + 文案带 ✓，录到组合的一瞬能明确感知「已生效」
+    /// 录制成功确认（用户病例 2026-11-16 二报「输入完回车了还有蓝框，丑」：
+    /// accent 底/边做确认脉冲会被误读成「还在录制态」且恢复链偶发不回）。
+    /// 改用与录制态零歧义的反馈：文案「✓ 新组合」短暂显示（0.8s 后回正常值）
+    /// + 整体透明度轻脉冲——状态色完全不参与，不可能残留蓝框
     private func flashConfirmed() {
-        layer?.backgroundColor = DesignTokens.accent.cgColor
+        guard !isRecording else { return }
         attributedTitle = NSAttributedString(string: "✓ " + Self.symbolString(for: combo), attributes: [
             .font: DesignTokens.Font.kbd,
-            .foregroundColor: NSColor.white,
+            .foregroundColor: DesignTokens.label1,
         ])
-        layer?.borderWidth = 0.5
-        layer?.borderColor = DesignTokens.accent.cgColor
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
-            self?.animateBackToNormal()
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 0.35
+        pulse.toValue = 1.0
+        pulse.duration = 0.28
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer?.add(pulse, forKey: "confirmPulse")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self, !self.isRecording else { return }
+            self.updateDisplay()
         }
-    }
-
-    private func animateBackToNormal() {
-        let animation = CABasicAnimation(keyPath: "backgroundColor")
-        animation.fromValue = DesignTokens.accent.cgColor
-        animation.toValue = DesignTokens.fill.cgColor
-        animation.duration = 0.32
-        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        layer?.add(animation, forKey: "confirmFlash")
-        layer?.backgroundColor = DesignTokens.fill.cgColor
-        layer?.borderColor = DesignTokens.stroke.cgColor
-        updateDisplay()
     }
 
     private func updateDisplay() {
