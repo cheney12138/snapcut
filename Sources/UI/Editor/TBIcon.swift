@@ -45,7 +45,7 @@ enum TBIcon {
         ctx.scaleBy(x: 1, y: -1)
         ctx.setStrokeColor(NSColor.black.cgColor)   // 模板：黑 = tint 通道
         ctx.setFillColor(NSColor.black.cgColor)
-        ctx.setLineWidth(1.8)
+        ctx.setLineWidth(1.6)
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
 

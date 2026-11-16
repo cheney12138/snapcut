@@ -912,9 +912,12 @@ private final class TBColorButton: NSButton {
         title = ""
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        // 命中区 = 色点本身（原型 .dot 无 hover 底色，只有 scale 1.12）
-        widthAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
-        heightAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
+        // 命中区 = 色点本身（原型 .dot 无 hover 底色，只有 scale 1.12）。
+        // 容器独立于 icon 按钮档（用户病例：按钮 28→32 后色点间距视觉太远——
+        // 色点容器跟 dotSide+6 走，不吃 icon 尺寸档）
+        let dotHit: CGFloat = TBStyle.dotSide + 6
+        widthAnchor.constraint(equalToConstant: dotHit).isActive = true
+        heightAnchor.constraint(equalToConstant: dotHit).isActive = true
 
         dot.translatesAutoresizingMaskIntoConstraints = false
         dot.wantsLayer = true
@@ -944,11 +947,18 @@ private final class TBColorButton: NSButton {
 
     override func layout() {
         super.layout()
-        // 内环路径：dot 外扩 4.5；外环：dot 外扩 8（同心圆环，线宽 1.5）
-        for (ring, offset) in [(innerRing, CGFloat(-4.5)), (outerRing, CGFloat(-8.0))] {
-            let rect = dot.bounds.insetBy(dx: offset, dy: offset)
-            ring.frame = rect.insetBy(dx: -ring.lineWidth / 2, dy: -ring.lineWidth / 2)
-            ring.path = CGPath(ellipseIn: ring.bounds, transform: nil)
+        // 内环路径：dot 外扩 4.5；外环：dot 外扩 8（同心圆环，线宽 1.5）。
+        // ⚠️ insetBy(dx: -4.5) 是外扩语义但 insetBy 负值即扩大——rect 原点
+        // 也随负 inset 偏移，ring.frame 相对 dot.layer（bounds 原点 0,0）
+        // 需保持居中：直接按 dotSide 算，不依赖 dot.bounds 布局时机（病例：
+        // 按钮尺寸改动后选中环消失）
+        let side = TBStyle.dotSide
+        for (ring, outset) in [(innerRing, CGFloat(4.5)), (outerRing, CGFloat(8.0))] {
+            let ringSide = side + outset * 2
+            let origin = (side - ringSide) / 2
+            let frame = CGRect(x: origin, y: origin, width: ringSide, height: ringSide)
+            ring.frame = frame
+            ring.path = CGPath(ellipseIn: CGRect(origin: .zero, size: frame.size), transform: nil)
         }
     }
 
