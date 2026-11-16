@@ -348,6 +348,23 @@ final class OverlayView: NSView {
 
     // MARK: - 手势
 
+    /// 冻结上屏前的「提前按下」补位（用户病例 2026-11-16：唤起面板立即拖拽
+    /// 无框选——⌘⇧A 冻结 ~180ms 期间 mouseDown 落在未上屏的窗上）。上屏后
+    /// 若主键仍按着，以当前鼠标位置合成框选起点，drag 事件无缝续上。
+    func beginDragIfPrimaryPressed() {
+        guard phase == .waitingForDrag else { return }
+        guard let src = CGEventSource(stateID: .combinedSessionState),
+              CGEventSource.buttonState(.combinedSessionState, button: .left) else { return }
+        let loc = NSEvent.mouseLocation
+        let local = window.flatMap { $0.convertPoint(fromScreen: loc) } ?? .zero
+        let point = convert(local, from: nil)
+        phase = .dragging(start: point)
+        selectionLocal = CGRect(origin: point, size: .zero)
+        Log.event(.overlay, "overlay.drag.recover", ["pt": "\(Int(point.x)),\(Int(point.y))"])
+        needsDisplay = true
+        _ = src
+    }
+
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
         let point = convert(event.locationInWindow, from: nil)

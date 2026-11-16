@@ -141,6 +141,11 @@ final class OverlayController {
             window.makeKey()
             windows.append(window)
         }
+        // 提前按下补位：冻结期间已按下主键的用户，上屏即续框选
+        if let key = windows.first(where: { $0.screen == NSScreen.main }),
+           let view = key.contentView as? OverlayView {
+            view.beginDragIfPrimaryPressed()
+        }
     }
 
     /// 从冻结帧本地裁剪（零延迟、零二次屏捕）
@@ -188,7 +193,30 @@ final class OverlayController {
         // cancel 的那次按键（keyUp/重投递）跨过焦点边界落进前一个 App——
         // TUI 把半截 Esc 当输入执行。延后让按键完整落在已关闭的 overlay 上。
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.restoreFocus()
+            self?.restoreFocusRobust()
+        }
+    }
+
+    /// 焦点归还的诊断 + 修正（用户病例 2026-11-16：「Esc 退出后应把焦点还给
+    /// 台前 App」却走了 deactivate 兜底）——begin 时记录的 frontmost 在归
+    /// 还时可能已失效（挂起/无窗口的 App yield 无效果）。改为：归还时优先
+    /// 取「当时的」frontmostApplication（若 Snapcut 已 inactive 则它就是该
+    /// 还给的人），record 兜底。
+    private func restoreFocusRobust() {
+        // 延后窗口内若用户已手动切换 App，不打扰（frontmost 已不是自己）
+        guard NSApp.isActive else { return }
+        let prev = previousApp
+            ?? NSWorkspace.shared.frontmostApplication
+        if let prev, !prev.isTerminated,
+           prev.processIdentifier != NSRunningApplication.current.processIdentifier {
+            NSApp.yieldActivation(to: prev)
+            Log.event(.app, "focus.restored", ["to": prev.bundleIdentifier ?? "?", "via": "robust"])
+        } else {
+            NSApp.deactivate()
+            Log.event(.app, "focus.deactivated", [
+                "hadPrev": "\(previousApp != nil)",
+                "prevAlive": "\(previousApp?.isTerminated ?? false)",
+            ])
         }
     }
 
