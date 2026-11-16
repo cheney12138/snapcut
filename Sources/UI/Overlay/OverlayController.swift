@@ -63,6 +63,8 @@ final class OverlayController {
     /// 考帧有净贡献——拿上一交付帧做基准会把慢滚全部误判静止丢帧（病例：用户
     /// 滚动 11s 只有 2 帧，交 delivered=3 计 frames=2）。仅在入列时更新。
     private var scrollRefBuffer: PixelBuffer?
+    /// 「滚动过快」HUD 提示的回落 work（1.2s）
+    private var scrollDroppedHintWork: DispatchWorkItem?
     /// 本次采集是否观测到过真实滚动（净贡献 > 0）：到底自动合成的前置条件——
     /// 从未滚动就静止 ≠ 到底（用户在读屏定位），不能自动合成
     private var scrollEverScrolled = false
@@ -292,6 +294,8 @@ final class OverlayController {
         scrollHUD = nil
         scrollFrames = []
         scrollRefBuffer = nil
+        scrollDroppedHintWork?.cancel()
+        scrollDroppedHintWork = nil
         scrollInitialSelection = nil
         scrollBottomDetected = false
         scrollNoProgressCount = 0
@@ -764,7 +768,16 @@ final class OverlayController {
                 "afterN": "\(scrollFrames.count)", "err": "\(error.localizedDescription)",
             ])
             scrollProgress = 0
-            scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
+            // 「滚动过快」提示（用户病例：快滚一屏 > 采样间隔 → 帧丢 HUD 恒 1）。
+            // 提示 1.2s 后回落正常帧数文案
+            scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress, droppedHint: true)
+            scrollDroppedHintWork?.cancel()
+            let w = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.scrollHUD?.update(frames: self.scrollFrames.count, progress: self.scrollProgress)
+            }
+            scrollDroppedHintWork = w
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: w)
             return
         }
         scrollNoProgressCount = 0

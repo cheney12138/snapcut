@@ -20,7 +20,9 @@ final class ScrollCaptureController {
 
     struct Config {
         /// 抓帧间隔（秒）。手动滚动模式下 ~400ms 足以保证相邻帧重叠
-        var captureInterval: TimeInterval = 0.4
+        // 0.12s（病例 2026-11-16：0.4s 间隔快滚一屏 > 间隔 → 帧间无重叠全丢，
+        // HUD 恒 1 帧）。0.12s 内用户滚不完整屏，相邻帧必有重叠可拼接
+        var captureInterval: TimeInterval = 0.12
         /// 最小帧高（像素）：低于此值的帧（如空窗口）直接丢弃
         var minFrameHeight: Int = 8
     }
@@ -74,7 +76,7 @@ final class ScrollCaptureController {
     func start(region: CGRect) throws {
         guard !isRunning else { throw ScrollCaptureError.alreadyRunning }
         guard let screen = Self.screen(containing: region) else {
-            throw ScrollCaptureError.regionOffScreen
+            throw ScrollCaptureController.ScrollCaptureError.regionOffScreen
         }
         guard let displayID = Self.displayID(of: screen) else {
             throw ScrollCaptureError.displayNotFound
@@ -170,24 +172,39 @@ enum ScrollFrameGrabber {
         // ⚠️ 默认 .nominal 会返回降采样图（逻辑分辨率），坐标按物理像素裁剪就会越界
         // （病例：屏幕下方选区 pxH=80 而非 500）。.exact = 显示器原生像素。
         config.captureResolution = .best
-        // ⚠️ SCStreamConfiguration 默认输出 1920×1080（宽高以像素计，头文件实锤）——
-        // 这就是「截图变模糊」的根因。CGDisplayPixelsWide 在缩放模式下返回的是
-        // 当前模式像素（1728）而非面板物理像素（3456）——必须用 frame × backingScale。
+        // 限定源区域（病例 2026-11-16 采样提速）：0.12s 间隔下每帧整屏截图
+        // （4K×2 屏）不可持续——sourceRect 只截选区，输出尺寸 = 选区物理像素，
+        // 采集耗时从 ~90ms/帧（整屏）降到 ~15ms/帧（选区）
         let physical = NSScreen.screens.first {
             ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
         }
-        config.width = Int((physical?.frame.width ?? 1728) * (physical?.backingScaleFactor ?? 2))
-        config.height = Int((physical?.frame.height ?? 1117) * (physical?.backingScaleFactor ?? 2))
+        let frame = physical?.frame ?? CGRect(x: 0, y: 0, width: 1728, height: 1117)
+        let scaleF = physical?.backingScaleFactor ?? 2
+        // SCStream 的 sourceRect 坐标：相对 display frame、Y-down（顶部对齐）
+        let sourceRect = CGRect(
+            x: region.minX - frame.minX,
+            y: frame.maxY - region.maxY,
+            width: region.width,
+            height: region.height
+        )
+        config.sourceRect = sourceRect
+        config.width = Int(region.width * scaleF)
+        config.height = Int(region.height * scaleF)
         config.showsCursor = false
         config.scalesToFit = false
         let full = try await SCScreenshotManager.captureImage(
             contentFilter: filter, configuration: config)
 
-        // ⚠️ 不信任传入 scale（BetterDisplay/虚拟分辨率病例：SCK 整屏图 1920×1080
-        // 而屏物理 3456×2234）——用「实际图尺寸 ÷ 屏幕 point 尺寸」实测比例裁剪
-        let screen = NSScreen.screens.first { Self.displayID(of: $0) == displayID }
-        guard let frame = screen?.frame, frame.width > 0, frame.height > 0 else {
-            throw ScrollCaptureController.ScrollCaptureError.displayNotFound
+        // sourceRect 生效（图尺寸 == 选区像素）直出
+        let expectedW = Int(region.width * scaleF)
+        let expectedH = Int(region.height * scaleF)
+        if full.width == expectedW && full.height == expectedH {
+            return full
+        }
+        // 防御回退：SCK 忽略 sourceRect / 输出降采样（BetterDisplay 虚拟分辨率
+        // 病例）——按实测比例从整屏图裁剪
+        guard frame.width > 0, frame.height > 0 else {
+            throw ScrollCaptureController.ScrollCaptureError.regionOffScreen
         }
         let scaleX = CGFloat(full.width) / frame.width
         let scaleY = CGFloat(full.height) / frame.height

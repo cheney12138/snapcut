@@ -152,13 +152,30 @@ final class ScrollCaptureHUDPanel: NSPanel {
 
     // MARK: - 状态更新
 
-    func update(frames: Int, progress: CGFloat) {
-        countLabel.attributedStringValue = Self.framesText(frames)
+    /// HUD 状态语义（用户 2026-11-16：「没理解 HUD 表达的是什么」）：
+    /// - waiting：等待首次滚动（刚进入，还没净贡献帧）
+    /// - capturing(n)：采集中——已入列 n 帧（净贡献帧，非采样数）
+    /// - fastScroll(hint)：滚动过快提示（帧被丢弃，请放慢）——短暂显示后回落
+    func update(frames: Int, progress: CGFloat, droppedHint: Bool = false) {
+        if frames <= 0 {
+            countLabel.attributedStringValue = Self.hintText("等待滚动…")
+        } else if droppedHint {
+            countLabel.attributedStringValue = Self.hintText("滚动过快，帧丢失")
+        } else {
+            countLabel.attributedStringValue = Self.framesText(frames)
+        }
         // 帧内进度条：只改宽度约束 constant（钉扎约束保持不动）
         progressFillWidthConstraint?.constant =
             DesignTokens.Scroll.progressSize.width * min(max(progress, 0), 1)
         contentView?.layoutSubtreeIfNeeded()
         adjustWindowSize()
+    }
+
+    private static func hintText(_ text: String) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.75),
+        ])
     }
 
     /// 到底：切确认态（呼吸点/帧数/进度条隐藏，OK 图标 + 绿字）
