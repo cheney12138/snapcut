@@ -1069,9 +1069,13 @@ private final class HotkeyRecorderView: NSButton {
             // 编辑器热键：裸字母/数字合法（原 O/P/H 语义）；裸命名键非法
             if allowBare, key.count == 1, key.first?.isLetter == true || key.first?.isNumber == true {
                 onCombo(key)
-                flashConfirmed()
                 isRecording = false
                 updateDisplay()
+                // 录完立即交还焦点（病例三报「还有蓝框」：录完按钮仍是 first
+                // responder——系统 keyboard focus ring 蓝框围着它，与 layer
+                // border 无关，resign 才消）
+                window?.makeFirstResponder(nil)
+                flashConfirmed()
                 return
             }
             onCombo(nil)
@@ -1080,6 +1084,7 @@ private final class HotkeyRecorderView: NSButton {
         onCombo((mods + [key]).joined(separator: "+"))
         isRecording = false
         updateDisplay()
+        window?.makeFirstResponder(nil)
         flashConfirmed()
     }
 
