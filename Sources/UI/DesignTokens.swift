@@ -119,8 +119,11 @@ enum DesignTokens {
         static let hud: NSVisualEffectView.Material = .hudWindow
         /// 档 2 · 卡片：.hudWindow 跟随窗口 appearance——引导卡
         static let card: NSVisualEffectView.Material = .hudWindow
-        /// 档 3 · 窗体：.underWindowBackground 全窗磨砂——设置窗底
-        static let window: NSVisualEffectView.Material = .underWindowBackground
+        /// 档 3 · 窗体：.sidebar 全窗磨砂——设置窗底
+        /// 病例：.underWindowBackground 在 isOpaque=false + clear 的透明窗体上
+        /// 磨砂直接失效（底下窗口文字穿透可见，macOS 26）；.sidebar 是设置类
+        /// 窗的常规材质，三件套（满铺 effectView + isOpaque=false + clear）下稳定。
+        static let window: NSVisualEffectView.Material = .sidebar
 
         /// 统一玻璃容器配方：三档材质 + blendingMode(.behindWindow) + active +
         /// 圆角 + 0.5pt stroke 描边。钉暗由窗口 appearance 负责（本函数不碰 appearance）。
@@ -354,7 +357,9 @@ enum DesignTokens {
         static let outlineSoftRing: CGFloat = 3.5                // 3.5pt soft 外圈
         static let outlineSoftAlpha: CGFloat = 0.14
         static let bottomAutoComposeDelay: TimeInterval = 0.6    // 到底 0.6s 自动合成
-        static let bottomConfirmSamples = 2                      // 两次采样无新增 → 到底
+        // ⚠️ 2 样本 @0.4s = 静止 0.8s 就判到底（病例：用户进采集态后先读屏定位，
+        // 还没开滚就自动合成单帧）——提到 4（静止 1.6s）才敢说「停止滚动」
+        static let bottomConfirmSamples = 4                      // 连续 4 次采样无新增 → 到底
         static let sampleInterval: TimeInterval = 0.4            // 采样周期
     }
 }

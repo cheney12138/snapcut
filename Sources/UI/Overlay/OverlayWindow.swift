@@ -916,6 +916,10 @@ final class OverlayView: NSView {
 
     override func keyDown(with event: NSEvent) {
         Log.logger(.overlay).debug("evt=overlay.keyDown key=\(event.keyCode, privacy: .public) phase=\(self.phaseLabel, privacy: .public)")
+        // 拼接窗口期（scroll 停采后 → 长图回填前的异步间隙）：所有键吞掉。
+        // 此时 editorSession 还挂着旧单帧底图，Enter→done / Esc→cancel 会把会话
+        // 销毁 ⇒ 合成结果无处回填（scroll.compose.noSession 病例）。
+        if controller.isScrollComposing { return }
         // 文字输入态：普通键给输入框（first responder 已是 field，事件不会到这）
         // C：选区阶段复制光标处像素颜色（取色器语义），随后结束会话
         let inSelectionPhase: Bool = {
@@ -958,7 +962,8 @@ final class OverlayView: NSView {
         switch Int(event.keyCode) {
         case kVK_Escape:
             if scrollMode {
-                controller.perform(action: .cancel)
+                // 采集态 Esc = 取消滚动采集（丢帧回标注态），不是取消整个截图会话
+                controller.cancelScrollForUser()
                 return
             }
             if textField != nil {

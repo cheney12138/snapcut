@@ -61,7 +61,11 @@ enum EditorKeyRouter {
             guard !effective.isEmpty else { continue }
             // 撞内置键（快存 ⌘⌥S / 文字态 Esc/Return——调用方已挡）：
             // 组合一致时让内置语义先行（设置页有冲突提示）
-            if HotkeySpec.parse(effective, allowBare: true)?.keyCode == HotkeySpec.parse(combo)?.keyCode,
+            // ⚠️ combo 侧也必须 allowBare 解析（病例：滚动截图 S 键进不了采集态，
+            // scroll.enter 只能靠工具栏按钮）：裸键事件（s/o/p）走默认 parse 会因
+            // 「无修饰键」返回 nil ⇒ 裸键热键（scroll=s / ocr=o / pin=p）全部匹配不上；
+            // named 键（return/esc）两侧同为 nil 的既有匹配语义保留（done/cancel 仍生效）。
+            if HotkeySpec.parse(effective, allowBare: true)?.keyCode == HotkeySpec.parse(combo, allowBare: true)?.keyCode,
                effective == combo { return actionKey }
         }
         return nil

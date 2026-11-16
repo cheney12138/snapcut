@@ -6,7 +6,8 @@ import AppKit
 ///   系统偏好同款居中布局）；三个等大小子视图叠在同一容器里切 isHidden，无闪烁。
 /// - 无「确定/取消」按钮：任何控件改动立即 `store.save`，窗口关闭即生效。
 /// - 视觉（延展设计真源 toolbar 的玻璃语言，真源无 settings 场景）：
-///   磨砂分组卡 NSVisualEffectView .underWindowBackground + 圆角 12 + 明暗自适应描边
+///   窗体档 3 全窗磨砂（mat.sidebar，满铺含 titlebar，明暗自适应）+ 磨砂分组卡
+///   radius 10 圆角 + 明暗自适应描边
 ///   （暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.09)，对齐真源 --glass-stroke/--glass-edge）；
 ///   分组标题 11pt semibold secondary；行式设置左标签右控件，行高 36，8pt 栅格（间距 8/12）；
 ///   分隔线 0.5pt 暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.085)（对齐 --hair）；
@@ -72,6 +73,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         // 病例：权限状态只在 buildAboutPane 时刷过一次（首次 open），用户事后
         // 授权再开窗口仍显示「未授权」旧文案——每次 open 都要重刷
         refreshPermissionStatus()
+        // LSUIElement（.accessory 策略）下，系统协作激活不会真正把 App 切到前台：
+        // 设置窗看起来在前，但用户一点面板，焦点就被让回之前的 App（窗「退后台」
+        // + toolbar tab 点不动）。设置窗打开期间临时切 .regular，关闭时还原。
+        NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         // mat.window / mat.card：窗口类界面跟随系统外观（迁移差异 §10-6，
         // token 表给了暗/亮双值；不再钉 darkAqua）
@@ -91,15 +96,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         windowBuilt = true
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 640),
+            styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         win.title = "Snapcut 设置"
         win.isReleasedWhenClosed = false
         win.toolbarStyle = .preference
-        // mat.window：全窗磨砂（.underWindowBackground + titlebar 透明，档 3 配方）
+        // 档 3 三件套：全窗磨砂必须满铺含 titlebar 区域，否则 titlebar 透明带
+        // 直接穿底（系统 fallback 到透）。
+        //   ① .fullSizeContentView：contentView 延伸到 titlebar 下，磨砂视图才
+        //      能满铺；内容顶部用 safeAreaLayoutGuide 避开 toolbar（见 pinStack）
+        //   ② isOpaque = false + backgroundColor = .clear：让窗底透出磨砂视图
         win.titlebarAppearsTransparent = true
         win.isOpaque = false
         win.backgroundColor = .clear
@@ -111,14 +120,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         win.toolbar = toolbar
         win.delegate = self  // 需要 NSWindowDelegate（windowWillClose）
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 480))
-        // 档 3 窗底：全窗磨砂铺底（内容三层之下）
-        let windowGlass = NSVisualEffectView(frame: container.bounds)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 640))
+        // 档 3 窗底：全窗磨砂铺底（内容三层之下，含 titlebar 区域）
+        let windowGlass = NSVisualEffectView()
         windowGlass.material = DesignTokens.Mat.window
         windowGlass.blendingMode = .behindWindow
         windowGlass.state = .active
-        windowGlass.autoresizingMask = [.width, .height]
+        windowGlass.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(windowGlass)
+        NSLayoutConstraint.activate([
+            windowGlass.topAnchor.constraint(equalTo: container.topAnchor),
+            windowGlass.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            windowGlass.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            windowGlass.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
         for pane in [generalPane, hotkeyPane, aboutPane] {
             container.addSubview(pane)
             pane.translatesAutoresizingMaskIntoConstraints = false
@@ -202,6 +217,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         regionRecorder?.endRecordingIfNeeded()
         fullScreenRecorder?.endRecordingIfNeeded()
         for r in editorRecorders.values { r.endRecordingIfNeeded() }
+        // 设置窗关闭：还原 LSUIElement 形态（show() 里临时切的 .regular）。
+        // 策略还原即自动让出前台，焦点回之前的 App。
+        NSApp.setActivationPolicy(.accessory)
         Log.event(.app, "settings.window.close")
     }
 
@@ -631,9 +649,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         stack.setCustomSpacing(24, after: tagline)
         stack.translatesAutoresizingMaskIntoConstraints = false
         aboutPane.addSubview(stack)
+        // fullSizeContentView 下用 safeArea 居中，避免被 toolbar 高度带偏
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: aboutPane.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: aboutPane.centerYAnchor),
+            stack.centerYAnchor.constraint(equalTo: aboutPane.safeAreaLayoutGuide.centerYAnchor),
         ])
         refreshPermissionStatus()
     }
@@ -789,7 +808,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private func pinStack(_ stack: NSStackView, to pane: NSView) {
         pane.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: pane.topAnchor),
+            // fullSizeContentView：顶部用 safeArea（避开 toolbar/titlebar 区），
+            // 否则卡片压进 titlebar 区（磨砂上叠 toolbar）
+            stack.topAnchor.constraint(equalTo: pane.safeAreaLayoutGuide.topAnchor),
             stack.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: pane.bottomAnchor),

@@ -18,6 +18,10 @@ final class ScrollCaptureHUDPanel: NSPanel {
     private let countLabel = NSTextField(labelWithString: "")
     private let progressTrack = NSView()
     private let progressFill = NSView()
+    /// 进度条宽度约束（只改 constant，不重建）——旧实现每次 update 都 deactivate
+    /// progressFill.constraints，把 leading/top/bottom 钉扎约束一起拆了 ⇒
+    /// fill 位置悬空、进度条看起来不动/错位
+    private var progressFillWidthConstraint: NSLayoutConstraint?
     private let okIconView = NSImageView()
     private let okLabel = NSTextField(labelWithString: "已到底 · 自动合成")
     private var capturingStack: NSStackView!
@@ -79,11 +83,13 @@ final class ScrollCaptureHUDPanel: NSPanel {
         progressFill.layer?.cornerRadius = DesignTokens.Scroll.progressSize.height / 2
         progressFill.translatesAutoresizingMaskIntoConstraints = false
         progressTrack.addSubview(progressFill)
+        let fillWidth = progressFill.widthAnchor.constraint(equalToConstant: 0)
+        progressFillWidthConstraint = fillWidth
         NSLayoutConstraint.activate([
             progressFill.leadingAnchor.constraint(equalTo: progressTrack.leadingAnchor),
             progressFill.topAnchor.constraint(equalTo: progressTrack.topAnchor),
             progressFill.bottomAnchor.constraint(equalTo: progressTrack.bottomAnchor),
-            progressFill.widthAnchor.constraint(equalToConstant: 0),
+            fillWidth,
         ])
 
         capturingStack = NSStackView(views: dots + [countLabel, progressTrack])
@@ -148,11 +154,9 @@ final class ScrollCaptureHUDPanel: NSPanel {
 
     func update(frames: Int, progress: CGFloat) {
         countLabel.attributedStringValue = Self.framesText(frames)
-        let clamped = min(max(progress, 0), 1)
-        progressFill.layoutSubtreeIfNeeded()
-        NSLayoutConstraint.deactivate(progressFill.constraints)
-        progressFill.widthAnchor.constraint(equalToConstant: DesignTokens.Scroll.progressSize.width * clamped).isActive = true
-        progressTrack.layoutSubtreeIfNeeded()
+        // 帧内进度条：只改宽度约束 constant（钉扎约束保持不动）
+        progressFillWidthConstraint?.constant =
+            DesignTokens.Scroll.progressSize.width * min(max(progress, 0), 1)
         contentView?.layoutSubtreeIfNeeded()
         adjustWindowSize()
     }
