@@ -947,16 +947,16 @@ private final class TBColorButton: NSButton {
 
     override func layout() {
         super.layout()
-        // 内环路径：dot 外扩 4.5；外环：dot 外扩 8（同心圆环，线宽 1.5）。
-        // ⚠️ insetBy(dx: -4.5) 是外扩语义但 insetBy 负值即扩大——rect 原点
-        // 也随负 inset 偏移，ring.frame 相对 dot.layer（bounds 原点 0,0）
-        // 需保持居中：直接按 dotSide 算，不依赖 dot.bounds 布局时机（病例：
-        // 按钮尺寸改动后选中环消失）
-        let side = TBStyle.dotSide
+        // 环几何（常量直算，零布局依赖）：相对按钮 bounds 中心，内环 = dot
+        // 外扩 4.5，外环外扩 8（同心圆环，线宽 1.5）。ring 挂按钮 layer
+        // （病例两轮：挂 dot.layer 时子 layer 布局时机 + 超界歧义，选中环
+        // 持续不显示）
+        let c = CGPoint(x: bounds.midX, y: bounds.midY)
         for (ring, outset) in [(innerRing, CGFloat(4.5)), (outerRing, CGFloat(8.0))] {
-            let ringSide = side + outset * 2
-            let origin = (side - ringSide) / 2
-            let frame = CGRect(x: origin, y: origin, width: ringSide, height: ringSide)
+            let ringSide = TBStyle.dotSide + outset * 2
+            let frame = CGRect(
+                x: c.x - ringSide / 2, y: c.y - ringSide / 2,
+                width: ringSide, height: ringSide)
             ring.frame = frame
             ring.path = CGPath(ellipseIn: CGRect(origin: .zero, size: frame.size), transform: nil)
         }
