@@ -321,7 +321,7 @@ enum DesignTokens {
         static let iconDisabledAlpha: CGFloat = 0.28
         static let dotSide: CGFloat = 14
         static let dotGap: CGFloat = 6
-        static let copyButtonSide: CGFloat = 28
+        static let copyButtonSide: CGFloat = 32   // 2026-11-17 重设计：与工具按钮同步 32（全条一致）
         static let tooltipFontSize: CGFloat = 10.5
     }
 

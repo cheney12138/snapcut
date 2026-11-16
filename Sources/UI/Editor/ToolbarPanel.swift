@@ -10,11 +10,12 @@ import CoreGraphics
 ///   mat.hud（hudWindow 钉暗，**不再叠 60% 深色着色**——材质本身已够暗）、
 ///   border 0.5pt stroke（白 .14）、inset.hi 顶缘内高光 白 .10、
 ///   shadow.float 单层投影（radius 44 offset(0,18) α.30 spread 20，高而淡）
-/// - 按钮：28×28、radius 7、图标 16pt（SF Symbol pointSize 14/medium）、默认白 85%、
+/// - 按钮：32×32、radius 8、图标 20pt（2026-11-17 工具栏图标重设计：推荐档
+///   icon 20 + 按钮 32，圆角随尺寸 7→8；对比稿 snapcut-toolbar-icons/index.html）；默认白 85%、
 ///   hover fill.hover（灰 α.36）**不上移**；选中 accent 实心 + 白图标 + inset.hi.strong，
 ///   **删除蓝色外发光**
 /// - 颜色点 14pt（选中：内环 1.5pt 白 .85 @−4.5 + 外环 1.5pt 白 .28 @−8）、间距 6
-/// - 主动作「复制」28×28 纯图标 accent 实心键（唯一彩色 accent，与保存/取消同构）
+/// - 主动作「复制」32×32 纯图标 accent 实心键（唯一彩色 accent，与保存/取消同构；同步 32 全条一致）
 /// - 粗细：连续滑杆 2-6pt（tickless + continuous，实时生效）76×20
 /// - 分组：工具(6+滚动截图) | 属性(5色+滑杆) | 历史(撤销/重做/取字/贴图/显隐) | 输出(复制/保存/取消)，
 ///   组间 hairline 分隔（白 .12 × 高 20，两侧各 4 ⇒ 线到内容 12）
@@ -36,9 +37,11 @@ private enum TBStyle {
     static let paddingH: CGFloat = DesignTokens.Toolbar.padding      // 10
     static let paddingV: CGFloat = DesignTokens.Toolbar.padding
     static let cornerRadius: CGFloat = DesignTokens.Radius.xl        // 14
-    static let buttonSide: CGFloat = DesignTokens.Control.h          // 28
-    static let buttonRadius: CGFloat = DesignTokens.Radius.md        // 7
-    static let iconPointSize: CGFloat = 14                           // 视觉高 ≈16（icon.s）
+    // 2026-11-17 重设计：按钮 32×32 / radius 8（推荐档）——不再取 Control.h(28)/Radius.md(7)，
+    // 工具栏专用尺寸在这里定值，其他界面的标准控件尺寸不受影响
+    static let buttonSide: CGFloat = 32
+    static let buttonRadius: CGFloat = 8
+    static let iconPointSize: CGFloat = 20                           // 重设计推荐档：icon 20pt
     static let iconWeight = NSFont.Weight.medium
     static let separatorWidth: CGFloat = 0.5
     static let separatorHeight: CGFloat = DesignTokens.Toolbar.separatorHeight // 20
@@ -312,7 +315,7 @@ final class ToolbarPanel: NSPanel {
 
         stack.addArrangedSubview(makeSeparator())
 
-        // 6) 主按钮「复制」（28×28 纯图标 accent 实心键，唯一彩色 accent；tooltip 保留）
+        // 6) 主按钮「复制」（32×32 纯图标 accent 实心键，唯一彩色 accent；tooltip 保留）
         //    + 保存 + 取消（同构，无彩）
         let copy = TBPrimaryButton(icon: .copy)
         copy.tag = 201
@@ -1023,7 +1026,7 @@ private final class TBStrokeSlider: NSSlider {
     override func mouseExited(with event: NSEvent) { onHover?(false) }
 }
 
-// MARK: - 主按钮「复制」（28×28 accent 实心纯图标键：唯一彩色 accent；无发光无上移）
+// MARK: - 主按钮「复制」（32×32 accent 实心纯图标键：唯一彩色 accent；无发光无上移）
 
 @MainActor
 private final class TBPrimaryButton: NSButton {

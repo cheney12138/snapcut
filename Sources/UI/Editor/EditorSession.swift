@@ -12,15 +12,20 @@ final class EditorSession {
     enum Tool: Int, CaseIterable {
         /// 无工具（用户裁定 2026-11-16：编辑器默认态——拖动=移动选区；
         /// 数字键选工具、再按同键取消回 none）
+        ///
+        /// case 声明序 = 工具栏按钮序（allCases 建按钮）：重设计版工具组顺序
+        /// 「箭头 矩形 椭圆 文字 马赛克 序号 高亮 滚动」——椭圆紧贴矩形成形状组。
+        /// rawValue 保持原值不动：数字热键（EditorKeyRouter 按名映射 1-7）、
+        /// 按钮 tag / Tool(rawValue:) 全部不受影响。
         case none = 0
         case arrow = 1
         case rect = 2
+        /// 椭圆/圆（圆心起拖：用户裁定 2026-11-16 新增「圆心圈选」）
+        case ellipse = 7
         case text = 3
         case mosaic = 4
         case sequence = 5
         case highlight = 6
-        /// 椭圆/圆（圆心起拖：用户裁定 2026-11-16 新增「圆心圈选」）
-        case ellipse = 7
 
         var label: String {
             switch self {
