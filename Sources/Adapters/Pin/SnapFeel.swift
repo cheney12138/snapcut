@@ -13,10 +13,10 @@ enum SnapFeel {
     static let landingDuration: TimeInterval = 0.10
     /// 分离回滑缓动时长（消除硬跳回）
     static let releaseDuration: TimeInterval = 0.10
-    /// 分离阻力带宽度：releaseDistance 前 24px 区间开始衰减（1:1 → 0.6:1）
-    static let resistBand: CGFloat = 24
-    /// 阻力带末端跟随比（0.6:1）
-    static let maxFollowRatio: CGFloat = 0.6
+    /// 分离阻力带宽度（乐高化 2026-11-16：24 → 10——轻拉即开）
+    static let resistBand: CGFloat = 10
+    /// 阻力带末端跟随比（0.85:1——衰减感保留但不钉死）
+    static let maxFollowRatio: CGFloat = 0.85
     /// 分离后同伙伴同边重吸防抖窗口
     static let resnapDebounce: TimeInterval = 0.2
 
