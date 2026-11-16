@@ -154,6 +154,19 @@ final class OverlayController {
             let freezeMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
             )
+            // 上屏门闩（用户病例 2026-11-16「快捷键唤起仍有延迟、选中文字后
+            // 框选才出现」）：上屏早于 App 激活时 overlay 收不到鼠标（事件路由
+            // 给前台 App）——冻结并行期间等激活完成（16ms 轮询，上限 800ms
+            // 防死等），窗出现即可交互
+            let latchStart = DispatchTime.now()
+            while !NSApp.isActive,
+                  DispatchTime.now().uptimeNanoseconds - latchStart.uptimeNanoseconds
+                    < 800_000_000 {
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            if !NSApp.isActive {
+                Log.error(.app, "overlay.open.activationTimeout", [:])
+            }
             self.showOverlayWindows()
             let elapsedMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
