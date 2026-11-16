@@ -34,6 +34,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let coordinator = AppCoordinator()
         self.coordinator = coordinator
         coordinator.start()
+        // 预激活（用户病例 2026-11-16「重启后第一次唤起卡手」）：accessory App
+        // 的首次 NSApp.activate 由 macOS 冷启动激活流程，实测 ~1.7s——期间
+        // overlay 已上屏但鼠标事件仍路由给前台 App（用户拖动选中的是 TUI 文字）。
+        // 启动时激活一次并立刻退出，把首次激活成本留在启动刻，之后每次唤起
+        // 都是热激活（<50ms）。
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.coordinator.releaseActivationAfterWarmup()
+        }
     }
 
     /// 坑 33（启动即退·根因）：ControlCenter 对 status item 发隐藏动作时，

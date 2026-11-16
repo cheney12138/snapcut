@@ -43,6 +43,13 @@ final class AppCoordinator {
         }
     }
 
+    /// 启动预激活后的释放（AppDelegate 启动 warmup 用）：退出激活态但不
+    /// 还给任何 App（此刻没记录过前台归属），前台自然回用户当前 App。
+    func releaseActivationAfterWarmup() {
+        NSApp.deactivate()
+        Log.event(.app, "app.warmup.released")
+    }
+
     func start() {
         AppCoordinatorShared.coordinator = self
         AppCoordinatorShared.deps = deps
