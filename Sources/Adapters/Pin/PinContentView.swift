@@ -46,6 +46,11 @@ final class PinContentView: NSView {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
+    /// 未激活窗口的首次鼠标交互直接生效（用户病例 2026-11-16：「钉住之后第一
+    /// 时间三指无法移动截图」）——macOS 默认未激活窗的首击只激活不交互（三指
+    /// 拖移同样走此路径），贴图窗独立于激活态，必须 override。
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     func setSnapGlow(_ on: Bool) {
         guard snapGlow != on else { return }
         snapGlow = on
