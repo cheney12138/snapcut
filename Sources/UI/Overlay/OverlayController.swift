@@ -30,6 +30,10 @@ final class OverlayController {
     private var selectionRectGlobal: CGRect?
     /// 会话开始时的前台 App（结束时把激活权还给它）
     private var previousApp: NSRunningApplication?
+    /// 前台 App 的 pid（Int 永不失效；NSRunningApplication 引用在 App 挂起/
+    /// 转后台时 isTerminated 语义不可靠——用户病例 7 次 prevAlive=false vs
+    /// 2 次 restored 实锤）。归还时按 pid 从 runningApplications 重查活引用。
+    private var previousAppPID: Int?
     /// 编辑会话（编辑态非空）
     private(set) var editorSession: EditorSession?
     private var toolbar: ToolbarPanel?
@@ -76,6 +80,9 @@ final class OverlayController {
     func begin(completion: @escaping (Result) -> Void, onShown: (() -> Void)? = nil) {
         self.completion = completion
         previousApp = NSWorkspace.shared.frontmostApplication
+        if let prev = previousApp {
+            previousAppPID = Int(prev.processIdentifier)
+        }
         editorSession = nil
         toolbar?.orderOut(nil)
         toolbar = nil
@@ -219,12 +226,20 @@ final class OverlayController {
         // （TUI 重启/pid 复用）——失效时回落「当前」frontmost（Snapcut 退激活
         // 后它就是正主），而不是直接 deactivate 吞掉焦点
         let prev: NSRunningApplication? = {
+            // ① pid 重查（记录值永真：pid 不随 App 状态变化失效）
+            let ownPID = Int(NSRunningApplication.current.processIdentifier)
+            if let pid = previousAppPID, pid != ownPID,
+               let live = NSWorkspace.shared.runningApplications.first(where: { $0.processIdentifier == pid }),
+               !live.isTerminated {
+                return live
+            }
+            // ② 引用兜底
             if let p = previousApp, !p.isTerminated,
                p.processIdentifier != NSRunningApplication.current.processIdentifier {
                 return p
             }
-            let current = NSWorkspace.shared.frontmostApplication
-            if let c = current, !c.isTerminated,
+            // ③ 当前 frontmost（App inactive 后它是正主）
+            if let c = NSWorkspace.shared.frontmostApplication, !c.isTerminated,
                c.processIdentifier != NSRunningApplication.current.processIdentifier {
                 return c
             }
