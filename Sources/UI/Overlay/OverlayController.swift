@@ -254,8 +254,11 @@ final class OverlayController {
             return nil
         }()
         if let prev {
-            NSApp.yieldActivation(to: prev)
-            Log.event(.app, "focus.restored", ["to": prev.bundleIdentifier ?? "?", "via": "robust"])
+            // 窗口级归还（用户病例 2026-11-16 终报「红绿灯都没亮」）：yieldActivation
+            // 只把 App 激活，prev 的窗口不变 key（红绿灯灰、TUI 收不到键盘）。
+            // activate() 走完整激活链（App + key 窗），实测把 TUI 连窗拉回。
+            _ = prev.activate()
+            Log.event(.app, "focus.restored", ["to": prev.bundleIdentifier ?? "?", "via": "activate"])
         } else {
             NSApp.deactivate()
             let pidMatched = previousAppPID.flatMap { pid in
