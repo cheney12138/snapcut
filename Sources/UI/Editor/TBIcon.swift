@@ -74,6 +74,12 @@ enum TBIcon {
             p.addLine(to: CGPoint(x: x2, y: y2))
             stroke(p, alpha: alpha)
         }
+        func fillRoundedRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, r: CGFloat) {
+            let p = CGPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerWidth: r, cornerHeight: r, transform: nil)
+            ctx.addPath(p)
+            ctx.fillPath()
+        }
+
         func strokeRoundedRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, r: CGFloat, alpha: CGFloat = 1) {
             let p = CGPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerWidth: r, cornerHeight: r, transform: nil)
             stroke(p, alpha: alpha)
@@ -111,22 +117,17 @@ enum TBIcon {
             strokeLine(8, 3.4, 8, 12.6)
             strokeLine(5.8, 12.6, 10.2, 12.6)
         case .mosaic:
-            // 马赛克 4：3×3 网格（设计稿填充块带 opacity——模板下改描边网格，
-            // 对角块加粗表达马赛克语义）
-            let p = CGMutablePath()
-            for row in 0..<3 { for col in 0..<3 {
-                let x = 2 + CGFloat(col) * 4.8, y = 2 + CGFloat(row) * 4.8
-                p.addRect(CGRect(x: x, y: y, width: 4, height: 4))
-            }}
-            ctx.saveGState(); ctx.setLineWidth(1.1); ctx.addPath(p); ctx.strokePath(); ctx.restoreGState()
-            // 对角重块（马赛克焦点）
-            ctx.saveGState()
-            ctx.setAlpha(0.9)
-            for (c, r) in [(0,0),(2,1),(1,2)] {
-                let x = 2 + CGFloat(c) * 4.8, y = 2 + CGFloat(r) * 4.8
-                ctx.fill(CGRect(x: x + 0.8, y: y + 0.8, width: 2.4, height: 2.4))
-            }
-            ctx.restoreGState()
+            // 马赛克（用户三稿裁定 A「散块拼贴」2026-11-16：语义=「模糊、没有
+            // 规律」——4 块大小/长宽/位置全不同（横长/竖长/近方/小方），1 实心
+            // 3 描边，零对齐零等分；网格/表格/点阵方案全被否）
+            // 块1 横长（描边）
+            strokeRoundedRect(2.6, 3.0, 5.2, 3.0, r: 0.9)
+            // 块2 竖长（描边）
+            strokeRoundedRect(9.0, 2.6, 3.0, 5.4, r: 0.9)
+            // 块3 近方（实心——墨量锚点）
+            fillRoundedRect(3.0, 8.0, 4.0, 4.0, r: 0.9)
+            // 块4 小方（描边，错位右下）
+            strokeRoundedRect(8.6, 9.4, 3.4, 3.0, r: 0.8)
         case .sequence:
             // 序号 5：圆 + 数字「2」（重设计：曲线整体重绘放大、下移居中）
             strokeCircle(8, 8, r: 5.6)
