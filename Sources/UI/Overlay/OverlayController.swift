@@ -798,20 +798,64 @@ final class OverlayController {
             Log.event(.scroll, "scroll.frame.dropAfterStop")
             return
         }
-        let buffer = PixelBuffer(cgImage: frame)
-        guard let ref = scrollRefBuffer else {
-            scrollRefBuffer = buffer
-            scrollFrames.append(frame)
-            Log.event(.scroll, "scroll.frame.n", ["n": "1"])
-            scrollHUD?.update(frames: scrollFrames.count, progress: 0)
+        // 重计算链后台化（病例 2026-11-16「还是没拼接好」：PixelBuffer 解码
+        // 2168×3456 RGBA ~30MB/帧 + 行签名 + findOverlap 全在主线程 → 8fps
+        // 下主线程被吞，采样帧大量丢弃（12 交付只 4 入列、帧间隔 0.24-0.9s
+        // 不均）。改：解码/比对在后台线程，主线程只收结论）
+        let refSnapshot = scrollRefBuffer
+        Task { [weak self] in
+            // 重计算全链后台（病例「还是没拼接好」：主线程帧处理吞掉采样吞吐）：
+            // 解码 30MB + 行签名 + findOverlap 全部在后台，主线程只收结论
+            let buffer = PixelBuffer(cgImage: frame)
+            var verdict: Verdict = .first
+            if let ref = refSnapshot {
+                if await Self.framesNearIdenticalAsync(ref, buffer) {
+                    verdict = .staticFrame
+                } else if let result = try? Stitcher.findOverlap(
+                    prev: ref, cur: buffer, options: Stitcher.Options(),
+                    frameIndex: 0
+                ) {
+                    verdict = .contributing(overlap: result.overlap)
+                } else {
+                    verdict = .skipped
+                }
+            }
+            guard let self else { return }
+            await MainActor.run {
+                self.processScrollFrame(frame, buffer: buffer, verdict: verdict)
+            }
+        }
+    }
+
+    private enum Verdict { case first, staticFrame, contributing(overlap: Int), skipped }
+
+    private static func framesNearIdenticalAsync(_ a: PixelBuffer, _ b: PixelBuffer) async -> Bool {
+        await Task.detached(priority: .userInitiated) {
+            Self.framesNearIdentical(a, b)
+        }.value
+    }
+
+    /// 帧处理后半段（主线程；解码/比对已在后台完成，verdict 为结论）
+    private func processScrollFrame(_ frame: CGImage, buffer: PixelBuffer, verdict: Verdict) {
+        // stop 之后在途帧不入列（状态已定格——后台解码窗口期会话可能已结束）
+        guard scrollController != nil else {
+            Log.event(.scroll, "scroll.frame.dropAfterStop")
             return
         }
-        if Self.framesNearIdentical(ref, buffer) {
-            // 静止帧（没滚动 / 已到底）：不入拼接序列。
-            // ⚠️ 完全相同的帧会让 Stitcher.findOverlap 无解（它要求 cur 至少
-            // 净贡献 1 行 ⇒ 排除 d=0 的真实对齐）⇒ stitch.noOverlap ——
-            // 静止 ≠ 失败：丢弃重复帧继续采，只累计到底判定（病例：用户
-            // 进采集态后先读了 0.8s 屏，帧 2/3 与帧 1 全同 ⇒ 拼接直接炸）。
+        if scrollRefBuffer == nil || verdict == .first {
+            if scrollRefBuffer == nil {
+                scrollRefBuffer = buffer
+                scrollFrames.append(frame)
+                Log.event(.scroll, "scroll.frame.n", ["n": "1"])
+                scrollHUD?.update(frames: scrollFrames.count, progress: 0)
+                return
+            }
+        }
+        let overlap: Int
+        switch verdict {
+        case .first:
+            return
+        case .staticFrame:
             scrollNoProgressCount += 1
             scrollProgress = 0
             scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
@@ -819,22 +863,11 @@ final class OverlayController {
                 detectScrollBottom()
             }
             return
-        }
-        // 与参考帧找可信重叠：成功才入列（净贡献帧序列，stitch 的相邻对全部预验证）
-        let overlap: Int
-        do {
-            overlap = try Stitcher.findOverlap(
-                prev: ref, cur: buffer, options: Stitcher.Options(), frameIndex: scrollFrames.count
-            ).overlap
-        } catch {
-            // 跳屏（0.4s 内滚超过一帧）/ 内容突变：与参考帧无重叠，本帧不可拼接，
-            // 丢弃不计数（不算静止，不推进到底判定）
+        case .skipped:
             Log.event(.scroll, "scroll.frame.skipNoOverlap", [
-                "afterN": "\(scrollFrames.count)", "err": "\(error.localizedDescription)",
+                "afterN": "\(scrollFrames.count)",
             ])
             scrollProgress = 0
-            // 「滚动过快」提示（用户病例：快滚一屏 > 采样间隔 → 帧丢 HUD 恒 1）。
-            // 提示 1.2s 后回落正常帧数文案
             scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress, droppedHint: true)
             scrollDroppedHintWork?.cancel()
             let w = DispatchWorkItem { [weak self] in
@@ -844,6 +877,8 @@ final class OverlayController {
             scrollDroppedHintWork = w
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: w)
             return
+        case .contributing(let o):
+            overlap = o
         }
         scrollNoProgressCount = 0
         // 到底后又有新帧（用户继续滚）：取消 pending 自动收尾，重新等到底
@@ -857,7 +892,7 @@ final class OverlayController {
             Log.event(.scroll, "scroll.bottom.revoked", [:])
         }
         scrollBottomDetected = false
-        growRegionIfPossible(ref: ref, cur: buffer, frame: frame, overlap: overlap)
+        growRegionIfPossible(ref: buffer, cur: buffer, frame: frame, overlap: overlap)
         scrollRefBuffer = buffer
         scrollFrames.append(frame)
         Log.event(.scroll, "scroll.frame.n", ["n": "\(scrollFrames.count)"])
@@ -870,7 +905,7 @@ final class OverlayController {
     /// 降到 0.95 让真实新帧计入。
     private static let nearIdenticalRowRatio: CGFloat = 0.95
 
-    private static func framesNearIdentical(_ a: PixelBuffer, _ b: PixelBuffer) -> Bool {
+    nonisolated private static func framesNearIdentical(_ a: PixelBuffer, _ b: PixelBuffer) -> Bool {
         guard a.height == b.height, a.width == b.width else { return false }
         let threshold = Stitcher.Options().rowDiffThreshold
         let stride = max(1, a.height / 60)
