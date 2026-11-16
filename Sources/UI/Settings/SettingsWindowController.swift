@@ -997,6 +997,33 @@ private final class HotkeyRecorderView: NSButton {
         window?.makeFirstResponder(nil)
     }
 
+    /// 录制成功确认脉冲（用户病例 2026-11-16「改了没有确认感」）：
+    /// accent 底色闪现 0.6s 渐隐 + 文案带 ✓，录到组合的一瞬能明确感知「已生效」
+    private func flashConfirmed() {
+        layer?.backgroundColor = DesignTokens.accent.cgColor
+        attributedTitle = NSAttributedString(string: "✓ " + Self.symbolString(for: combo), attributes: [
+            .font: DesignTokens.Font.kbd,
+            .foregroundColor: NSColor.white,
+        ])
+        layer?.borderWidth = 0.5
+        layer?.borderColor = DesignTokens.accent.cgColor
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+            self?.animateBackToNormal()
+        }
+    }
+
+    private func animateBackToNormal() {
+        let animation = CABasicAnimation(keyPath: "backgroundColor")
+        animation.fromValue = DesignTokens.accent.cgColor
+        animation.toValue = DesignTokens.fill.cgColor
+        animation.duration = 0.32
+        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer?.add(animation, forKey: "confirmFlash")
+        layer?.backgroundColor = DesignTokens.fill.cgColor
+        layer?.borderColor = DesignTokens.stroke.cgColor
+        updateDisplay()
+    }
+
     private func updateDisplay() {
         let text = isRecording ? "按下新组合…" : Self.symbolString(for: combo)
         // t.kbd（11/medium）；录制态文字 label.1、常态 label.1（设计 .hk/.kk 同色）
@@ -1038,6 +1065,7 @@ private final class HotkeyRecorderView: NSButton {
             // 编辑器热键：裸字母/数字合法（原 O/P/H 语义）；裸命名键非法
             if allowBare, key.count == 1, key.first?.isLetter == true || key.first?.isNumber == true {
                 onCombo(key)
+                flashConfirmed()
                 isRecording = false
                 updateDisplay()
                 return
@@ -1048,6 +1076,7 @@ private final class HotkeyRecorderView: NSButton {
         onCombo((mods + [key]).joined(separator: "+"))
         isRecording = false
         updateDisplay()
+        flashConfirmed()
     }
 
     // MARK: 字符串 ⇄ 显示符号（"cmd+shift+a" ⇄ "⌘⇧A"）
