@@ -46,7 +46,10 @@ public struct MagnetSnapOutcome: Sendable {
 public enum MagnetGroup {
     public static let gutter: CGFloat = 16
     public static let snapDistance: CGFloat = 14
-    public static let releaseDistance: CGFloat = 46
+    // 28（用户裁定 2026-11-16「吸附之后扯不开，不丝滑，期望像乐高」：
+    // 46px 磁滞 + 0.6:1 阻力带让卡片 46px 内最多只挪 14px——视觉钉死。
+    // 乐高语义 = 轻拉即开：release 收到 28，阻力带 10px、0.85:1）
+    public static let releaseDistance: CGFloat = 28
     /// 贴边才有意义：投影重叠不足此值时进入「角吸附」分支（原型 overlap1 > 8；
     /// 病例：斜 45° 靠近时两轴投影都不重叠 → 永不吸附，补角吸附对齐）
     public static let minOverlap: CGFloat = 8
