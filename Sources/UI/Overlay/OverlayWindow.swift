@@ -54,7 +54,7 @@ final class OverlayWindow: NSWindow {
         // phase 变化后 guard 挡住）
         if event.type == .leftMouseDown || event.type == .leftMouseDragged {
             if let view = contentView as? OverlayView {
-                view.beginDragIfNeeded(from: convert(event.locationInWindow, to: contentView))
+                view.beginDragIfNeeded(from: view.convert(event.locationInWindow, from: nil))
             }
         }
         super.sendEvent(event)
