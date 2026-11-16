@@ -131,20 +131,26 @@ final class OverlayController {
 
     /// 上屏：每屏一窗，带冻结帧的窗直接把静态画面铺满（用户看到"屏幕定住"）
     private func showOverlayWindows() {
-        for screen in NSScreen.screens {
+        // 光标屏先建先 key（病例 2026-11-16「面板出现在另一个屏幕」：双屏各
+        // 一窗是设计，但 key 窗按建窗顺序随机落屏——键盘事件/工具栏跟随全跟
+        // 错屏。光标在哪个屏，哪个屏的窗是 key）
+        let cursorScreen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        let ordered = NSScreen.screens.sorted { $0 == cursorScreen ? false : true }
+        for screen in ordered {
             let window = OverlayWindow(screen: screen, controller: self)
             if let displayID = DisplayRegistry.displayID(of: screen),
                let frozen = frozenImages[displayID] {
                 window.installFrozenImage(frozen)
             }
             window.orderFrontRegardless()
-            window.makeKey()
             windows.append(window)
         }
-        // 提前按下补位：冻结期间已按下主键的用户，上屏即续框选
-        if let key = windows.first(where: { $0.screen == NSScreen.main }),
-           let view = key.contentView as? OverlayView {
-            view.beginDragIfPrimaryPressed()
+        // 光标屏的窗收 key + 补位起拖（一次 makeKey，其他窗不抢——流畅）
+        if let key = windows.first(where: { $0.screen == cursorScreen }) {
+            key.makeKey()
+            (key.contentView as? OverlayView)?.beginDragIfPrimaryPressed()
         }
     }
 
