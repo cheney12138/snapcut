@@ -41,7 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 都是热激活（<50ms）。
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.coordinator.releaseActivationAfterWarmup()
+            self?.coordinator?.releaseActivationAfterWarmup()
         }
     }
 
