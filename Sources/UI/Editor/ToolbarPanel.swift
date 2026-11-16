@@ -898,10 +898,11 @@ private final class TBToolButton: TBIconButton {
 private final class TBColorButton: NSButton {
     var onHover: ((Bool) -> Void)?
     private let dot = NSView()
-    /// 选中态内环：白 .85，比 dot 大 4.5pt（CSS .dot.on::after inset −4.5）
-    private let innerRing = CAShapeLayer()
-    /// 选中态外环：白 .28，比 dot 大 8pt（CSS .dot.on::before inset −8）
-    private let outerRing = CAShapeLayer()
+    /// 选中态内环：白 .85，比 dot 大 4.5pt。终极方案（病例四轮）：CAShapeLayer
+    /// 无论挂 dot.layer 还是 self.layer 都不显示——换真实 NSView（wantsLayer
+    /// + 圆形描边），subview 渲染顺序无歧义
+    private let innerRing = NSView()
+    private let outerRing = NSView()
     private var trackingArea: NSTrackingArea?
     private var selected = false
 
@@ -925,14 +926,14 @@ private final class TBColorButton: NSButton {
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.borderWidth = 0.5
         dot.layer?.borderColor = NSColor.black.withAlphaComponent(0.28).cgColor
-        for ring in [innerRing, outerRing] {
-            ring.fillColor = NSColor.clear.cgColor
-            ring.strokeColor = NSColor.white.withAlphaComponent(0.85).cgColor
-            ring.lineWidth = 1.5
+        for (ring, alpha) in [(innerRing, 0.85), (outerRing, 0.28)] {
+            ring.translatesAutoresizingMaskIntoConstraints = false
+            ring.wantsLayer = true
+            ring.layer?.borderWidth = 1.5
+            ring.layer?.borderColor = NSColor.white.withAlphaComponent(alpha).cgColor
             ring.isHidden = true
-            dot.layer?.addSublayer(ring)
+            addSubview(ring)
         }
-        outerRing.strokeColor = NSColor.white.withAlphaComponent(0.28).cgColor
         addSubview(dot)
         NSLayoutConstraint.activate([
             dot.centerXAnchor.constraint(equalTo: centerXAnchor),
@@ -954,11 +955,10 @@ private final class TBColorButton: NSButton {
         let c = CGPoint(x: bounds.midX, y: bounds.midY)
         for (ring, outset) in [(innerRing, CGFloat(4.5)), (outerRing, CGFloat(8.0))] {
             let ringSide = TBStyle.dotSide + outset * 2
-            let frame = CGRect(
+            ring.frame = CGRect(
                 x: c.x - ringSide / 2, y: c.y - ringSide / 2,
                 width: ringSide, height: ringSide)
-            ring.frame = frame
-            ring.path = CGPath(ellipseIn: CGRect(origin: .zero, size: frame.size), transform: nil)
+            ring.layer?.cornerRadius = ringSide / 2
         }
     }
 
@@ -1152,8 +1152,14 @@ private final class ToolbarTooltipWindow: NSPanel {
             // padding 3.5 8 → 高 21
             let w = size.width + 16
             let h: CGFloat = 21
-            let x = rect.midX - w / 2
+            var x = rect.midX - w / 2
             let y = rect.maxY + 8
+            // 屏边 clamp（用户病例：hover label 顶部/侧边被裁——工具栏近屏幕
+            // 边缘时 tooltip 出界）
+            if let screenFrame = NSScreen.screens.first(where: { $0.frame.intersects(rect) }) {
+                let visible = screenFrame.visibleFrame
+                x = max(visible.minX + 4, min(x, visible.maxX - w - 4))
+            }
             setFrame(NSRect(x: x, y: y, width: w, height: h), display: true)
             contentView?.layer?.shadowPath = CGPath(
                 roundedRect: NSRect(x: 0, y: 0, width: w, height: h),
