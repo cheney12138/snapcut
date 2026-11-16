@@ -222,6 +222,15 @@ final class ScrollCaptureHUDPanel: NSPanel {
         })
     }
 
+    /// 到底撤销：回采集态（用户又继续滚，scroll.bottom.revoked 配套）
+    func setCapturingState() {
+        capturingStack.isHidden = false
+        capturingStack.alphaValue = 1
+        okStack.isHidden = true
+        contentView?.layoutSubtreeIfNeeded()
+        adjustWindowSize()
+    }
+
     /// HUD 贴选区下缘 8pt 居中（§9：贴选区下缘 8pt）
     func reposition(below selectionGlobal: CGRect, on screen: NSScreen) {
         let size = contentView?.fittingSize ?? frame.size
@@ -384,5 +393,18 @@ final class ScrollRegionGlowView: NSView {
         bottomBarLayer.isHidden = false
         glowLayer.removeAnimation(forKey: "motion.pulse")
         glowLayer.opacity = DesignTokens.Motion.pulseAlphaMin
+    }
+
+    /// 到底撤销（用户又继续滚）：清绿条恢复脉动
+    func clearBottomReached() {
+        bottomBarLayer.isHidden = true
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = DesignTokens.Motion.pulseAlphaMin
+        anim.toValue = DesignTokens.Motion.pulseAlphaMax
+        anim.duration = DesignTokens.Motion.pulseDuration
+        anim.autoreverses = true
+        anim.repeatCount = .infinity
+        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        glowLayer.add(anim, forKey: "motion.pulse")
     }
 }

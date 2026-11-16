@@ -846,6 +846,16 @@ final class OverlayController {
             return
         }
         scrollNoProgressCount = 0
+        // 到底后又有新帧（用户继续滚）：取消 pending 自动收尾，重新等到底
+        if scrollBottomDetected {
+            scrollBottomWork?.cancel()
+            scrollBottomWork = nil
+            for window in windows where window.owningScreen == scrollScreen {
+                window.clearScrollBottomReached()
+            }
+            scrollHUD?.setCapturingState()
+            Log.event(.scroll, "scroll.bottom.revoked", [:])
+        }
         scrollBottomDetected = false
         growRegionIfPossible(ref: ref, cur: buffer, frame: frame, overlap: overlap)
         scrollRefBuffer = buffer

@@ -89,6 +89,11 @@ final class OverlayWindow: NSWindow {
         (contentView as? OverlayView)?.setScrollBottomReached()
     }
 
+    /// 到底撤销（用户到底后又继续滚）：清绿条恢复采集光晕
+    func clearScrollBottomReached() {
+        (contentView as? OverlayView)?.clearScrollBottomReached()
+    }
+
     /// 安装冻结帧（会话开始时的整屏静态图）
     func installFrozenImage(_ image: CGImage) {
         (contentView as? OverlayView)?.installFrozenImage(image)
@@ -255,6 +260,10 @@ final class OverlayView: NSView {
     /// 到底确认态（底缘绿条亮起，光晕定格）
     func setScrollBottomReached() {
         scrollGlowView?.setBottomReached()
+    }
+
+    func clearScrollBottomReached() {
+        scrollGlowView?.clearBottomReached()
     }
 
     /// 边缘光晕层（scene 06：outline 1.5pt accent + 3.5pt soft 外圈 + motion.pulse）

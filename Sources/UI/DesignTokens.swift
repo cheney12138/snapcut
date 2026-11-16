@@ -420,7 +420,10 @@ enum DesignTokens {
         static let bottomAutoComposeDelay: TimeInterval = 0.6    // 到底 0.6s 自动合成
         // ⚠️ 2 样本 @0.4s = 静止 0.8s 就判到底（病例：用户进采集态后先读屏定位，
         // 还没开滚就自动合成单帧）——提到 4（静止 1.6s）才敢说「停止滚动」
-        static let bottomConfirmSamples = 4                      // 连续 4 次采样无新增 → 到底
+        // 10（病例 2026-11-16「还是没拼接好」：0.12s 采样下 4 样本=0.48s 停顿
+        // 就误判到底——用户滚动中松手换姿势即触发，长图只有 1-2 帧。
+        // 0.12×10=1.2s 停顿才判到底（对齐 0.4s 时代 4 样本=1.6s 的设计意图）
+        static let bottomConfirmSamples = 10
         static let sampleInterval: TimeInterval = 0.4            // 采样周期
         // 拼帧超时上限（病例：3840×2098 两帧 compose 卡 10s 后才 fail——超时
         // 直接回退单帧+恢复原选区，不让用户在无反馈的收尾期干等）
