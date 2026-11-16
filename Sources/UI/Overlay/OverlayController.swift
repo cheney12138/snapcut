@@ -82,6 +82,14 @@ final class OverlayController {
         previousApp = NSWorkspace.shared.frontmostApplication
         if let prev = previousApp {
             previousAppPID = Int(prev.processIdentifier)
+            Log.event(.app, "focus.begin.record", [
+                "pid": "\(previousAppPID ?? -1)",
+                "bundle": prev.bundleIdentifier ?? "?",
+                "active": "\(NSApp.isActive)",
+            ])
+        } else {
+            previousAppPID = nil
+            Log.event(.app, "focus.begin.record", ["pid": "-1", "bundle": "nil"])
         }
         editorSession = nil
         toolbar?.orderOut(nil)
@@ -250,9 +258,14 @@ final class OverlayController {
             Log.event(.app, "focus.restored", ["to": prev.bundleIdentifier ?? "?", "via": "robust"])
         } else {
             NSApp.deactivate()
+            let pidMatched = previousAppPID.flatMap { pid in
+                NSWorkspace.shared.runningApplications.contains { $0.processIdentifier == pid }
+            } ?? false
             Log.event(.app, "focus.deactivated", [
                 "hadPrev": "\(previousApp != nil)",
                 "prevAlive": "\(previousApp?.isTerminated ?? false)",
+                "pid": "\(previousAppPID ?? -1)",
+                "pidMatched": "\(pidMatched)",
             ])
         }
     }
