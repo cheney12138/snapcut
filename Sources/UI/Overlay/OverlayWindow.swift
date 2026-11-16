@@ -574,8 +574,15 @@ final class OverlayView: NSView {
             return
         }
 
-        // 2) 空格 + 选区内拖拽 = 整体移动
+        // 2) 空格 + 选区内拖拽 = 整体移动（保留）
         if spacePressed && editorRectLocal.contains(point) {
+            editGesture = .move(startRect: editorRectLocal, startPoint: point)
+            return
+        }
+        // 2.5) 边缘内侧带（12pt）直接拖 = 整体移动（用户病例 2026-11-16：
+        // 「截图完想移动，结果直接画上箭头」——直觉是拖边缘=挪位置；外缘
+        // 手柄 resize 之外的近边缘区域给 move，选区中心区仍归标注工具）
+        if !spacePressed, nearSelectionEdge(point, band: 12) {
             editGesture = .move(startRect: editorRectLocal, startPoint: point)
             return
         }
@@ -621,6 +628,14 @@ final class OverlayView: NSView {
             )
         }
         needsDisplay = true
+    }
+
+    /// 点是否落在选区边缘内侧 band pt 的环形带内（不算外缘手柄区）
+    private func nearSelectionEdge(_ point: CGPoint, band: CGFloat) -> Bool {
+        let outer = editorRectLocal
+        let inner = outer.insetBy(dx: band, dy: band)
+        guard inner.width > band, inner.height > band else { return false }
+        return outer.contains(point) && !inner.contains(point)
     }
 
     private func handleEditorDragged(_ point: CGPoint) {
