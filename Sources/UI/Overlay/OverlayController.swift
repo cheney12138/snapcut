@@ -96,6 +96,13 @@ final class OverlayController {
         // 补丁 E（reviewer）：防御性清滚动残留（不依赖 coordinator state 门禁——
         // 缺失边①：任何绕过路径留下的吞键/采样/HUD 状态一律清零）
         teardownScrollSession()
+        // 病例（用户 2026-11-16「截图快捷键把设置面板唤起来」）：设置窗开启
+        // 期间 App 是 .regular，overlay 的 NSApp.activate 会把它的窗全部顶到
+        // 前台——设置窗盖在截图覆盖层上。截图期间设置窗退场（截完不自动回，
+        // 重新从菜单打开——截图时设置窗在场本身就挡内容）
+        if SettingsWindowController.shared.isVisible {
+            SettingsWindowController.shared.orderOutForCapture()
+        }
         previousApp = NSWorkspace.shared.frontmostApplication
         if let prev = previousApp {
             previousAppPID = Int(prev.processIdentifier)

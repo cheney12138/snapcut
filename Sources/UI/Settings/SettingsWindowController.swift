@@ -65,6 +65,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
 
     // MARK: - 打开
 
+    /// 截图期间退场（OverlayController.begin 调用；窗可见时 orderOut——
+    /// .regular App 的 activate 会把设置窗顶到 overlay 上挡截图内容）
+    var isVisible: Bool { window?.isVisible ?? false }
+
+    func orderOutForCapture() {
+        window?.orderOut(nil)
+        Log.event(.app, "settings.window.orderOutForCapture")
+    }
+
     func show(store: SettingsStoring) {
         self.store = store
         settings = store.load()
