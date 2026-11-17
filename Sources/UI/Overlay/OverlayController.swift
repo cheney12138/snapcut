@@ -884,30 +884,32 @@ final class OverlayController {
                         "tiles": "\(est.texturedTiles)",
                     ])
                 }
-                if let est = estimate, est.confidence >= 0.30, est.texturedTiles >= 6 {
-                    // dy 语义（降采样坐标系,Y-down）：同内容 tile 在 cur 的位置
-                    // = ref 位置 + dy。dy < 0 = 内容上移 = 页面下滚（新内容从底
-                    // 露出 |dy|×downsample 行）；dy ≥ 0 小值 = 静止/回滚
-                    if est.dy >= -2 {
-                        verdict = .staticFrame
+                // tile 三态裁决（病例「还没滚完就中断」：滚动中 12 帧 conf=0.20
+                // dy=3 回落行签名被判静止 → bottom.detected → 0.6s 自动收束）：
+                // SnowShot 语义——位移估计只有「动/静」两种可信结论,低置信=
+                // 未判定,不参与 bottom 静止计数也不丢内容。行签名静止判定
+                // 整体废弃（对局部/慢速滚动结构性误判,多轮验证）：
+                // ① conf≥0.30 且 dy≤-4 → 滚动中（折算 overlap 入列）
+                // ② conf≥0.30 且 dy>-4 → 高置信静止 → bottom 计数
+                // ③ conf<0.30 → 未判定：跳帧但不算静止（bottom 不误触）
+                if let est = estimate, est.texturedTiles >= 6 {
+                    if est.confidence >= 0.30 {
+                        if est.dy >= -4 {
+                            verdict = .staticFrame
+                        } else {
+                            let shiftPx = Double(-est.dy) * 4.0   // 降采样 4x → 全分辨率
+                            let overlap = buffer.height - Int(shiftPx)
+                            Log.event(.scroll, "scroll.motion.tile", [
+                                "dy": "\(est.dy)", "conf": String(format: "%.2f", est.confidence),
+                                "tiles": "\(est.texturedTiles)", "overlap": "\(overlap)",
+                            ])
+                            verdict = overlap >= Stitcher.Options().minOverlap
+                                ? .contributing(overlap: overlap)
+                                : .skipped
+                        }
                     } else {
-                        let shiftPx = Double(-est.dy) * 4.0   // 降采样 4x → 全分辨率
-                        let overlap = buffer.height - Int(shiftPx)
-                        Log.event(.scroll, "scroll.motion.tile", [
-                            "dy": "\(est.dy)", "conf": String(format: "%.2f", est.confidence),
-                            "tiles": "\(est.texturedTiles)", "overlap": "\(overlap)",
-                        ])
-                        verdict = overlap >= Stitcher.Options().minOverlap
-                            ? .contributing(overlap: overlap)
-                            : .skipped
+                        verdict = .skipped   // 未判定：跳帧但不算静止（bottom 不误触）
                     }
-                } else if await Self.framesNearIdenticalAsync(ref, buffer) {
-                    verdict = .staticFrame
-                } else if let result = try? Stitcher.findOverlap(
-                    prev: ref, cur: buffer, options: Stitcher.Options(),
-                    frameIndex: 0
-                ) {
-                    verdict = .contributing(overlap: result.overlap)
                 } else {
                     verdict = .skipped
                 }
