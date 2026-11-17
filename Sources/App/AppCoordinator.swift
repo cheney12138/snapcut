@@ -168,6 +168,8 @@ final class AppCoordinator {
     /// 截图两键的热键 id（设置保存后重注册用——病例「改完不生效」：
     /// 注册只在启动，改键要重启才生效）
     private var regionHotKeyID: UInt32?
+    /// 兜底热键只注册一次（rebind 重跑 registerCaptureHotkeys 时防 -9878 重复）
+    private var everRegisteredFallbacks = false
     private var fullHotKeyID: UInt32?
 
     /// 设置保存后重绑定（SettingsWindowController.persist 回灌时调）
@@ -191,6 +193,9 @@ final class AppCoordinator {
         fullHotKeyID = hotkeyCenter.register(keyCode: full.keyCode, modifiers: full.modifiers) { [weak self] in
             self?.beginFullScreenCapture()
         }
+        // ⚠️ 兜底三键（⌥⌘H/⌃⌥D/⌥⌘,）只注册一次——rebind 不会走这里
+        guard regionHotKeyID == nil || !everRegisteredFallbacks else { return }
+        everRegisteredFallbacks = true
         // 兜底可达性（菜单栏满时图标会被系统隐藏，实测连最小 App 也不显示）：
         // ⌥⌘H 在光标处弹出完整菜单，⌥⌘, 直接开设置
         deps.hotkeys.register(keyCode: UInt32(kVK_ANSI_H), modifiers: [.option, .command]) { [weak self] in

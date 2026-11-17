@@ -83,11 +83,16 @@ public struct HotkeySpec: Equatable, Sendable {
             default: return nil
             }
         }
-        // 至少一个修饰键，否则会抢普通打字（编辑器作用域例外）
+        // 至少一个修饰键，否则会抢普通打字（例外：编辑器作用域 allowBare；
+        // F 键（功能键）任何作用域都无打字冲突，裸用安全——用户裁定 F 区
+        // 全局放开）
         if mods.isEmpty {
-            guard allowBare else { return nil }
-            // 裸键允许：字母数字 + F 键（用户裁定 F 区放开——F 键无打字冲突）
-            if keyPart.count != 1, namedKeys[keyPart] == nil { return nil }
+            let isFunctionKey = keyPart.count > 1 && namedKeys[keyPart] != nil
+                && keyPart.hasPrefix("f") && keyPart.dropFirst().first?.isNumber == true
+            if !isFunctionKey {
+                guard allowBare else { return nil }
+                if keyPart.count != 1 { return nil }
+            }
         }
         return HotkeySpec(keyCode: keyCode, modifiers: mods)
     }
