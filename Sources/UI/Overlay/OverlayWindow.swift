@@ -1099,6 +1099,13 @@ final class OverlayView: NSView {
                 controller.perform(action: .copy)
             } else if phase == .confirmed {
                 controller.perform(action: .copy)
+            } else if phase == .waitingForDrag, let target = hovered {
+                // 病例（用户 2026-11-17「默认选中的窗口回车要按两次」）：
+                // hover 高亮窗时回车——waitingForDrag 分支无处理=第一次回车
+                // 被吞，用户被迫回车两次（第二次时若已点击进 confirmed 才生效）。
+                // 修：回车=确认 hover 窗（与单击 hover 窗同路径，含 220ms
+                // 双击宽限——回车单发不触发双击，宽限后照常整窗确认）
+                scheduleWindowCapture(target)
             }
         case kVK_ANSI_S:
             // ⌘⌥S 快存（内置语义，不走热键体系）；⌘S 保存与裸 S 滚动截图
