@@ -915,15 +915,18 @@ final class OverlayController {
         scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
     }
 
-    /// 两帧是否几乎一致（抽 60 行签名比对，≥95% 行匹配 = 没滚动）。
-    /// 0.98 病例：慢速滚动 / 滚动中停顿被误判静止 ⇒ 11s 采样只入列 2 帧
-    /// （用户实测 2026-11-17 日志：sampler.stop delivered=3 vs frames=2），
-    /// 降到 0.95 让真实新帧计入。
-    // 0.80（病例 2026-11-17「页面内卡片滚动无法处理」：卡片只占选区 5-15%
-    // 面积——整窗 60 行抽样 95% 相似判静止，局部滚动的匹配率 96-98% 全被
-    // 误判静止 → 19 交付只 2 入列、1.2s 后误判到底自动关闭。80% 阈值 =
-    // 20% 面积变化即认为在滚（局部/整窗滚动都接住））
-    nonisolated private static let nearIdenticalRowRatio: CGFloat = 0.80
+    /// 两帧是否几乎一致（抽 60 行签名比对，≥98% 行匹配 = 没滚动）。
+    /// 阈值史（三级病例推演）：
+    /// ① 0.95→0.98 病例：慢速滚动被误判静止 ⇒ 11s 只入列 2 帧
+    /// ② 0.98→0.95：停顿期误判，回落
+    /// ③ 0.80（病例「卡片局部滚动」5-15% 面积局部滚 → 相似率 85-95% 需要
+    /// 低阈值接住）——但 **0.80 把「卡片 10% 面积变化」也判静止**（只 10% 行
+    /// 变 < 20% 阈值）：29 帧全 static、拼不出长图（用户 2026-11-17 实报
+    /// 「Safari 卡片页没拼接成功」日志铁证）
+    /// 终案：staticFrame 只认 **真静止**（0.98）——小变化帧（0.80-0.98，
+    /// 慢滚/局部滚/微动）一律送 stitcher.findOverlap 裁决：拼得上=贡献帧，
+    /// 拼不上=skip（带 droppedHint 提示，比静默吞好）。拼接层是唯一真裁判。
+    nonisolated private static let nearIdenticalRowRatio: CGFloat = 0.98
 
     nonisolated private static func framesNearIdentical(_ a: PixelBuffer, _ b: PixelBuffer) -> Bool {
         guard a.height == b.height, a.width == b.width else { return false }
