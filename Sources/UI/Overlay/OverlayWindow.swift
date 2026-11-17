@@ -1350,8 +1350,9 @@ final class OverlayView: NSView {
         // 实现：move 手势进行中（editGesture == .move）从全屏 frozenImage 动态
         // 裁 editorRectLocal 屏幕对应区域；松手时 adjustSelection 提交正式底图
         // （标注 offset 平移）——拖动中标注跟框走，视觉连贯。
-        if case .move = editGesture, let frozen = frozenImage,
-           let liveCrop = liveFrozenCrop() {
+        switch editGesture {
+        case .move, .resize:
+            if let frozen = frozenImage, let liveCrop = liveFrozenCrop() {
             ctx.saveGState()
             ctx.clip(to: editorRectLocal)
             ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
@@ -1359,7 +1360,12 @@ final class OverlayView: NSView {
             ctx.interpolationQuality = .none
             ctx.draw(liveCrop, in: editorRectLocal)
             ctx.restoreGState()
-        } else {
+                return
+            }
+        default:
+            break
+        }
+        do {
         ctx.saveGState()
         ctx.clip(to: editorRectLocal)
         ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
