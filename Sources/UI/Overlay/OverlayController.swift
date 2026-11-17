@@ -465,10 +465,10 @@ final class OverlayController {
 
     private func enterEditor(base: CGImage, selection: CGRect, screen: NSScreen) {
         // 幂等清理（病例 2026-11-16：enter.fromScroll 在 compose 回退链被调两次
-        // ——旧工具栏不拆、双面板 + panel 负坐标）：重入先撤旧编辑视觉
+        // ——旧工具栏不拆、双面板 + panel 负坐标）：重入先撤旧编辑视觉。
+        // ⚠️ toolbar 实例保留（dismiss 视觉退场后复用——构建 440ms 太贵）
         if editorSession != nil {
-            toolbar?.dismiss()   // motion.exit；completion 持有面板至收窗
-            toolbar = nil
+            toolbar?.orderOut(nil)
             for window in windows {
                 window.exitScrollMode()
                 (window.contentView as? OverlayView)?.exitEditorIfNeeded()
@@ -489,8 +489,11 @@ final class OverlayController {
             window.enterEditorMode(session: session)
         }
 
-        // 工具栏
-        let toolbar = ToolbarPanel()
+        // 工具栏（复用实例——病例 2026-11-17「回车之后才出现工具栏」：每次
+        // 新建 ToolbarPanel 的构建 ~440ms（20 按钮+玻璃+布局），松手→工具栏
+        // 可见之间空窗长到用户以为工具栏是回车触发的。复用上次会话的工具栏
+        // （configure 重绑 session/place 新位置），首次构建后即 0ms 就位）
+        let toolbar = self.toolbar ?? ToolbarPanel()
         toolbar.updateScreen(screen)
         toolbar.configure(
             session: session,
