@@ -1294,6 +1294,24 @@ final class OverlayView: NSView {
     }
 
     /// 编辑阶段：选区外蒙层 + 选区内冻结底图 + 标注层
+    /// move 手势期间的实时取景：当前选区在冻结帧上的对应区域
+    private func liveFrozenCrop() -> CGImage? {
+        guard let window = window, let frozen = frozenImage, bounds.width > 0 else { return nil }
+        // editorRectLocal（视图 Y-down）→ 屏全局（Y-up）
+        let global = CGRect(
+            x: window.frame.minX + editorRectLocal.minX,
+            y: window.frame.maxY - editorRectLocal.maxY,
+            width: editorRectLocal.width, height: editorRectLocal.height)
+        // 屏 → 冻结帧像素（frozen 与 window.frame 同区域 1:1 像素比例）
+        let sx = CGFloat(frozen.width) / max(1, window.frame.width)
+        let sy = CGFloat(frozen.height) / max(1, window.frame.height)
+        let px = CGRect(
+            x: (global.minX - window.frame.minX) * sx,
+            y: (window.frame.maxY - global.maxY) * sy,
+            width: global.width * sx, height: global.height * sy).integral
+        return frozen.cropping(to: px)
+    }
+
     private func drawEditor(ctx: CGContext) {
         guard let session = editorSession else { return }
 
@@ -1327,6 +1345,21 @@ final class OverlayView: NSView {
         } else {
             baseForDraw = session.baseImage
         }
+        // ⚠️ 用户裁定（2026-11-17「相机取景框」语义）：拖动选区期间，框内内容
+        // 必须实时映射冻结帧的对应区域（取景器对着的是世界，不是一张贴图）。
+        // 实现：move 手势进行中（editGesture == .move）从全屏 frozenImage 动态
+        // 裁 editorRectLocal 屏幕对应区域；松手时 adjustSelection 提交正式底图
+        // （标注 offset 平移）——拖动中标注跟框走，视觉连贯。
+        if case .move = editGesture, let frozen = frozenImage,
+           let liveCrop = liveFrozenCrop() {
+            ctx.saveGState()
+            ctx.clip(to: editorRectLocal)
+            ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.interpolationQuality = .none
+            ctx.draw(liveCrop, in: editorRectLocal)
+            ctx.restoreGState()
+        } else {
         ctx.saveGState()
         ctx.clip(to: editorRectLocal)
         ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
@@ -1335,6 +1368,7 @@ final class OverlayView: NSView {
         ctx.interpolationQuality = .none
         ctx.draw(baseForDraw, in: editorRectLocal)
         ctx.restoreGState()
+        }
 
         // 3. 标注层（同一渲染器 = 导出所见）
         // ⚠️ 病例：不能放在上面的「图像翻转 gstate」里画——那个 CTM 是为 Y-up 位图
