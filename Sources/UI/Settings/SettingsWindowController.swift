@@ -745,9 +745,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private func persist() {
         guard let store else { return }
         store.save(settings)  // 适配器内打 settings.save 日志
-        // 即时回灌运行中的 coordinator（编辑器热键逐键读 settings，
-        // 不重启即生效；全局 Carbon 热键仍需重启重注册——历史行为，另案）
+        // 即时回灌 + 全局热键重绑（病例「改完不生效」：全局键注册只在
+        // 启动，改键后要重启——rebind 即时重注册 Carbon）
         AppCoordinatorShared.coordinator?.settings = settings
+        AppCoordinatorShared.coordinator?.rebindCaptureHotkeys()
     }
 
     // MARK: - 布局助手（磨砂分组卡 / 行高 36 / 8pt 栅格）

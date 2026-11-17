@@ -165,13 +165,30 @@ final class AppCoordinator {
     }
 
     /// 按用户设置注册两个截图热键（解析失败回落默认 ⌘⇧A / ⌘⇧S）
+    /// 截图两键的热键 id（设置保存后重注册用——病例「改完不生效」：
+    /// 注册只在启动，改键要重启才生效）
+    private var regionHotKeyID: UInt32?
+    private var fullHotKeyID: UInt32?
+
+    /// 设置保存后重绑定（SettingsWindowController.persist 回灌时调）
+    func rebindCaptureHotkeys() {
+        hotkeyCenter.unregister(regionHotKeyID)
+        hotkeyCenter.unregister(fullHotKeyID)
+        regionHotKeyID = nil
+        fullHotKeyID = nil
+        registerCaptureHotkeys()
+        Log.event(.hotkey, "hotkey.rebind", [
+            "region": settings.hotkeyRegion, "full": settings.hotkeyFullScreen,
+        ])
+    }
+
     private func registerCaptureHotkeys() {
         let region = HotkeySpec.parse(settings.hotkeyRegion) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_A), modifiers: [.command, .shift])
         let full = HotkeySpec.parse(settings.hotkeyFullScreen) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_S), modifiers: [.command, .shift])
-        deps.hotkeys.register(keyCode: region.keyCode, modifiers: region.modifiers) { [weak self] in
+        regionHotKeyID = hotkeyCenter.register(keyCode: region.keyCode, modifiers: region.modifiers) { [weak self] in
             self?.beginRegionCapture()
         }
-        deps.hotkeys.register(keyCode: full.keyCode, modifiers: full.modifiers) { [weak self] in
+        fullHotKeyID = hotkeyCenter.register(keyCode: full.keyCode, modifiers: full.modifiers) { [weak self] in
             self?.beginFullScreenCapture()
         }
         // 兜底可达性（菜单栏满时图标会被系统隐藏，实测连最小 App 也不显示）：
