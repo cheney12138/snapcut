@@ -1322,13 +1322,14 @@ final class OverlayView: NSView {
         // 屏 → 冻结帧像素（frozen 与 window.frame 同区域 1:1 像素比例）
         let sx = CGFloat(frozen.width) / max(1, window.frame.width)
         let sy = CGFloat(frozen.height) / max(1, window.frame.height)
-        // ⚠️ CGImage.cropping 坐标系原点在**左下**（与 drawEditor 的 Y-up
-        // 位图假设一致，与「视图 Y-down」直觉相反）——用户实报镜像病例：
-        // 左下角内容从右上角镜像出现 = y 按顶部量错了方向。正确=从底部量：
-        // 框底（global.minY）离屏底（frame.minY）的距离 × sy
+        // ⚠️ 坐标两坑（用户镜像病例「左下→右上」两个 y 方向都复现过）：
+        // ① CGImage.cropping 原点在**左上**（Y-down；crop_test3 实测铁证）
+        //   —— y 从顶部量，与 controller.pixelRect 同公式
+        // ② 真根因在绘制 CTM（drawEditor liveCrop 路径已补内层平移）：
+        //   翻转围绕已平移原点致 draw rect.y 语义反转 = 垂直镜像
         var px = CGRect(
             x: (global.minX - window.frame.minX) * sx,
-            y: (global.minY - window.frame.minY) * sy,
+            y: (window.frame.maxY - global.maxY) * sy,
             width: global.width * sx, height: global.height * sy)
         // 防御：clamp 进位图边界（越界裁剪返 nil → 回退旧路径贴图）
         px = px.intersection(CGRect(x: 0, y: 0, width: CGFloat(frozen.width), height: CGFloat(frozen.height)))
