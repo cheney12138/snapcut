@@ -26,6 +26,11 @@ public struct HotkeySpec: Equatable, Sendable {
     /// 系统约定默认；字母裸键（o/p/h）是编辑器原语义。
     public static let namedKeys: [String: UInt32] = [
         "return": 36, "esc": 53, "space": 49, "delete": 51, "tab": 48,
+        // F 区（用户裁定 2026-11-17「快捷配置不让用 F 区，不要加这个限制」；
+        // 键码 = HIToolbox kVK_F1..F12）
+        "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+        "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+        "left": 123, "right": 124, "down": 125, "up": 126,
     ]
     private static let namedKeySymbols: [String: String] = [
         "return": "⏎", "esc": "esc", "space": "Space", "delete": "⌫", "tab": "⇥",
@@ -81,8 +86,8 @@ public struct HotkeySpec: Equatable, Sendable {
         // 至少一个修饰键，否则会抢普通打字（编辑器作用域例外）
         if mods.isEmpty {
             guard allowBare else { return nil }
-            // 裸键仅允许字母数字（命名键裸按需带修饰键，避免抢系统行为）
-            guard keyPart.count == 1 else { return nil }
+            // 裸键允许：字母数字 + F 键（用户裁定 F 区放开——F 键无打字冲突）
+            if keyPart.count != 1, namedKeys[keyPart] == nil { return nil }
         }
         return HotkeySpec(keyCode: keyCode, modifiers: mods)
     }
