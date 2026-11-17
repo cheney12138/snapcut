@@ -136,18 +136,21 @@ enum Stitcher {
             // tile-NCC 位移优先（SnowShot 同思想,病例「卡片页拼不出长图」：
             // 行签名对局部滚动的结构性误判在 stitch 阶段同样存在——逐对帧
             // 重叠检测先行 tile 估计,可信则直接折算 overlap,失败回落行签名）
-            let tileOverlap: Int? = {
+            // tile-NCC 粗位移 → findOverlap 精搜（±32 行窗口,步长 1）：
+            // 粗定位毫秒级 + 精修像素级,精度与性能兼得（初版「tile 直接折算
+            // overlap」卡死病例的修正——全量 NCC 已裁剪,精修窗口替代折算）
+            let tileHint: Int? = {
                 guard let est = TileMotionEstimator.estimateShift(
                     ref: frames[index - 1], cur: frames[index]),
                     est.confidence >= 0.30, est.texturedTiles >= 6, est.dy < -2
                 else { return nil }
-                let shiftPx = Double(-est.dy) * 4.0
-                let overlap = buffer.height - Int(shiftPx)
-                return overlap >= options.minOverlap ? overlap : nil
+                // dy（降采样,Y-down,负=页面下滚）→ 对齐参数 d：cur 第 0 行
+                // 对齐 prev 第 d 行;页面下滚 |dy|px=cur 顶 =prev 往下 d=|dy|×ds 行
+                return Int(-Double(est.dy) * Double(TileMotionEstimator.Estimate.downsample))
             }()
-            let (overlap, _) = try tileOverlap.map { ($0, buffer.height - $0) }
-                ?? findOverlap(prev: buffers[index - 1], cur: buffer,
-                               options: options, frameIndex: index)
+            let (overlap, _) = try findOverlap(
+                prev: buffers[index - 1], cur: buffer,
+                options: options, frameIndex: index, hintD: tileHint)
             let contributed = buffer.height - overlap
             // cur 第 0 行在输出中的位置 = prev 第 0 行位置 + prev 高度 - 重叠
             runningY += buffers[index - 1].height - overlap
@@ -170,7 +173,8 @@ enum Stitcher {
     /// 返回 `(overlap, d)`：cur 的第 i 行对齐 prev 的第 d+i 行，overlap = prevH - d。
     /// 线程语义：纯函数，任意线程可调用。
     static func findOverlap(
-        prev: PixelBuffer, cur: PixelBuffer, options: Options, frameIndex: Int
+        prev: PixelBuffer, cur: PixelBuffer, options: Options, frameIndex: Int,
+        hintD: Int? = nil
     ) throws -> (overlap: Int, d: Int) {
         guard prev.height > options.minOverlap, cur.height > options.minOverlap else {
             throw StitcherError.frameTooSmall(
@@ -180,6 +184,26 @@ enum Stitcher {
         // cur 必须至少净贡献 1 行，否则会死循环拼接静止画面
         let maxOverlap = min(prev.height, cur.height) - 1
         guard maxOverlap >= options.minOverlap else {
+            throw StitcherError.noOverlapFound(frameIndex: frameIndex)
+        }
+
+        // tile-NCC 提示窗口（性能 + 精度分工：粗位移由 tile 投票给出,此处
+        // 只在 ±32 行内步长 1 精搜;无提示时回落全量从大到小枚举）
+        if let hint = hintD {
+            let dMin = max(0, hint - 32)
+            let dMax = min(prev.height - options.minOverlap - 1, hint + 32)
+            if dMax >= dMin {
+                // 窗口内优先靠近 hint（精搜步长 1,从 hint 向两侧扩）
+                for delta in 0...max(dMax - hint, hint - dMin) {
+                    for d in [hint - delta, hint + delta] where d >= dMin && d <= dMax {
+                        let overlap = prev.height - d
+                        guard overlap >= options.minOverlap, overlap <= maxOverlap else { continue }
+                        if alignmentPasses(prev: prev, cur: cur, d: d, overlap: overlap, options: options) {
+                            return (overlap, d)
+                        }
+                    }
+                }
+            }
             throw StitcherError.noOverlapFound(frameIndex: frameIndex)
         }
 
