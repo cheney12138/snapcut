@@ -420,9 +420,9 @@ final class OverlayView: NSView {
             window?.makeKey()
             needsDisplay = true
         case .confirmed:
-            if event.clickCount >= 2 {
-                controller.perform(action: .copy)
-            }
+            // 双击=copy 已移除（用户裁定 2026-11-17「我还没 Enter，贴图就不要
+            // 生成」——确认动作只走 Enter/工具栏按钮，鼠标双击不得隐式完成）
+            break
         case .editing:
             handleEditorMouseDown(point, event: event)
         case .dragging:
