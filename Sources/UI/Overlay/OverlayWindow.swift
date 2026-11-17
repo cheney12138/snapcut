@@ -1381,6 +1381,7 @@ final class OverlayView: NSView {
             ctx.clip(to: editorRectLocal)
             ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
             ctx.scaleBy(x: 1, y: -1)
+            ctx.translateBy(x: -editorRectLocal.minX, y: -editorRectLocal.minY)
             ctx.interpolationQuality = .none
             ctx.draw(liveCrop, in: editorRectLocal)
             ctx.restoreGState()
