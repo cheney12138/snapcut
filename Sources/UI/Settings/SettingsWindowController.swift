@@ -1079,6 +1079,11 @@ private final class HotkeyRecorderView: NSButton {
     // MARK: keyDown 捕获
 
     override func keyDown(with event: NSEvent) {
+        Log.event(.app, "recorder.keyDown", [
+            "code": "\(event.keyCode)",
+            "chars": "\(event.charactersIgnoringModifiers ?? "?")",
+            "recording": "\(isRecording)",
+        ])
         guard isRecording else { return }
         if event.keyCode == 53 {  // Esc 取消录制
             endRecordingIfNeeded()
@@ -1094,8 +1099,19 @@ private final class HotkeyRecorderView: NSButton {
             // 编辑器热键：裸字母/数字合法（原 O/P/H 语义）；裸命名键非法
             // 裸键白名单：字母/数字 + F 键（用户病例「f1 录不进去」——录制侧
             // 的裸键判定只认单字符，F1-F12 两字符被拒）
+            // F 键白名单对两类录制器都放行（用户裁定 2026-11-17 终报「改不了
+            // 我再给你最后一次机会」——全局热键行录 F1 也被「需含修饰键」拒）。
+            // F 键无打字冲突，裸用作全局热键也安全
             let isBareFKey = key.count == 2 && key.hasPrefix("f") && (key.dropFirst().first?.isNumber == true)
-            if allowBare, (key.count == 1 && (key.first?.isLetter == true || key.first?.isNumber == true)) || isBareFKey {
+            if isBareFKey {
+                onCombo(key)
+                isRecording = false
+                updateDisplay()
+                window?.makeFirstResponder(nil)
+                flashConfirmed()
+                return
+            }
+            if allowBare, (key.count == 1 && (key.first?.isLetter == true || key.first?.isNumber == true)) {
                 onCombo(key)
                 isRecording = false
                 updateDisplay()
