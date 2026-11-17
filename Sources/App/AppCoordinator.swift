@@ -301,9 +301,12 @@ final class AppCoordinator {
                     self.exporter.savePanel(image)
                 } else {
                     self.exporter.copyToClipboard(image)
-                    // 复制反馈（设置可关）：右下角 toast，不抢焦点
+                    // 复制反馈（设置可关）：右下角 toast，不抢焦点。
+                    // 点击 toast → 打开截图继续编辑（用户功能 2026-11-17）
                     if self.settings.showCopyNotification {
-                        CaptureToast.show(image: image)
+                        CaptureToast.show(image: image, onClick: { [weak self] in
+                            self?.reopenEditor(image: image)
+                        })
                     }
                 }
             case .save(let image):
@@ -318,6 +321,31 @@ final class AppCoordinator {
         if elapsedMs > 50 {
             Log.error(.overlay, "overlay.open.slow", ["ms": "\(elapsedMs)"])
         }
+    }
+
+    /// toast 点击重开编辑（复用 overlay 生命周期,回车/导出走同一 completion 链）
+    private func reopenEditor(image: CGImage) {
+        if overlayController == nil {
+            overlayController = OverlayController()
+        }
+        overlayController?.openEditor(image: image, completion: { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .copy(let img):
+                self.exporter.copyToClipboard(img)
+                if self.settings.showCopyNotification {
+                    CaptureToast.show(image: img, onClick: { [weak self] in
+                        self?.reopenEditor(image: img)
+                    })
+                }
+            case .save(let img):
+                self.state = .exporting
+                self.exporter.savePanel(img)
+            case .cancelled:
+                break
+            }
+            self.state = .idle
+        })
     }
 
     /// 快速保存（编辑器内 ⌘⌥S）：按设置的目录与文件名规则直接落盘

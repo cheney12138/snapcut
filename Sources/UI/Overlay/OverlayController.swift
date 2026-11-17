@@ -93,6 +93,44 @@ final class OverlayController {
 
     // MARK: - 会话
 
+    /// 从外源图片重开编辑器（toast 点击「打开截图继续编辑」入口）：
+    /// 不拍屏（图已有）——建光标屏 overlay 窗、selection=图适配屏的显示矩形、
+    /// 直接进编辑态。原尺寸保留（导出时按 session.scale 还原像素）。
+    func openEditor(image: CGImage, completion: @escaping (Result) -> Void) {
+        self.completion = completion
+        overlaySessionEpoch += 1
+        teardownScrollSession()
+        editorSession = nil
+        toolbar?.dismiss()
+        toolbar = nil
+        dismissAll()
+        frozenImages.removeAll()
+        previousApp = NSWorkspace.shared.frontmostApplication
+        previousAppPID = previousApp.map { Int($0.processIdentifier) }
+        ensureActivation(reason: "toast.reopen")
+        NSApp.activate(ignoringOtherApps: true)
+
+        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
+            ?? NSScreen.main ?? NSScreen.screens.first
+        guard let screen else { return }
+        // 图适配屏（80% 可视高度上限,宽同比例）
+        let maxH = screen.visibleFrame.height * 0.8
+        let maxW = screen.visibleFrame.width * 0.8
+        let scale = min(1, min(maxW / CGFloat(image.width), maxH / CGFloat(image.height)))
+        let w = CGFloat(image.width) * scale
+        let h = CGFloat(image.height) * scale
+        let selection = CGRect(
+            x: screen.frame.midX - w / 2, y: screen.frame.midY - h / 2,
+            width: w, height: h)
+
+        let window = OverlayWindow(screen: screen, controller: self)
+        window.orderFrontRegardless()
+        windows.append(window)
+        window.makeKey()
+        didSelect(rect: selection, on: screen)
+        Log.event(.app, "toast.reopen.editor", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
+    }
+
     func begin(completion: @escaping (Result) -> Void, onShown: (() -> Void)? = nil) {
         self.completion = completion
         overlaySessionEpoch += 1

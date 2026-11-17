@@ -163,7 +163,8 @@ enum CaptureToast {
         Log.event(.app, "toast.show", ["kind": "text", "msg": message])
     }
 
-    static func show(image: CGImage, message: String = "已复制到剪贴板") {
+    static func show(image: CGImage, message: String = "已复制到剪贴板",
+                     onClick: (() -> Void)? = nil) {
         // 连续截图：旧 toast 0.1s 快 fade 再上新，避免叠影硬切
         dismissWork?.cancel()
         retireCurrentToast()
@@ -238,6 +239,20 @@ enum CaptureToast {
         }
         current = panel
 
+        // 点击打开编辑（用户功能 2026-11-17「通知弹窗允许点击,打开截图
+        // 继续编辑」）：toast 可点（首击激活窗）——点击立即退场+回调
+        if let onClick {
+            panel.ignoresMouseEvents = false
+            let clickView = ToastClickView(frame: panel.contentView?.bounds ?? .zero)
+            clickView.onClick = { [weak panel] in
+                guard let panel else { return }
+                panel.orderOut(nil)
+                if current === panel { current = nil }
+                onClick()
+            }
+            panel.contentView?.addSubview(clickView)
+            clickView.autoresizingMask = [.width, .height]
+        }
         // 2 秒后退场：fade 0.18s + 下滑 6pt
         let work = DispatchWorkItem {
             playExit(panel: panel, duration: 0.18) {
@@ -258,6 +273,15 @@ enum CaptureToast {
         Log.event(.app, "toast.show", [
             "pxW": "\(image.width)", "pxH": "\(image.height)",
         ])
+    }
+}
+
+/// toast 点击层（全幅 hit-test,首击激活）
+private final class ToastClickView: NSView {
+    var onClick: (() -> Void)?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
     }
 }
 
