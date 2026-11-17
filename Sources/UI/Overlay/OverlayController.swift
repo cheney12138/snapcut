@@ -903,7 +903,11 @@ final class OverlayController {
     /// 0.98 病例：慢速滚动 / 滚动中停顿被误判静止 ⇒ 11s 采样只入列 2 帧
     /// （用户实测 2026-11-17 日志：sampler.stop delivered=3 vs frames=2），
     /// 降到 0.95 让真实新帧计入。
-    private static let nearIdenticalRowRatio: CGFloat = 0.95
+    // 0.80（病例 2026-11-17「页面内卡片滚动无法处理」：卡片只占选区 5-15%
+    // 面积——整窗 60 行抽样 95% 相似判静止，局部滚动的匹配率 96-98% 全被
+    // 误判静止 → 19 交付只 2 入列、1.2s 后误判到底自动关闭。80% 阈值 =
+    // 20% 面积变化即认为在滚（局部/整窗滚动都接住））
+    nonisolated private static let nearIdenticalRowRatio: CGFloat = 0.80
 
     nonisolated private static func framesNearIdentical(_ a: PixelBuffer, _ b: PixelBuffer) -> Bool {
         guard a.height == b.height, a.width == b.width else { return false }
