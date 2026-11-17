@@ -165,9 +165,14 @@ final class OverlayController {
             self.showOverlayWindows()
             if !NSApp.isActive {
                 Task { @MainActor in
-                    for _ in 0..<18 {
-                        if NSApp.isActive { break }
+                    var attempts = 0
+                    while !NSApp.isActive, attempts < 18 {
+                        // 每 100ms 重发 activate（用户终报「咔咔的」：单发
+                        // activate 被系统异步丢弃，主线程 runloop 上的重发
+                        // 最终被接受——3 秒不激活 = 干等不重试的空转）
+                        NSApp.activate(ignoringOtherApps: true)
                         try? await Task.sleep(nanoseconds: 100_000_000)
+                        attempts += 1
                     }
                     if !NSApp.isActive {
                         Log.error(.app, "overlay.open.activationTimeout", [:])
