@@ -72,6 +72,13 @@ final class OverlayController {
     /// 本次采集是否观测到过真实滚动（净贡献 > 0）：到底自动合成的前置条件——
     /// 从未滚动就静止 ≠ 到底（用户在读屏定位），不能自动合成
     private var scrollEverScrolled = false
+    // 局部滚动带锁定（病例 2026-11-17 Safari 卡片页：整页 90% 行静止 →
+    // findOverlap 行签名（64 点跨宽采样）大部分落在静止区 → 大 overlap
+    // 轻易通过 → 每帧贡献 1-5px → 10 帧拼出 2 屏「没拼接」。终案：连续
+    // 低贡献帧触发「滚动带检测」——行签名 diff 聚类出变化主带（滚动卡片），
+    // 自动收缩采集选区到该带，之后纯带内拼接（相机对准真正在动的东西）
+    private var lowContributionCount = 0
+    private var scrollBandLocked = false
     /// 进入滚动采集时的原选区（grow 之前）：拼接失败回退单帧时恢复它，
     /// 而不是保留 grow 后的选区（病例：grow 扩到全屏 → compose 失败 →
     /// enter.fromScroll pxH=2098 pxW=3840 全屏选区，另一屏也被框住）
@@ -703,6 +710,8 @@ final class OverlayController {
         scrollBottomDetected = false
         scrollProgress = 0
         scrollRefBuffer = nil
+        lowContributionCount = 0
+        scrollBandLocked = false
         scrollEverScrolled = false
 
         // 编辑态 UI 退场（会话保留；motion.exit 替代 orderOut 直切）
@@ -895,6 +904,16 @@ final class OverlayController {
             return
         case .contributing(let o):
             overlap = o
+            // 局部滚动哨兵：贡献行 < 8px 且未锁带 → 计数；连续 3 帧低贡献
+            // → 检测行级变化带并收缩选区（页内卡片滚动场景的根本解）
+            if !scrollBandLocked, o > 0, buffer.height - o < 8 {
+                lowContributionCount += 1
+                if lowContributionCount >= 3, let ref = scrollRefBuffer {
+                    lockScrollBand(ref: ref, cur: buffer)
+                }
+            } else {
+                lowContributionCount = 0
+            }
         }
         scrollNoProgressCount = 0
         // 到底后又有新帧（用户继续滚）：取消 pending 自动收尾，重新等到底
@@ -982,6 +1001,63 @@ final class OverlayController {
                 "screen": "\(Int(bounds.width))x\(Int(bounds.height))@\(Int(bounds.minX)),\(Int(bounds.minY))",
             ])
         }
+    }
+
+    /// 局部滚动带检测与锁定：ref/cur 行签名逐行 diff，聚类出变化主带
+    /// （卡片滚动区），把采集选区收缩到该带并重置基准帧。带外静止行不再
+    /// 干扰 findOverlap（行签名大部分采样点落在静止区的结构性误匹配消失）。
+    private func lockScrollBand(ref: PixelBuffer, cur: PixelBuffer) {
+        guard ref.width == cur.width, ref.height == cur.height,
+              ref.height > 32, let rect = scrollSelectionRect,
+              let screen = scrollScreen else { return }
+        // 行变化位图（容差同 rowDiffThreshold——行签名差 > 阈值 = 变化行）
+        let threshold = Stitcher.Options().rowDiffThreshold
+        var changed = [Bool](repeating: false, count: ref.height)
+        for row in 0..<ref.height where row < cur.height {
+            changed[row] = !PixelBuffer.rowMatches(ref.signature[row], cur.signature[row],
+                                                    threshold: threshold)
+        }
+        // 最大连续变化带（≥16 行才可信；上下各扩 8 行容错）
+        var bestRange: (start: Int, end: Int)? = nil
+        var runStart = -1
+        for row in 0...ref.height {
+            let isChanged = row < ref.height && changed[row]
+            if isChanged, runStart < 0 { runStart = row }
+            if !isChanged, runStart >= 0 {
+                if bestRange == nil || (row - runStart) > (bestRange!.end - bestRange!.start) {
+                    bestRange = (runStart, row)
+                }
+                runStart = -1
+            }
+        }
+        guard var band = bestRange, band.end - band.start >= 16 else {
+            lowContributionCount = 0   // 没有可信带：重置哨兵，避免反复尝试
+            return
+        }
+        band.start = max(0, band.start - 8)
+        band.end = min(ref.height, band.end + 8)
+        // 帧像素行（Y-down，顶部为 0）→ 选区 pt：px/帧高 × 选区高 + 选区 minY（Y-up）
+        let pxToPt = rect.height / CGFloat(ref.height)
+        let bandMinYGlobal = rect.maxY - CGFloat(band.end) * pxToPt
+        let bandHeightPt = CGFloat(band.end - band.start) * pxToPt
+        let newRect = CGRect(x: rect.minX, y: bandMinYGlobal,
+                             width: rect.width, height: bandHeightPt)
+        // 带锁定：收缩区域 + 下一帧重置基准（region shrink 会丢 ref，
+        // updateScrollRegion 重画蒙层）
+        scrollSelectionRect = newRect
+        for window in windows where window.owningScreen == screen {
+            window.updateScrollRegion(newRect)
+        }
+        scrollHUD?.reposition(below: newRect, on: screen)
+        scrollBandLocked = true
+        lowContributionCount = 0
+        // 下一帧作为新基准重新起步（当前 buffer 与带不对应位置关系）
+        scrollRefBuffer = nil
+        scrollFrames.removeAll { !($0 === scrollFrames.first) }   // 保留首帧底图
+        Log.event(.scroll, "scroll.band.locked", [
+            "px": "\(band.start)..<\(band.end)",
+            "ptRect": "\(Int(newRect.minY)),\(Int(newRect.height))",
+        ])
     }
 
     /// 到底：底缘 2pt 绿条 + HUD 切确认态 + 0.6s 后自动合成（无需用户动作）。
