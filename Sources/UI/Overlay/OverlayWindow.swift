@@ -53,6 +53,12 @@ final class OverlayWindow: NSWindow {
         // mouseDragged 在非 key 窗时收不到，窗层补齐（起拖只做一次，view
         // phase 变化后 guard 挡住）
         if event.type == .leftMouseDown || event.type == .leftMouseDragged {
+            // 冷启动首激活（用户病例 2026-11-17 终报：重启后第一次唤起，
+            // 热键回调的 activate 被系统忽略——LSUIElement 无手势上下文；
+            // 3.1s 未激活。真实点击=手势上下文，系统必接受——按下瞬间激活）
+            if !NSApp.isActive {
+                NSApp.activate(ignoringOtherApps: true)
+            }
             if let view = contentView as? OverlayView {
                 view.beginDragIfNeeded(from: view.convert(event.locationInWindow, from: nil))
             }
