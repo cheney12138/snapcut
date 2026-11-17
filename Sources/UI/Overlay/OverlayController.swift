@@ -827,7 +827,7 @@ final class OverlayController {
         }
     }
 
-    private enum Verdict { case first, staticFrame, contributing(overlap: Int), skipped }
+    private enum Verdict: Equatable { case first, staticFrame, contributing(overlap: Int), skipped }
 
     private static func framesNearIdenticalAsync(_ a: PixelBuffer, _ b: PixelBuffer) async -> Bool {
         await Task.detached(priority: .userInitiated) {
