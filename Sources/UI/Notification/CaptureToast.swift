@@ -243,6 +243,15 @@ enum CaptureToast {
             playExit(panel: panel, duration: 0.18) {
                 if current === panel { current = nil }
             }
+            // 双保险（用户病例「回车之后还浮在桌面上」：NSAnimationContext
+            // completion 偶发不触发 → toast 永驻）：0.6s 后无条件收窗
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                if current === panel {
+                    panel.orderOut(nil)
+                    current = nil
+                    Log.event(.app, "toast.exit.forced", [:])
+                }
+            }
         }
         dismissWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
