@@ -204,7 +204,9 @@ enum Stitcher {
                     }
                 }
             }
-            throw StitcherError.noOverlapFound(frameIndex: frameIndex)
+            // hint 精搜失败不直接判死——回落全量枚举（卡片页行签名结构性
+            // 误判的风险由 tile hint 优先规避,但 hint 落空时老链兜底比
+            // noOverlap 崩掉整个拼接强）
         }
 
         // 重叠从大到小枚举：滚动捕获场景下最大可信重叠即真实重叠
