@@ -1322,10 +1322,13 @@ final class OverlayView: NSView {
         // 屏 → 冻结帧像素（frozen 与 window.frame 同区域 1:1 像素比例）
         let sx = CGFloat(frozen.width) / max(1, window.frame.width)
         let sy = CGFloat(frozen.height) / max(1, window.frame.height)
-        let px = CGRect(
+        var px = CGRect(
             x: (global.minX - window.frame.minX) * sx,
             y: (window.frame.maxY - global.maxY) * sy,
-            width: global.width * sx, height: global.height * sy).integral
+            width: global.width * sx, height: global.height * sy)
+        // 防御：clamp 进位图边界（越界裁剪返 nil → 回退旧路径贴图）
+        px = px.intersection(CGRect(x: 0, y: 0, width: CGFloat(frozen.width), height: CGFloat(frozen.height)))
+        guard !px.isNull, px.width >= 1, px.height >= 1 else { return nil }
         return frozen.cropping(to: px)
     }
 
