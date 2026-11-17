@@ -260,6 +260,16 @@ enum DesignTokens {
 
     // MARK: - 7. 控件尺寸
 
+    /// 玻璃浮层前景（暗外观=白 α，亮外观=黑 α）——工具栏等 HUD 组件
+    /// 跟随系统后的文字/描边动态色源
+    static func hudForeground(_ alpha: CGFloat) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let base: NSColor = isDark ? .white : .black
+            return base.withAlphaComponent(alpha)
+        }
+    }
+
     enum Control {
         static let h: CGFloat = 28      // ctl.h：标准控件高 / 工具·图标按钮 28×28
         static let hSm: CGFloat = 22    // ctl.h.sm：popup、小按钮、热键录制器、NSSwitch

@@ -56,7 +56,7 @@ private enum TBStyle {
     static let sliderWidth: CGFloat = DesignTokens.Control.sliderWidth // 76
     static let accent = DesignTokens.accent
     static let accentHover = DesignTokens.accentHover
-    static let iconIdle = NSColor.white.withAlphaComponent(DesignTokens.Toolbar.iconIdleAlpha)
+    static let iconIdle = DesignTokens.hudForeground(DesignTokens.Toolbar.iconIdleAlpha)
     static let iconActive = DesignTokens.labelOnAccent
     static let iconDisabledAlpha = DesignTokens.Toolbar.iconDisabledAlpha
 }
@@ -109,9 +109,9 @@ final class ToolbarPanel: NSPanel {
         // 工具栏上面，把点击全部吃掉（病例：所有按钮点了没反应）
         level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        // ⚠️ 玻璃材质钉死暗色：不设的话跟随系统主题，浅色模式下 .hudWindow 是浅色
-        // 材质，叠 60% 深色后成浑浊中灰，没有玻璃感（用户实报「不透明深灰」）
-        appearance = NSAppearance(named: .darkAqua)
+        // 玻璃跟随系统（用户裁定 2026-11-17「工具栏要浅色，2 种跟随系统切换」：
+        // 历史的钉暗是为「60% 深叠色」防浑浊——深叠色已删，钉暗解除。
+        // 浅色模式下 hudWindow 是亮玻璃，前景色走 hudForeground 动态色）
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false          // 阴影由根视图图层画（面板自带阴影会被裁掉/难调 spread）
