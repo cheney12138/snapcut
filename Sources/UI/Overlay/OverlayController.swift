@@ -838,6 +838,14 @@ final class OverlayController {
                 // 枚举）；dy=0 → 静止；低置信 → 回落行签名旧链
                 let estimate = TileMotionEstimator.estimateShift(
                     ref: refImageSnapshot ?? frame, cur: frame)
+                // 诊断（卡片页拼接调试）：每帧 tile 估计结论全量落日志——
+                // dy/置信度/tile 数,判断分支走向
+                if let est = estimate {
+                    Log.event(.scroll, "scroll.motion.tile", [
+                        "dy": "\(est.dy)", "conf": String(format: "%.2f", est.confidence),
+                        "tiles": "\(est.texturedTiles)",
+                    ])
+                }
                 if let est = estimate, est.confidence >= 0.30, est.texturedTiles >= 6 {
                     // dy 语义（降采样坐标系,Y-down）：同内容 tile 在 cur 的位置
                     // = ref 位置 + dy。dy < 0 = 内容上移 = 页面下滚（新内容从底
