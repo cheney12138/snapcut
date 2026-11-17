@@ -350,12 +350,70 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             row("截图音效", trailing: [soundSwitch]),
         ])
 
-        let outer = NSStackView(views: [captureCard, fileCard, historyCard, notifyCard])
+        // 工具栏排序（用户裁定 2026-11-17）：行序 = toolbarOrder；▲▼ 调序即时生效
+        let orderCard = makeGroupCard(title: "工具栏排序", rows: buildToolbarOrderRows())
+
+        let outer = NSStackView(views: [captureCard, orderCard, fileCard, historyCard, notifyCard])
         outer.orientation = .vertical
         outer.alignment = .leading
         outer.spacing = 12
         outer.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
         pinStack(outer, to: generalPane)
+    }
+
+    /// 工具栏排序行（▲▼ 调序；改动即 persist + 工具栏重建在下次会话生效）
+    private func buildToolbarOrderRows() -> [NSView] {
+        var rows: [NSView] = []
+        let order = settings.toolbarOrderSafe()
+        for (idx, raw) in order.enumerated() {
+            let name: String
+            switch raw {
+            case 206: name = "滚动截图"
+            default:
+                name = EditorSession.Tool(rawValue: raw)?.label ?? "未知(\(raw))"
+            }
+            let label = NSTextField(labelWithString: "\(idx + 1). \(name)")
+            label.font = .systemFont(ofSize: 12)
+
+            let up = NSButton(title: "▲", target: self, action: #selector(toolbarOrderTapped(_:)))
+            up.bezelStyle = .inline
+            up.controlSize = .small
+            up.isEnabled = idx > 0
+            up.tag = raw * 10 + 0   // delta=-1 编码为末位 0
+
+            let down = NSButton(title: "▼", target: self, action: #selector(toolbarOrderTapped(_:)))
+            down.bezelStyle = .inline
+            down.controlSize = .small
+            down.isEnabled = idx < order.count - 1
+            down.tag = raw * 10 + 2   // delta=+1 编码为末位 2
+
+            rows.append(row(label.stringValue, trailing: [up, down]))
+        }
+        return rows
+    }
+
+    @objc private func toolbarOrderTapped(_ sender: NSButton) {
+        let raw = sender.tag / 10
+        let delta = (sender.tag % 10) - 1   // 编码：末位 0=-1，2=+1
+        moveToolbarOrder(raw, delta: delta)
+    }
+
+    /// 调序：toolbarOrder 里把 raw 上/下移，persist 即时生效
+    private func moveToolbarOrder(_ raw: Int, delta: Int) {
+        guard let idx = settings.toolbarOrder.firstIndex(of: raw) else { return }
+        let target = idx + delta
+        guard target >= 0, target < settings.toolbarOrder.count else { return }
+        settings.toolbarOrder.swapAt(idx, target)
+        Log.event(.app, "settings.toolbarOrder", ["moved": "\(raw)", "to": "\(target)"])
+        persist()
+        rebuildOrderCard()
+    }
+
+    /// 排序卡整卡重建（行序即时反映）：通用页清空重 build + 切回显示
+    private func rebuildOrderCard() {
+        generalPane.subviews.forEach { $0.removeFromSuperview() }
+        buildGeneralPane()
+        selectTab(0)
     }
 
     @objc private func afterCaptureChanged(_ sender: NSPopUpButton) {

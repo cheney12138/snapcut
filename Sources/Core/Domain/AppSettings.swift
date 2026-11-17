@@ -41,9 +41,25 @@ public struct AppSettings: Equatable, Sendable, Codable {
     /// 额外允许裸键（"o"/"s"）与命名键（"return" / "esc"）——编辑器作用域，
     /// 不注册 Carbon。scroll 清空则滚动截图无键（仅工具栏按钮入口）。
     public var editorHotkeys: [String: String]
+    /// 工具栏按钮自定义排序（EditorSession.Tool rawValue 序列 + 206 滚动；
+    /// 用户裁定 2026-11-17）。默认 = enum 顺序 + 滚动在尾
+    public var toolbarOrder: [Int]
 
     /// 编辑器热键的出厂默认（= 原 keyDown 硬编码 + 滚动截图 s；存量存档缺 scroll
     /// 键时 editorHotkey(for:) 自动回落默认 —— s 从「内置」转「可自定义」零感知迁移）
+    public static let defaultToolbarOrder: [Int] = {
+        var order = EditorSession.Tool.allCases.filter { $0 != .none }.map { $0.rawValue }
+        order.append(206)   // 滚动截图（工具组尾）
+        return order
+    }()
+
+    /// 排序查找（缺省回落默认——旧存档兼容）
+    public func toolbarOrderSafe() -> [Int] {
+        let valid = Set(EditorSession.Tool.allCases.map { $0.rawValue }) .union([206])
+        let filtered = toolbarOrder.filter { valid.contains($0) }
+        return filtered.count > 0 ? filtered : Self.defaultToolbarOrder
+    }
+
     public static let defaultEditorHotkeys: [String: String] = [
         "undo": "cmd+z",
         "redo": "cmd+shift+z",
@@ -73,7 +89,8 @@ public struct AppSettings: Equatable, Sendable, Codable {
         playCaptureSound: Bool = false,
         hotkeyRegion: String = "cmd+shift+a",
         hotkeyFullScreen: String = "cmd+shift+s",
-        editorHotkeys: [String: String] = AppSettings.defaultEditorHotkeys
+        editorHotkeys: [String: String] = AppSettings.defaultEditorHotkeys,
+        toolbarOrder: [Int] = AppSettings.defaultToolbarOrder
     ) {
         self.afterCapture = afterCapture
         self.saveDirectoryPath = saveDirectoryPath
@@ -84,6 +101,7 @@ public struct AppSettings: Equatable, Sendable, Codable {
         self.hotkeyRegion = hotkeyRegion
         self.hotkeyFullScreen = hotkeyFullScreen
         self.editorHotkeys = editorHotkeys
+        self.toolbarOrder = toolbarOrder
     }
 
     /// 出厂默认值
@@ -111,5 +129,7 @@ public struct AppSettings: Equatable, Sendable, Codable {
             .decodeIfPresent(String.self, forKey: .hotkeyFullScreen)) ?? "cmd+shift+s"
         editorHotkeys = (try? decoder.container(keyedBy: CodingKeys.self)
             .decodeIfPresent([String: String].self, forKey: .editorHotkeys)) ?? Self.defaultEditorHotkeys
+        toolbarOrder = (try? decoder.container(keyedBy: CodingKeys.self)
+            .decodeIfPresent([Int].self, forKey: .toolbarOrder)) ?? Self.defaultToolbarOrder
     }
 }

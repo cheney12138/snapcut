@@ -216,22 +216,26 @@ final class ToolbarPanel: NSPanel {
         ])
         rootStack = stack
 
-        // 1) 6 个绘图工具 + 滚动截图入口（用户裁定：进工具组，R6 六工具不破——
-        //    滚动是动作不是标注工具，不占 EditorSession.Tool 序号，tag 206）
-        for tool in EditorSession.Tool.allCases where tool != .none {
-            let button = TBToolButton(tool: tool)
-            button.target = self
-            button.action = #selector(toolTapped(_:))
-            button.onHover = { [weak self] inside in self?.handleHover(inside, button: button, text: tool.tipText) }
-            toolButtons[tool] = button
-            stack.addArrangedSubview(button)
+        // 1) 工具组 + 滚动截图入口：按 settings.toolbarOrder 自定义排序
+        //    （用户裁定 2026-11-17；默认 = enum 序 + 滚动尾）
+        let order = (AppCoordinatorShared.coordinator?.settings ?? .defaultSettings).toolbarOrderSafe()
+        for raw in order {
+            if raw == 206 {
+                let scrollButton = TBIconButton(icon: .scroll, fallback: "滚")
+                scrollButton.tag = 206
+                scrollButton.target = self
+                scrollButton.action = #selector(toolTapped(_:))
+                scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 \(Self.hotkeyTip("scroll"))") }
+                stack.addArrangedSubview(scrollButton)
+            } else if let tool = EditorSession.Tool(rawValue: raw), tool != .none {
+                let button = TBToolButton(tool: tool)
+                button.target = self
+                button.action = #selector(toolTapped(_:))
+                button.onHover = { [weak self] inside in self?.handleHover(inside, button: button, text: tool.tipText) }
+                toolButtons[tool] = button
+                stack.addArrangedSubview(button)
+            }
         }
-        let scrollButton = TBIconButton(icon: .scroll, fallback: "滚")
-        scrollButton.tag = 206
-        scrollButton.target = self
-        scrollButton.action = #selector(toolTapped(_:))
-        scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 \(Self.hotkeyTip("scroll"))") }
-        stack.addArrangedSubview(scrollButton)
 
         stack.addArrangedSubview(makeSeparator())
 
