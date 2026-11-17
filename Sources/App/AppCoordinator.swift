@@ -43,11 +43,14 @@ final class AppCoordinator {
         }
     }
 
-    /// 启动预激活后的释放（AppDelegate 启动 warmup 用）：退出激活态但不
-    /// 还给任何 App（此刻没记录过前台归属），前台自然回用户当前 App。
+    /// 启动预激活（用户病例 2026-11-17 终报「重启后第一次必延迟、咔咔的」：
+    /// LSUIElement 从非激活态的首次 activate 需 ~750ms（无手势上下文被
+    /// 系统降级处理）——窗上屏后第一批鼠标事件漏给前台 App（TUI 选字 +
+    /// 框选乱跳）。终案：warmup 后**保持激活**不释放（启动瞬间的焦点抢夺
+    /// 由 restart.sh 语境消化）——此后每次唤起 activate 是「已激活 App 再
+    /// 激活」热路径，即时生效）
     func releaseActivationAfterWarmup() {
-        NSApp.deactivate()
-        Log.event(.app, "app.warmup.released")
+        Log.event(.app, "app.warmup.keptActive", ["active": "\(NSApp.isActive)"])
     }
 
     func start() {
