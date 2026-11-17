@@ -154,18 +154,26 @@ final class OverlayController {
             let freezeMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
             )
-            // 激活门闩 v2（用户 2026-11-17 三报「还是延迟、又选到文字」）：v1
-            // 的 16ms 忙等让主线程无喘息——NSApp.isActive 的更新依赖 runloop
-            // 处理激活事件，被门闩自己饿死。v2：100ms 步进（每步都给 runloop
-            // 真实的处理窗口），2s 硬上限
-            for _ in 0..<20 {
+            // 门闩 v3（用户「偶尔有延迟」）：窗先上屏（视觉即时），激活并行
+            // 补位——窗层起拖兜底（sendEvent beginDragIfNeeded）已让「激活
+            // 慢半拍」期间的鼠标事件也能框选；冻结期间最多等 200ms 激活
+            // 让 Esc/键盘也可用，超时放行不再拖显示
+            for _ in 0..<2 {
                 if NSApp.isActive { break }
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
-            if !NSApp.isActive {
-                Log.error(.app, "overlay.open.activationTimeout", [:])
-            }
             self.showOverlayWindows()
+            if !NSApp.isActive {
+                Task { @MainActor in
+                    for _ in 0..<18 {
+                        if NSApp.isActive { break }
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                    if !NSApp.isActive {
+                        Log.error(.app, "overlay.open.activationTimeout", [:])
+                    }
+                }
+            }
             let elapsedMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
             )
