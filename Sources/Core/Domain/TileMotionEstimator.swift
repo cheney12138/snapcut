@@ -98,8 +98,13 @@ enum TileMotionEstimator {
     private struct Tile {
         let x: Int
         let y: Int
-        let data: [Double]      // 中心化亮度（NCC 预备）
-        let energy: Double      // Σd²
+        let data: [Double]      // 中心化亮度（NCC 预备,全像素布局）
+        let energy: Double      // Σd²（全像素——仅用于方差/权重）
+        /// 8×8 采样网格口径的中心化值与能量（与 tileNCC 采样步长完全一致——
+        /// 病例「conf 恒 0」：初版分子 64 点 dot 对分母全像素 energy,
+        /// 尺度差 ~3 倍 → NCC 上限 0.33 < 0.6 阈值 → 永远判 0）
+        let sampledData: [Double]
+        let sampledEnergy: Double
         let variance: Double
         let weight: Double
     }
@@ -163,7 +168,20 @@ enum TileMotionEstimator {
         }
         variance /= Double(values.count)
         let weight = min(1.0, variance / 0.01)
-        return Tile(x: x, y: y, data: values, energy: energy, variance: variance, weight: weight)
+        // 8×8 均匀采样网格（step = size/8;与 tileNCC 的 sampleGrid 一致）
+        let step = max(1, size / 8)
+        var sampled: [Double] = []
+        var sampledEnergy = 0.0
+        for yy in stride(from: 0, to: size, by: step) {
+            for xx in stride(from: 0, to: size, by: step) {
+                let d = values[yy * size + xx]   // 中心化值
+                sampled.append(d)
+                sampledEnergy += d * d
+            }
+        }
+        return Tile(x: x, y: y, data: values, energy: energy,
+                    sampledData: sampled, sampledEnergy: sampledEnergy,
+                    variance: variance, weight: weight)
     }
 
     // MARK: - NCC（均匀采样）
@@ -171,7 +189,10 @@ enum TileMotionEstimator {
     private static func tileNCC(
         tile: Tile, cur: GrayImage, y0: Int, size: Int, sampleGrid: Int
     ) -> Double {
-        // 均匀采样 sampleGrid² 个点（性能纪律：64 点/候选,tile 全像素的 1/9）
+        // 均匀采样 sampleGrid² 个点（性能纪律：64 点/候选）。
+        // ⚠️ 口径统一（病例「conf 恒 0」：分子 64 点 dot 对分母全像素
+        // energy,尺度差 ~3 倍 → NCC 上限 0.33 → 全部 < 0.6 阈值判 0）：
+        // 分子与分母都用 8×8 采样口径（tile.sampledData/sampledEnergy）
         let step = max(1, size / sampleGrid)
         var sumCur = 0.0
         var count = 0
@@ -186,20 +207,18 @@ enum TileMotionEstimator {
         let meanCur = sumCur / Double(count)
         var dot = 0.0
         var energyCur = 0.0
+        var i = 0
         for yy in stride(from: 0, to: size, by: step) {
             let row = (y0 + yy) * cur.width
             for xx in stride(from: 0, to: size, by: step) {
                 let dc = Double(cur.pixels[row + tile.x + xx]) - meanCur
-                // 采样网格坐标的 tile 中心化值（网格一致,可直接索引）
-                let tIdx = yy * size + xx
-                dot += tile.data[tIdx] * dc
+                dot += tile.sampledData[i] * dc
                 energyCur += dc * dc
+                i += 1
             }
         }
-        let denom = (tile.energy * energyCur).squareRoot()
+        let denom = (tile.sampledEnergy * energyCur).squareRoot()
         guard denom > 1e-9 else { return 0 }
-        // tile.energy 是全像素中心化能量,dot/energyCur 是采样点——能量口径
-        // 不一致会有偏,但 NCC 只用于同帧候选间相对比较,单调性保留
         let ncc = dot / denom
         return ncc < 0 ? 0 : ncc
     }
