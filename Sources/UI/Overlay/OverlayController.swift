@@ -63,6 +63,8 @@ final class OverlayController {
     /// 考帧有净贡献——拿上一交付帧做基准会把慢滚全部误判静止丢帧（病例：用户
     /// 滚动 11s 只有 2 帧，交 delivered=3 计 frames=2）。仅在入列时更新。
     private var scrollRefBuffer: PixelBuffer?
+    /// ref 的原 CGImage（tile-NCC 位移估计需要像素图,PixelBuffer 只存行签名）
+    private var scrollRefImage: CGImage?
     /// 「滚动过快」HUD 提示的回落 work（1.2s）
     private var scrollDroppedHintWork: DispatchWorkItem?
     /// compose 期 Esc 连按计数（3 次 = 强制取消逃生）
@@ -710,6 +712,7 @@ final class OverlayController {
         scrollBottomDetected = false
         scrollProgress = 0
         scrollRefBuffer = nil
+        scrollRefImage = nil
         lowContributionCount = 0
         scrollBandLocked = false
         scrollEverScrolled = false
@@ -828,13 +831,39 @@ final class OverlayController {
         // 下主线程被吞，采样帧大量丢弃（12 交付只 4 入列、帧间隔 0.24-0.9s
         // 不均）。改：解码/比对在后台线程，主线程只收结论）
         let refSnapshot = scrollRefBuffer
+        let refImageSnapshot = scrollRefImage
         Task { [weak self] in
             // 重计算全链后台（病例「还是没拼接好」：主线程帧处理吞掉采样吞吐）：
             // 解码 30MB + 行签名 + findOverlap 全部在后台，主线程只收结论
             let buffer = PixelBuffer(cgImage: frame)
             var verdict: Verdict = .first
             if let ref = refSnapshot {
-                if await Self.framesNearIdenticalAsync(ref, buffer) {
+                // SnowShot 同思想裁决（用户终报「看 snowshot 源码吧」）：tile-NCC
+                // 位移估计先行——行签名对「90% 行静止 + 卡片局部滚动」结构性误判
+                // （静态区采样点稀释滚动区 → 大 overlap 恒通过 → 每帧贡献 1-5px）。
+                // tile 化后无纹理区（页眉/侧栏纯色）剔除投票,有纹理的卡片区以
+                // NCC 投真实位移。dy 高置信 → 直接按 dy 折算 overlap（不走向重叠
+                // 枚举）；dy=0 → 静止；低置信 → 回落行签名旧链
+                let estimate = TileMotionEstimator.estimateShift(
+                    ref: refImageSnapshot ?? frame, cur: frame)
+                if let est = estimate, est.confidence >= 0.30, est.texturedTiles >= 6 {
+                    // dy 语义（降采样坐标系,Y-down）：同内容 tile 在 cur 的位置
+                    // = ref 位置 + dy。dy < 0 = 内容上移 = 页面下滚（新内容从底
+                    // 露出 |dy|×downsample 行）；dy ≥ 0 小值 = 静止/回滚
+                    if est.dy >= -2 {
+                        verdict = .staticFrame
+                    } else {
+                        let shiftPx = Double(-est.dy) * 4.0   // 降采样 4x → 全分辨率
+                        let overlap = buffer.height - Int(shiftPx)
+                        Log.event(.scroll, "scroll.motion.tile", [
+                            "dy": "\(est.dy)", "conf": String(format: "%.2f", est.confidence),
+                            "tiles": "\(est.texturedTiles)", "overlap": "\(overlap)",
+                        ])
+                        verdict = overlap >= Stitcher.Options().minOverlap
+                            ? .contributing(overlap: overlap)
+                            : .skipped
+                    }
+                } else if await Self.framesNearIdenticalAsync(ref, buffer) {
                     verdict = .staticFrame
                 } else if let result = try? Stitcher.findOverlap(
                     prev: ref, cur: buffer, options: Stitcher.Options(),
@@ -870,6 +899,7 @@ final class OverlayController {
         if scrollRefBuffer == nil || verdict == .first {
             if scrollRefBuffer == nil {
                 scrollRefBuffer = buffer
+                scrollRefImage = frame
                 scrollFrames.append(frame)
                 Log.event(.scroll, "scroll.frame.n", ["n": "1"])
                 scrollHUD?.update(frames: scrollFrames.count, progress: 0)
@@ -929,6 +959,7 @@ final class OverlayController {
         scrollBottomDetected = false
         growRegionIfPossible(ref: buffer, cur: buffer, frame: frame, overlap: overlap)
         scrollRefBuffer = buffer
+        scrollRefImage = frame
         scrollFrames.append(frame)
         Log.event(.scroll, "scroll.frame.n", ["n": "\(scrollFrames.count)"])
         scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
@@ -1053,6 +1084,7 @@ final class OverlayController {
         lowContributionCount = 0
         // 下一帧作为新基准重新起步（当前 buffer 与带不对应位置关系）
         scrollRefBuffer = nil
+        scrollRefImage = nil
         scrollFrames.removeAll { !($0 === scrollFrames.first) }   // 保留首帧底图
         Log.event(.scroll, "scroll.band.locked", [
             "px": "\(band.start)..<\(band.end)",

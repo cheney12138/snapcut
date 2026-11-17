@@ -133,8 +133,21 @@ enum Stitcher {
                 continue
             }
 
-            let (overlap, _) = try findOverlap(
-                prev: buffers[index - 1], cur: buffer, options: options, frameIndex: index)
+            // tile-NCC 位移优先（SnowShot 同思想,病例「卡片页拼不出长图」：
+            // 行签名对局部滚动的结构性误判在 stitch 阶段同样存在——逐对帧
+            // 重叠检测先行 tile 估计,可信则直接折算 overlap,失败回落行签名）
+            let tileOverlap: Int? = {
+                guard let est = TileMotionEstimator.estimateShift(
+                    ref: frames[index - 1], cur: frames[index]),
+                    est.confidence >= 0.30, est.texturedTiles >= 6, est.dy < -2
+                else { return nil }
+                let shiftPx = Double(-est.dy) * 4.0
+                let overlap = buffer.height - Int(shiftPx)
+                return overlap >= options.minOverlap ? overlap : nil
+            }()
+            let (overlap, _) = try tileOverlap.map { ($0, buffer.height - $0) }
+                ?? findOverlap(prev: buffers[index - 1], cur: buffer,
+                               options: options, frameIndex: index)
             let contributed = buffer.height - overlap
             // cur 第 0 行在输出中的位置 = prev 第 0 行位置 + prev 高度 - 重叠
             runningY += buffers[index - 1].height - overlap
