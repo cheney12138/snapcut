@@ -1092,7 +1092,10 @@ private final class HotkeyRecorderView: NSButton {
         let key = Self.keyName(for: event)
         if mods.isEmpty {
             // 编辑器热键：裸字母/数字合法（原 O/P/H 语义）；裸命名键非法
-            if allowBare, key.count == 1, key.first?.isLetter == true || key.first?.isNumber == true {
+            // 裸键白名单：字母/数字 + F 键（用户病例「f1 录不进去」——录制侧
+            // 的裸键判定只认单字符，F1-F12 两字符被拒）
+            let isBareFKey = key.count == 2 && key.hasPrefix("f") && (key.dropFirst().first?.isNumber == true)
+            if allowBare, (key.count == 1 && (key.first?.isLetter == true || key.first?.isNumber == true)) || isBareFKey {
                 onCombo(key)
                 isRecording = false
                 updateDisplay()
