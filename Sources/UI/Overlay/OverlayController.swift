@@ -436,13 +436,15 @@ final class OverlayController {
         let sizeUnchanged = abs(newGlobal.width - old.width) < 0.5
             && abs(newGlobal.height - old.height) < 0.5
 
+        // 始终重裁（用户病例 2026-11-17「移动框直接给我移动贴图了」：尺寸不变
+        // 时跳过重裁 → 底图保持旧位置内容跟着框平移 = 一张贴图在屏上飘。
+        // 冻结帧是全屏的——框移到哪就裁哪的真实画面）
         var base = session.baseImage
-        if !sizeUnchanged {
-            guard let cropped = cropFrozenImage(selection: newGlobal, screen: screen) else {
-                Log.error(.overlay, "selection.adjust.noFrozen")
-                return
-            }
+        if let cropped = cropFrozenImage(selection: newGlobal, screen: screen) {
             base = cropped
+        } else if !sizeUnchanged {
+            Log.error(.overlay, "selection.adjust.noFrozen")
+            return
         }
         session.applySelectionChange(
             newSelection: newGlobal, newBase: base, annotationOffset: annotationOffset
