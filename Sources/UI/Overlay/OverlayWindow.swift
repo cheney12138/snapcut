@@ -1312,7 +1312,8 @@ final class OverlayView: NSView {
 
     /// 编辑阶段：选区外蒙层 + 选区内冻结底图 + 标注层
     /// move 手势期间的实时取景：当前选区在冻结帧上的对应区域
-    private func liveFrozenCrop() -> CGImage? {
+    /// （整像素对齐裁剪 + 1:1 绘制矩形，采样每帧稳定不抖）
+    private func liveFrozenCrop() -> (crop: CGImage, drawRect: CGRect)? {
         guard let window = window, let frozen = frozenImage, bounds.width > 0 else { return nil }
         // editorRectLocal（视图 Y-down）→ 屏全局（Y-up）
         let global = CGRect(
@@ -1334,7 +1335,17 @@ final class OverlayView: NSView {
         // 防御：clamp 进位图边界（越界裁剪返 nil → 回退旧路径贴图）
         px = px.intersection(CGRect(x: 0, y: 0, width: CGFloat(frozen.width), height: CGFloat(frozen.height)))
         guard !px.isNull, px.width >= 1, px.height >= 1 else { return nil }
-        return frozen.cropping(to: px)
+        // 整像素对齐（用户病例「取景框画面热空气扭曲」）：浮点裁剪 rect +
+        // nearest 采样 = 每帧采样网格亚像素跳变 → 内容热浪般扭动。取整后
+        // 每帧采样点集稳定；绘制矩形从像素反算回点（1:1 无拉伸）——clip 仍
+        // 用 editorRectLocal（视觉框精确跟手，内容 0.5pt 内的对齐差不可见）
+        px = px.integral
+        // 绘制 rect（视图点，从顶部量——与 px 同向）：像素 ÷ 比例
+        let drawRect = CGRect(
+            x: px.minX / sx, y: px.minY / sy,
+            width: px.width / sx, height: px.height / sy)
+        guard let crop = frozen.cropping(to: px) else { return nil }
+        return (crop, drawRect)
     }
 
     private func drawEditor(ctx: CGContext) {
@@ -1377,14 +1388,17 @@ final class OverlayView: NSView {
         // （标注 offset 平移）——拖动中标注跟框走，视觉连贯。
         switch editGesture {
         case .move, .resize:
-            if let frozen = frozenImage, let liveCrop = liveFrozenCrop() {
+            if let frozen = frozenImage, let live = liveFrozenCrop() {
+            // 1:1 绘制（drawRect 像素反算，整点对齐——热扭曲病例修复）：
+            // 翻转 CTM 的 rect 语义为「从顶部量」（与裁剪 px 同向），rect.minX/minY
+            // 即绘制原点；不再依赖 editorRectLocal 的浮点位置拉伸位图
             ctx.saveGState()
             ctx.clip(to: editorRectLocal)
-            ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
+            ctx.translateBy(x: live.drawRect.minX, y: live.drawRect.maxY)
             ctx.scaleBy(x: 1, y: -1)
-            ctx.translateBy(x: -editorRectLocal.minX, y: -editorRectLocal.minY)
+            ctx.translateBy(x: -live.drawRect.minX, y: -live.drawRect.minY)
             ctx.interpolationQuality = .none
-            ctx.draw(liveCrop, in: editorRectLocal)
+            ctx.draw(live.crop, in: live.drawRect)
             ctx.restoreGState()
                 return
             }
