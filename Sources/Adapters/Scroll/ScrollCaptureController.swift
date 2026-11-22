@@ -84,7 +84,8 @@ final class ScrollCaptureController {
         }
 
         let screenFrame = screen.frame
-        let scale = screen.backingScaleFactor
+        let scale = max(1, screen.backingScaleFactor)
+        let preferDisplayP3 = screen.canRepresent(.p3)
         let fps = max(1, min(120, config.targetFPS))
         let queueDepth = max(2, min(8, config.queueDepth))
         let minHeight = config.minFrameHeight
@@ -111,6 +112,7 @@ final class ScrollCaptureController {
                     displayID: displayID,
                     screenFrame: screenFrame,
                     scale: scale,
+                    preferDisplayP3: preferDisplayP3,
                     fps: fps,
                     queueDepth: queueDepth,
                     minFrameHeight: minHeight,
@@ -180,6 +182,7 @@ private actor ScrollStreamBox {
         displayID: CGDirectDisplayID,
         screenFrame: CGRect,
         scale: CGFloat,
+        preferDisplayP3: Bool,
         fps: Int,
         queueDepth: Int,
         minFrameHeight: Int,
@@ -215,18 +218,31 @@ private actor ScrollStreamBox {
 
         let config = SCStreamConfiguration()
         config.captureResolution = .best
-        config.sourceRect = CGRect(
-            x: region.minX - screenFrame.minX,
-            y: screenFrame.maxY - region.maxY,
-            width: region.width,
-            height: region.height
+        // 对齐到物理像素格（如 2x 屏按 0.5pt 取整），保证 sourceRect * scale == 输出像素，消除 SCK 双线性重采样糊边
+        let safeScale = max(1, scale)
+        let invScale = 1.0 / safeScale
+        let rawMinX = max(0, region.minX - screenFrame.minX)
+        let rawMinY = max(0, screenFrame.maxY - region.maxY)
+        let rawMaxX = min(screenFrame.width, region.maxX - screenFrame.minX)
+        let rawMaxY = min(screenFrame.height, screenFrame.maxY - region.minY)
+        let alignedMinX = (rawMinX * safeScale).rounded(.down) * invScale
+        let alignedMinY = (rawMinY * safeScale).rounded(.down) * invScale
+        let alignedMaxX = max(alignedMinX + invScale, (rawMaxX * safeScale).rounded(.up) * invScale)
+        let alignedMaxY = max(alignedMinY + invScale, (rawMaxY * safeScale).rounded(.up) * invScale)
+        let alignedSourceRect = CGRect(
+            x: alignedMinX,
+            y: alignedMinY,
+            width: alignedMaxX - alignedMinX,
+            height: alignedMaxY - alignedMinY
         )
-        config.width = max(1, Int(region.width * scale))
-        config.height = max(1, Int(region.height * scale))
+        config.sourceRect = alignedSourceRect
+        config.width = max(1, Int((alignedSourceRect.width * safeScale).rounded()))
+        config.height = max(1, Int((alignedSourceRect.height * safeScale).rounded()))
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         config.queueDepth = queueDepth
         config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.colorSpaceName = CGColorSpace.sRGB
+        let streamSpaceName: CFString = preferDisplayP3 ? CGColorSpace.displayP3 : CGColorSpace.sRGB
+        config.colorSpaceName = streamSpaceName
         config.showsCursor = false
         config.scalesToFit = false
 
@@ -241,8 +257,9 @@ private actor ScrollStreamBox {
             expectedWidth: config.width,
             expectedHeight: config.height,
             minFrameHeight: minFrameHeight,
-            region: region,
+            sourceRect: alignedSourceRect,
             screenFrame: screenFrame,
+            colorSpaceName: streamSpaceName,
             onFrame: onFrame,
             onError: onError
         )
@@ -275,7 +292,7 @@ private final class ScrollStreamOutput: NSObject, SCStreamOutput, SCStreamDelega
     private let expectedWidth: Int
     private let expectedHeight: Int
     private let minFrameHeight: Int
-    private let region: CGRect
+    private let sourceRect: CGRect
     private let screenFrame: CGRect
     private let colorSpace: CGColorSpace
     private let onFrame: @MainActor (CGImage) -> Void
@@ -285,17 +302,20 @@ private final class ScrollStreamOutput: NSObject, SCStreamOutput, SCStreamDelega
         expectedWidth: Int,
         expectedHeight: Int,
         minFrameHeight: Int,
-        region: CGRect,
+        sourceRect: CGRect,
         screenFrame: CGRect,
+        colorSpaceName: CFString,
         onFrame: @escaping @MainActor (CGImage) -> Void,
         onError: @escaping @MainActor (Error) -> Void
     ) {
         self.expectedWidth = expectedWidth
         self.expectedHeight = expectedHeight
         self.minFrameHeight = minFrameHeight
-        self.region = region
+        self.sourceRect = sourceRect
         self.screenFrame = screenFrame
-        self.colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        self.colorSpace = CGColorSpace(name: colorSpaceName)
+            ?? CGColorSpace(name: CGColorSpace.sRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
         self.onFrame = onFrame
         self.onError = onError
     }
@@ -374,10 +394,10 @@ private final class ScrollStreamOutput: NSObject, SCStreamOutput, SCStreamDelega
         let scaleX = CGFloat(full.width) / screenFrame.width
         let scaleY = CGFloat(full.height) / screenFrame.height
         let pxRect = CGRect(
-            x: (region.minX - screenFrame.minX) * scaleX,
-            y: (screenFrame.maxY - region.maxY) * scaleY,
-            width: region.width * scaleX,
-            height: region.height * scaleY
+            x: sourceRect.minX * scaleX,
+            y: sourceRect.minY * scaleY,
+            width: sourceRect.width * scaleX,
+            height: sourceRect.height * scaleY
         ).integral
         guard pxRect.width > 0, pxRect.height > 0,
               let cropped = full.cropping(to: pxRect) else {

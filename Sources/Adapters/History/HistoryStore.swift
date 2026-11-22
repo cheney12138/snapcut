@@ -217,9 +217,10 @@ final class HistoryStore {
         let canvasSize = metadata?.canvasSize
         let annotations = metadata?.annotations ?? []
         let strokeWidth = metadata?.strokeWidth ?? 2
+        let dpi = Self.preferredRetinaDPI(forCanvasWidth: canvasSize?.width, pixelWidth: width)
 
         Task.detached(priority: .userInitiated) { [weak self] in
-            guard let data = Self.encodePNG(image) else {
+            guard let data = Self.encodePNG(image, dpi: dpi) else {
                 Log.error(.history, "history.record.encode_fail", ["id": id])
                 return
             }
@@ -784,15 +785,32 @@ final class HistoryStore {
         return CGSize(width: CGFloat(width), height: CGFloat(height))
     }
 
-    /// CGImage → PNG Data（ImageIO，不依赖 AppKit，线程安全）
-    private nonisolated static func encodePNG(_ image: CGImage) -> Data? {
+    /// CGImage → PNG Data（ImageIO，不依赖 AppKit，线程安全；写入 Retina DPI 元数据对齐原生截图）
+    private nonisolated static func encodePNG(_ image: CGImage, dpi: CGFloat = 144) -> Data? {
         let out = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             out, UTType.png.identifier as CFString, 1, nil)
         else { return nil }
-        CGImageDestinationAddImage(destination, image, nil)
+        let safeDPI = max(72, dpi)
+        let props: [CFString: Any] = [
+            kCGImagePropertyDPIWidth: safeDPI,
+            kCGImagePropertyDPIHeight: safeDPI,
+        ]
+        CGImageDestinationAddImage(destination, image, props as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return out as Data
+    }
+
+    private static func preferredRetinaDPI(forCanvasWidth canvasWidth: CGFloat?, pixelWidth: Int) -> CGFloat {
+        if let canvasWidth, canvasWidth > 1 {
+            let inferredScale = min(4, max(1, (CGFloat(pixelWidth) / canvasWidth).rounded()))
+            return inferredScale * 72
+        }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        return max(1, screen?.backingScaleFactor ?? 2) * 72
     }
 
     /// id = ISO8601 时间戳 + 4 位随机大写十六进制后缀（同秒多次截图不冲突）

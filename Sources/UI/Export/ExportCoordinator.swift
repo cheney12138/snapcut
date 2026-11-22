@@ -73,8 +73,13 @@ final class ExportCoordinator {
         return "Snapcut \(formatter.string(from: Date())).png"
     }
 
-    private func writePNG(_ image: CGImage, to url: URL) {
+    private func writePNG(_ image: CGImage, to url: URL, scale: CGFloat? = nil) {
         let rep = NSBitmapImageRep(cgImage: image)
+        let safeScale = max(1, scale ?? defaultRetinaScale())
+        rep.size = NSSize(
+            width: CGFloat(image.width) / safeScale,
+            height: CGFloat(image.height) / safeScale
+        )
         guard let data = rep.representation(using: .png, properties: [:]) else {
             Log.error(.export, "export.save.fail", ["err": "PNG 编码失败"])
             return
@@ -89,5 +94,13 @@ final class ExportCoordinator {
         } catch {
             Log.error(.export, "export.save.fail", ["err": "\(error.localizedDescription)"])
         }
+    }
+
+    private func defaultRetinaScale() -> CGFloat {
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        return max(1, screen?.backingScaleFactor ?? 2)
     }
 }

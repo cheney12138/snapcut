@@ -35,6 +35,9 @@ final class ScrollCaptureHUDPanel: NSPanel {
     /// 锚定选区与屏幕：宽度自适应时始终基于选区中心重算，避免动画叠加引起水平漂移
     private var anchorSelectionGlobal: CGRect?
     private weak var anchorScreen: NSScreen?
+    /// 防止到底确认态 0.15s crossfade 动画完成回调在「到底撤销」后覆盖回 okStack 导致 HUD 假死卡字
+    private var bottomTransitionToken = 0
+    private var isShowingBottomState = false
 
     init() {
         let m = Self.shadowMargin
@@ -247,6 +250,11 @@ final class ScrollCaptureHUDPanel: NSPanel {
     private var lastStateKind: String = ""
 
     func update(state: State) {
+        if !isShowingBottomState && !okStack.isHidden {
+            capturingStack.isHidden = false
+            capturingStack.alphaValue = 1
+            okStack.isHidden = true
+        }
         let kind: String
         switch state {
         case .waiting:
@@ -305,29 +313,41 @@ final class ScrollCaptureHUDPanel: NSPanel {
     /// 到底/到顶：切确认态（呼吸点/帧数 crossfade 出、OK 态 crossfade 入）
     func setBottomState(isTop: Bool = false) {
         okLabel.stringValue = isTop ? "已到顶 · 自动合成" : "已到底 · 自动合成"
-        guard okStack.isHidden else { return }   // 已在确认态，幂等
+        guard !isShowingBottomState else { return }   // 已在确认态（含过渡中），幂等
+        isShowingBottomState = true
+        bottomTransitionToken &+= 1
+        let token = bottomTransitionToken
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = DesignTokens.Motion.crossfadeDuration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             capturingStack.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            guard let self else { return }
-            self.capturingStack.isHidden = true
-            self.capturingStack.alphaValue = 1   // 复位，下次进入采集态可直接显示
-            self.okStack.isHidden = false
-            self.okStack.alphaValue = 0
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = DesignTokens.Motion.crossfadeDuration
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                self.okStack.animator().alphaValue = 1
+            MainActor.assumeIsolated {
+                guard let self, self.bottomTransitionToken == token, self.isShowingBottomState else { return }
+                self.capturingStack.isHidden = true
+                self.capturingStack.alphaValue = 1   // 复位，下次进入采集态可直接显示
+                self.okStack.isHidden = false
+                self.okStack.alphaValue = 0
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = DesignTokens.Motion.crossfadeDuration
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    self.okStack.animator().alphaValue = 1
+                }
+                self.contentView?.layoutSubtreeIfNeeded()
+                self.adjustWindowSize()
             }
-            self.contentView?.layoutSubtreeIfNeeded()
-            self.adjustWindowSize()
         })
     }
 
     /// 到底撤销：回采集态（用户又继续滚，scroll.bottom.revoked 配套）
     func setCapturingState() {
+        isShowingBottomState = false
+        bottomTransitionToken &+= 1
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            capturingStack.animator().alphaValue = 1
+            okStack.animator().alphaValue = 1
+        }
         capturingStack.isHidden = false
         capturingStack.alphaValue = 1
         okStack.isHidden = true
@@ -375,6 +395,11 @@ final class ScrollCaptureHUDPanel: NSPanel {
     }
 
     func show(below selectionGlobal: CGRect, on screen: NSScreen) {
+        isShowingBottomState = false
+        bottomTransitionToken &+= 1
+        capturingStack.isHidden = false
+        capturingStack.alphaValue = 1
+        okStack.isHidden = true
         anchorSelectionGlobal = selectionGlobal
         anchorScreen = screen
         contentView?.layoutSubtreeIfNeeded()

@@ -417,10 +417,8 @@ enum DesignTokens {
         /// 克制的临界阻尼曲线 cubic-bezier(0.22, 1, 0.36, 1) — 工具栏/浮层落位干脆利落，无廉价橡胶回弹
         nonisolated(unsafe) static let springTimingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0)
 
-        /// 系统减少动态效果偏好（开启时去掉位移/缩放，仅保留克制淡入淡出）
-        @MainActor static var reduceMotion: Bool {
-            NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        }
+        /// 强制启用完整动效（针对 Snapcut 忽略系统「减少动态效果」设置，确保灵动岛与弹簧交互满血生效）
+        @MainActor static var reduceMotion: Bool { false }
 
         /// motion.spring：0.22s 临界阻尼入场
         static let springDuration: TimeInterval = 0.22
