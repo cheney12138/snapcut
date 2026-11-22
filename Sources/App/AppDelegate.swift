@@ -4,24 +4,6 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var coordinator: AppCoordinator?
 
-    override init() {
-        super.init()
-        // 坑 33 配套：接管 quit Apple event（osascript quit / 系统「退出」菜单等），
-        // 置热标记后走标准 terminate——applicationShouldTerminate 只放行两类：
-        // 本标记（用户显式退出）+ 菜单退出（SnapcutQuitController 同款标记）。
-        // CC 驱逐 status item 的连坐 terminate 没有 Apple event，被拦。
-        NSAppleEventManager.shared().setEventHandler(
-            self,
-            andSelector: #selector(handleQuitEvent(_:withReply:)),
-            forEventClass: AEEventClass(kCoreEventClass),
-            andEventID: AEEventID(kAEQuitApplication)
-        )
-    }
-
-    @objc private func handleQuitEvent(_ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor) {
-        UserDefaults.standard.set(true, forKey: "app.quit.allowed")
-        NSApp.terminate(nil)
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "?"
@@ -56,7 +38,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(false, forKey: "app.quit.allowed")
             return .terminateNow
         }
-        Log.event(.app, "app.terminate.blocked")
+        // ⑦ 2026-11-22 病例：这里原本靠 NSAppleEventManager 自装 quit 事件 handler
+        //    置标记，实测**不会触发**（AppKit 内置的 quit handler 先接走了），于是
+        //    `osascript ... quit` 报 -128「用户已取消」，更要命的是 **Sparkle 自动更新
+        //    下载完成后要求 App 退出以替换 .app，被这里拦死** —— 表现是更新窗自己
+        //    消失、版本号不动、Autoupdate 常驻不退（用户视角：更新功能坏了）。
+        //    判据改到 terminate 现场：正在处理 quit Apple Event ⇒ 放行。
+        //    ControlCenter 驱逐 status item 的连坐 terminate **没有** Apple Event
+        //    （坑 33 的原判据），仍然被拦。
+        let current = NSAppleEventManager.shared().currentAppleEvent
+        if let current,
+           current.eventClass == AEEventClass(kCoreEventClass),
+           current.eventID == AEEventID(kAEQuitApplication) {
+            Log.event(.app, "app.terminate.allow", ["src": "appleevent"])
+            return .terminateNow
+        }
+        Log.event(.app, "app.terminate.blocked", [
+            "ae": current.map { "\($0.eventClass)/\($0.eventID)" } ?? "none",
+        ])
         return .terminateCancel
     }
 

@@ -54,6 +54,17 @@ codesign --force --deep --sign "$LOCAL_SIGN_ID" --identifier app.snapcut.snapcut
 codesign --verify --deep --strict --verbose=1 "$APP"
 # 公钥必须是 44 字符 base64（43 字符解不出 32 字节，Sparkle 会在启动阶段直接拒绝启动更新器）。
 # wc -c 在 macOS 会补空格，所以要 xargs 收拾干净再比。
+# 构建号必须是「合法的 Sparkle 版本」：CFBundleVersion 若停在默认值 "1"，而 appcast 里
+# sparkle:version 是时间戳，Sparkle 会认为**每个包都比已装的更新** ⇒ 装完再检查又有更新
+# （无限升级循环，且用户只会觉得"这软件一直让我重启"）。这里断言它是时间戳形状。
+BUILD_NUM=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Contents/Info.plist")
+case "$BUILD_NUM" in
+  [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+  *) echo "✗ CFBundleVersion=$BUILD_NUM 不像时间戳构建号（应为 12 位，如 202611221332）" >&2
+     echo "  原因通常是 project.yml 的 Info.plist 没绑 CFBundleVersion: \$(CURRENT_PROJECT_VERSION)" >&2
+     exit 1;;
+esac
+
 KEY_LEN=$(/usr/libexec/PlistBuddy -c "Print :SUPublicEDKey" "$APP/Contents/Info.plist" | tr -d '\n' | wc -c | xargs)
 [ "$KEY_LEN" = "44" ] || { echo "✗ SUPublicEDKey 长度 ${KEY_LEN}（应为 44，Sparkle 启动阶段会直接失败）"; exit 1; }
 

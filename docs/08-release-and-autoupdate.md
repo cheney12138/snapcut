@@ -55,6 +55,13 @@ curl -sIL https://github.com/cheney12138/snapcut/releases/latest/download/appcas
 | `project.yml` → `MARKETING_VERSION` | 手工（release.sh 改） | 人类看的版本，如 `0.2.0` |
 | `project.yml` → `CFBundleShortVersionString` | 同上 | 进 Info.plist 的那个 |
 | `project.yml` → `CURRENT_PROJECT_VERSION` | **release.sh 自动**（`date +%Y%m%d%H%M`） | Sparkle 比大小的**构建号**，必须单调递增；用时间戳杜绝"忘了涨" |
+| `Info.plist` → `CFBundleVersion` | 绑定 `$(CURRENT_PROJECT_VERSION)` | **必须显式绑**，见下方病例 |
+
+⚠️ **`CFBundleVersion` 必须绑 `$(CURRENT_PROJECT_VERSION)`**（2026-11-22 实锤）：
+`project.yml` 的 `info.properties` 里不写这一项，xcodegen 会落默认值 **`1`**，
+而 appcast 的 `sparkle:version` 是时间戳 ⇒ 每个包在 Sparkle 眼里都「比已装的更新」
+⇒ 用户每次检查都被提示升级、装完还提示（无限升级循环）。`make-dmg.sh` 已加断言：
+`CFBundleVersion` 必须是 12 位时间戳，否则拒绝出包。
 
 ⚠️ **不要**用 PlistBuddy 去写某个局部 Info.plist —— `Resources/Info.plist` 是
 `xcodegen` 从 `project.yml` 生成的，手改会被下次 `xcodegen generate` 抹掉。
@@ -98,7 +105,9 @@ curl -sIL https://github.com/cheney12138/snapcut/releases/latest/download/appcas
 |---|---|
 | 点「检查更新」永远"已是最新" | `grep edSignature ~/Desktop/appcast.xml`（缺签名 = 该 item 被忽略） |
 | 手动检查报错 404 | `curl -sIL …/releases/latest/download/appcast.xml`；appcast 是否挂在**最新**那一版 |
-| 更新下载完装不上 | 新旧包签名身份是否一致：`codesign -dv --verbose=2 <app>` 两边比 |
+| 更新下载完装不上（更新窗自己消失、版本不动、Autoupdate 常驻不退） | App 的退出被拦了。Sparkle 要 App 退出才能替换 .app；`applicationShouldTerminate` 里必须放行 **quit Apple Event**（本项目 2026-11-22 就卡在这：自装的 NSAppleEventManager handler 不触发，改成在 terminate 现场看 `currentAppleEvent`） |
+| 每次检查都提示有新版、装完还提示 | `CFBundleVersion` 是不是默认值 `1`：`/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" <app>/Contents/Info.plist` |
+| 新旧包签名不一致 | `codesign -dv --verbose=2 <app>` 两边比身份/团队 |
 | App 启动就弹窗说更新器不可用 | `SUPublicEDKey` 必须 44 字符 base64（43 字符解不出 32 字节） |
 | 后台发现新版本但不弹 | 后台 App 必须实现 gentle reminders（`GentleReminderDelegate`），否则 Sparkle 判定"用户不会注意到" |
 
@@ -113,4 +122,8 @@ curl -sIL https://github.com/cheney12138/snapcut/releases/latest/download/appcas
 2. 收藏 → 点「检查更新…」→ 应出现 Sparkle 的更新窗口，显示新版本与 Release notes
 3. 安装后 App 自动重启，版本号变新 ⇒ 签名校验、下载、替换、重启全通
 
-（2026-11-22 首次接通时就是这样验的；只看到"网络错误/404"= 还没发第一版，不是接线问题。）
+**2026-11-22 实测记录（完整走通）**：把版本降到 `0.1.9` / 构建 `202611010000` → `make dev`
+→ 点「检查更新…」→ Sparkle 弹「Snapcut 0.2.0 is now available—you have 0.1.9」→ 点 Install
+→ 日志 `OK: EdDSA signature is correct for update` → 提取替换 → 自动重启 →
+`build/Snapcut.app` 的版本变成 `0.2.0` / 构建 `202611221335`。整条链路（feed 解析、
+版本比较、签名校验、替换、重启）全通。
