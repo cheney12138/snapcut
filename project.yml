@@ -15,7 +15,7 @@ settings:
     # （ChatGPT 教训见 glance 病例：写局部 Info.plist 的 PlistBuddy 失败被 || true 吞掉，
     #  包永远叫旧版本名。版本只认工程设置这一处。）
     MARKETING_VERSION: "0.2.0"
-    CURRENT_PROJECT_VERSION: "202611221328"
+    CURRENT_PROJECT_VERSION: "202611221332"
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "Apple Development: 18600607249@163.com (7KDMYNHX76)"
     DEVELOPMENT_TEAM: ""
