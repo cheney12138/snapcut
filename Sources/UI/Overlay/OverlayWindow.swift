@@ -8,10 +8,34 @@ final class OverlayWindow: NSWindow {
     // 无边框窗口默认 canBecomeKey=false，必须显式允许才能接收键盘事件
     override var canBecomeKey: Bool { true }
 
-    let owningScreen: NSScreen
+    private(set) var owningScreen: NSScreen
+    /// GPU 冻结帧底层视图（CALayer.contents 直接托管 4K CGImage，消除每帧 mouseMoved 33MB CPU 重绘）
+    private let frozenBackdropView: NSView
+    /// 交互与蒙层/标注前景视图
+    let overlayView: OverlayView
 
     init(screen: NSScreen, controller: OverlayController) {
         self.owningScreen = screen
+        let bounds = NSRect(origin: .zero, size: screen.frame.size)
+        let root = NSView(frame: bounds)
+        root.wantsLayer = true
+
+        let backdrop = NSView(frame: bounds)
+        backdrop.wantsLayer = true
+        backdrop.autoresizingMask = [.width, .height]
+        backdrop.layer?.contentsGravity = .resize
+        backdrop.layer?.magnificationFilter = .linear
+        backdrop.layer?.minificationFilter = .linear
+        backdrop.isHidden = true
+
+        let view = OverlayView(frame: bounds, controller: controller)
+        view.autoresizingMask = [.width, .height]
+
+        root.addSubview(backdrop)
+        root.addSubview(view)
+        self.frozenBackdropView = backdrop
+        self.overlayView = view
+
         super.init(
             contentRect: screen.frame,
             styleMask: [.borderless],
@@ -27,9 +51,20 @@ final class OverlayWindow: NSWindow {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
+        contentView = root
+        initialFirstResponder = view
+    }
 
-        let view = OverlayView(frame: NSRect(origin: .zero, size: screen.frame.size), controller: controller)
-        contentView = view
+    /// 窗口池复用重置（零 33MB backing-store 重建开销）
+    func prepareForReuse(screen: NSScreen) {
+        owningScreen = screen
+        if frame != screen.frame {
+            setFrame(screen.frame, display: false)
+        }
+        frozenBackdropView.layer?.contents = nil
+        frozenBackdropView.isHidden = true
+        overlayView.resetForReuse()
+        makeFirstResponder(overlayView)
     }
 
     /// 窗口层事件总闸 + 起拖兜底（用户病例 2026-11-16 三报「唤起后没立马框选」）
@@ -49,69 +84,69 @@ final class OverlayWindow: NSWindow {
             ])
         default: break
         }
-        // 起拖兜底（down 或 drag 任一到达 + view 空闲）：view 的 mouseDown/
-        // mouseDragged 在非 key 窗时收不到，窗层补齐（起拖只做一次，view
-        // phase 变化后 guard 挡住）
-        if event.type == .leftMouseDown || event.type == .leftMouseDragged {
-            // 冷启动首激活（用户病例 2026-11-17 终报：重启后第一次唤起，
-            // 热键回调的 activate 被系统忽略——LSUIElement 无手势上下文；
-            // 3.1s 未激活。真实点击=手势上下文，系统必接受——按下瞬间激活）。
-            // 二次保险：activate 若仍被异步降级，repeat 请求直到 active
-            // （主线程 runloop 上的重试最终会被系统接受——实测 activate
-            // 连发 2-3 次后生效）
-            if !NSApp.isActive {
-                NSApp.activate(ignoringOtherApps: true)
-                _ = NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-            }
-            if let view = contentView as? OverlayView {
-                view.beginDragIfNeeded(from: view.convert(event.locationInWindow, from: nil))
-            }
+        // 首次点击落在非激活窗口时同步发起激活；配合 OverlayView.acceptsFirstMouse == true，
+        // AppKit 会把首笔完整的 mouseDown → mouseDragged → mouseUp 原封不动送达视图，
+        // 不再提前篡改 phase 导致首次框选卡死需要多次重拖。
+        if event.type == .leftMouseDown, !NSApp.isActive {
+            NSApp.activate()
         }
         super.sendEvent(event)
     }
 
     /// 选区所在屏进入编辑模式（显示冻结底图 + 标注交互）
     func enterEditorMode(session: EditorSession) {
-        (contentView as? OverlayView)?.enterEditorMode(session: session)
+        overlayView.enterEditorMode(session: session)
     }
 
-    /// 滚动截图模式（区域 outline + 光晕脉动）
+    /// 滚动截图模式（隐藏冻结底图露出底层实时滚动画面 + 区域 outline 光晕脉动）
     func enterScrollMode() {
-        (contentView as? OverlayView)?.enterScrollMode()
+        frozenBackdropView.isHidden = true
+        overlayView.enterScrollMode()
     }
 
     /// 退出编辑模式（enterEditor 幂等重入用：回蒙层态）
     func exitEditorIfNeeded() {
-        (contentView as? OverlayView)?.exitEditorIfNeeded()
+        overlayView.exitEditorIfNeeded()
     }
 
     func exitScrollMode() {
-        (contentView as? OverlayView)?.exitScrollMode()
+        frozenBackdropView.isHidden = (frozenBackdropView.layer?.contents == nil)
+        overlayView.exitScrollMode()
     }
 
     /// 滚动采集：区域随内容生长（全局矩形）
     func updateScrollRegion(_ global: CGRect) {
-        (contentView as? OverlayView)?.updateScrollRegion(global: global)
+        overlayView.updateScrollRegion(global: global)
     }
 
     /// 到底：底缘 2pt 绿条 + 光晕定格
     func setScrollBottomReached() {
-        (contentView as? OverlayView)?.setScrollBottomReached()
+        overlayView.setScrollBottomReached()
     }
 
     /// 到底撤销（用户到底后又继续滚）：清绿条恢复采集光晕
     func clearScrollBottomReached() {
-        (contentView as? OverlayView)?.clearScrollBottomReached()
+        overlayView.clearScrollBottomReached()
     }
 
-    /// 安装冻结帧（会话开始时的整屏静态图）
+    /// 安装冻结帧（GPU CALayer 托管，零每帧 CPU 重绘）
     func installFrozenImage(_ image: CGImage) {
-        (contentView as? OverlayView)?.installFrozenImage(image)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        frozenBackdropView.layer?.contents = image
+        frozenBackdropView.isHidden = false
+        CATransaction.commit()
+        overlayView.installFrozenImage(image)
+    }
+
+    /// 窗口刚上屏或重聚焦时，立即同步真实鼠标位置、十字准星与放大镜，不等首次 mouseMoved
+    func syncInitialCursor() {
+        overlayView.syncInitialCursor()
     }
 
     /// 外部入口：整屏截图（⌘⇧S / 托盘菜单）
     func pickFullDisplay() {
-        (contentView as? OverlayView)?.pickFullDisplayExternally()
+        overlayView.pickFullDisplayExternally()
     }
 }
 
@@ -136,6 +171,17 @@ final class OverlayView: NSView {
 
     /// 编辑态：选区在视图本地坐标（Y 向上）
     private var editorRectLocal: CGRect = .zero
+    /// 独立外源图（Toast 重开 / 长图编辑）初始适配矩形，供双击「适配 ↔ 1:1 原生」切换
+    private var standaloneFitRectLocal: CGRect = .zero
+    private var standaloneZoomHudText: String?
+    private var standaloneZoomHudWork: DispatchWorkItem?
+    /// 智能一键脱敏（M1）：悬停可点消的自动脱敏框 + 刚命中时的短暂轻蓝轮廓提示 + 顶部瞬时胶囊反馈
+    private var hoveredAutoRedactRect: CGRect?
+    private var flashedAutoRedactRects: [CGRect] = []
+    private var autoRedactFlashWork: DispatchWorkItem?
+    private var editorToastText: String?
+    private var editorToastWork: DispatchWorkItem?
+    private var isStandaloneImage: Bool { frozenImage == nil }
 
     /// 拖拽中的标注预览（未确认，不入 store）
     private var pendingAnnotation: AnnotationModel?
@@ -170,9 +216,13 @@ final class OverlayView: NSView {
     /// 光标本地坐标（放大镜跟随；Y 向下）
     private var cursorLocal: CGPoint = .zero
 
-    /// 悬停命中的窗口（窗口截图预览 + 单击整窗）
+    /// 悬停命中的窗口（窗口截图预览 + 单击整窗；近似全屏的大窗默认不高亮）
     private var hovered: HoveredWindow?
     private var hoveredLocalRect: CGRect?
+    /// 鼠标移到屏幕边缘（≤14pt）时进入整屏预览，框体平滑变形为整个屏幕
+    private var edgeFullScreenHover = false
+    private var hoverMorphFromRect: CGRect?
+    private var hoverMorphStart: CFTimeInterval = 0
     private var hoverProbePoint: CGPoint = .zero
     private var hoverProbeTime: CFTimeInterval = 0
     /// 单击整窗的延迟任务（220ms 双击宽限：双击=全屏，单击=整窗）
@@ -199,6 +249,49 @@ final class OverlayView: NSView {
     override var acceptsFirstResponder: Bool { true }
     override var canBecomeKeyView: Bool { true }
     override var isFlipped: Bool { true }  // 统一 Y 向下（与标注几何一致）
+    /// 关键：允许非激活窗口的首笔鼠标按下/拖拽直接进入框选流程（杜绝重启后首次 F1 必须拖 2–3 次才选中的根因）
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// 复用重置：彻底清空上一轮选区/编辑/滚动/悬停状态，避免销毁重建 4K OverlayWindow
+    func resetForReuse() {
+        pendingWindowCapture?.cancel()
+        pendingWindowCapture = nil
+        standaloneZoomHudWork?.cancel()
+        standaloneZoomHudWork = nil
+        standaloneZoomHudText = nil
+        hoveredAutoRedactRect = nil
+        flashedAutoRedactRects = []
+        autoRedactFlashWork?.cancel()
+        autoRedactFlashWork = nil
+        editorToastText = nil
+        editorToastWork?.cancel()
+        editorToastWork = nil
+        textField?.removeFromSuperview()
+        textField = nil
+        scrollGlowView?.removeFromSuperview()
+        scrollGlowView = nil
+        scrollMode = false
+        scrollRectLocal = nil
+        phase = .waitingForDrag
+        selectionLocal = .zero
+        editorSession = nil
+        editorRectLocal = .zero
+        standaloneFitRectLocal = .zero
+        pendingAnnotation = nil
+        editGesture = .none
+        draggedEventCount = 0
+        spacePressed = false
+        hoverEdge = nil
+        frozenImage = nil
+        frozenSampler = nil
+        hovered = nil
+        hoveredLocalRect = nil
+        edgeFullScreenHover = false
+        hoverMorphFromRect = nil
+        hoverMorphStart = 0
+        hoverFadeStart = 0
+        needsDisplay = true
+    }
 
     // MARK: - 编辑态切入
 
@@ -214,6 +307,9 @@ final class OverlayView: NSView {
             width: global.width,
             height: global.height
         )
+        if isStandaloneImage {
+            standaloneFitRectLocal = editorRectLocal
+        }
         needsDisplay = true
     }
 
@@ -285,11 +381,43 @@ final class OverlayView: NSView {
         scrollGlowView = glow
     }
 
-    /// 安装冻结帧并重绘（"屏幕定住"效果的唯一来源）
+    /// 安装冻结帧并立即首帧上屏；放大镜像素缓冲放到后台线程异步解码，消除主线程 ~68ms 阻塞
     func installFrozenImage(_ image: CGImage) {
         frozenImage = image
-        // 放大镜/取色用：一次性解像素，之后 O(1) 采样（禁止实时屏捕）
-        frozenSampler = FrozenSampler(image: image)
+        frozenSampler = nil
+        needsDisplay = true
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let sampler = FrozenSampler(image: image)
+            await MainActor.run {
+                guard let self, self.frozenImage === image else { return }
+                self.frozenSampler = sampler
+                if self.phase == .waitingForDrag {
+                    self.needsDisplay = true
+                }
+            }
+        }
+    }
+
+    /// 供会话级 Carbon Esc 路由调用：若当前正在输入文字，先取消文字输入并返回 true
+    func cancelActiveTextEditingIfNeeded() -> Bool {
+        guard textField != nil else { return false }
+        cancelTextEditing()
+        window?.makeFirstResponder(self)
+        return true
+    }
+
+    /// 上屏首帧即按当前全局鼠标位置对齐 cursorLocal、悬停高亮与十字准星，避免首帧放大镜停在 (0,0) 且光标仍是箭头
+    func syncInitialCursor() {
+        guard let win = window, phase == .waitingForDrag else { return }
+        let mouse = NSEvent.mouseLocation
+        let local = CGPoint(
+            x: min(max(mouse.x - win.frame.minX, 0), bounds.width),
+            y: min(max(win.frame.maxY - mouse.y, 0), bounds.height)
+        )
+        cursorLocal = local
+        updateHover(at: local)
+        win.invalidateCursorRects(for: self)
+        NSCursor.crosshair.set()
         needsDisplay = true
     }
 
@@ -319,9 +447,57 @@ final class OverlayView: NSView {
             needsDisplay = true      // 放大镜跟随
         case .editing:
             updateHoverEdge(at: local)
+            updateHoverAutoRedact(at: local)
         default:
             break
         }
+    }
+
+    /// 马赛克工具下悬停在自动脱敏块上时，高亮轻虚线轮廓并切换手型光标，直觉提示「单击可取消该处脱敏」
+    private func updateHoverAutoRedact(at local: CGPoint) {
+        let nextRect: CGRect?
+        if let session = editorSession,
+           session.currentTool == .mosaic,
+           hoverEdge == nil,
+           editorRectLocal.contains(local) {
+            nextRect = session.store.autoRedactedRect(at: localToAnnotation(local))
+        } else {
+            nextRect = nil
+        }
+        guard nextRect != hoveredAutoRedactRect else { return }
+        hoveredAutoRedactRect = nextRect
+        if nextRect != nil {
+            NSCursor.pointingHand.set()
+        } else if hoverEdge == nil {
+            NSCursor.crosshair.set()
+        }
+        needsDisplay = true
+    }
+
+    /// 一键脱敏命中后短暂闪一下轻蓝轮廓（~0.55s，不入导出图）
+    func flashAutoRedactRects(_ rects: [CGRect]) {
+        autoRedactFlashWork?.cancel()
+        flashedAutoRedactRects = rects
+        needsDisplay = true
+        let work = DispatchWorkItem { [weak self] in
+            self?.flashedAutoRedactRects = []
+            self?.needsDisplay = true
+        }
+        autoRedactFlashWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+    }
+
+    /// 编辑器画布顶部轻提示胶囊（1.6s 后自动收起，仅屏幕可见，绝不入导出图）
+    func showEditorToast(_ text: String) {
+        editorToastWork?.cancel()
+        editorToastText = text
+        needsDisplay = true
+        let work = DispatchWorkItem { [weak self] in
+            self?.editorToastText = nil
+            self?.needsDisplay = true
+        }
+        editorToastWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6, execute: work)
     }
 
     /// 编辑态：光标是否压在手柄上（决定光标形状 + 手柄高亮）
@@ -340,10 +516,128 @@ final class OverlayView: NSView {
             case .topLeft, .bottomRight: NSCursor.crosshair.set()
             case .topRight, .bottomLeft: NSCursor.crosshair.set()
             }
+        } else if isStandaloneImage, editorSession?.currentTool == EditorSession.Tool.none, editorRectLocal.contains(local) {
+            NSCursor.openHand.set()
         } else {
             NSCursor.crosshair.set()
         }
         needsDisplay = true
+    }
+
+    // MARK: - 独立外源图滚轮/捏合缩放与平移
+
+    override func scrollWheel(with event: NSEvent) {
+        guard phase == .editing, !scrollMode, isStandaloneImage else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let anchor = convert(event.locationInWindow, from: nil)
+        if event.modifierFlags.contains(.shift) {
+            let dx = event.hasPreciseScrollingDeltas ? event.scrollingDeltaX : event.scrollingDeltaX * 14
+            let dy = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 14
+            panStandalone(dx: dx, dy: dy)
+            return
+        }
+        guard event.momentumPhase.isEmpty else { return }
+        let deltaY = event.scrollingDeltaY
+        guard deltaY != 0 else { return }
+        let factor: CGFloat
+        if event.hasPreciseScrollingDeltas {
+            let clamped = min(max(deltaY, -40), 40)
+            factor = pow(1.008, clamped)
+        } else {
+            let clamped = min(max(deltaY, -5), 5)
+            factor = pow(1.12, clamped)
+        }
+        applyStandaloneZoom(factor: factor, anchor: anchor)
+    }
+
+    override func magnify(with event: NSEvent) {
+        guard phase == .editing, !scrollMode, isStandaloneImage else {
+            super.magnify(with: event)
+            return
+        }
+        let factor = max(0.2, 1 + event.magnification)
+        applyStandaloneZoom(factor: factor, anchor: convert(event.locationInWindow, from: nil))
+    }
+
+    private func standaloneWidthBounds(for session: EditorSession) -> (minW: CGFloat, maxW: CGFloat, nativeW: CGFloat, aspect: CGFloat) {
+        let backing = max(1, window?.backingScaleFactor ?? 2)
+        let imgW = max(1, CGFloat(session.baseImage.width))
+        let imgH = max(1, CGFloat(session.baseImage.height))
+        let aspect = imgW / imgH
+        let nativeW = imgW / backing
+        let maxSafeDimPt = min(7200.0, 14400.0 / backing)
+        let maxWByHeight = maxSafeDimPt * aspect
+        let maxW = max(nativeW, min(max(nativeW * 2.5, bounds.width * 2.0), min(maxSafeDimPt, maxWByHeight)))
+        let minW = min(max(80.0, nativeW * 0.1), maxW)
+        return (minW, maxW, nativeW, aspect)
+    }
+
+    private func applyStandaloneZoom(factor: CGFloat, anchor: CGPoint) {
+        guard let session = editorSession, factor > 0 else { return }
+        let (minW, maxW, nativeW, aspect) = standaloneWidthBounds(for: session)
+        let oldRect = editorRectLocal
+        guard oldRect.width > 0, oldRect.height > 0 else { return }
+        let newW = min(max(oldRect.width * factor, minW), maxW)
+        guard abs(newW - oldRect.width) > 0.25 else { return }
+        let newH = newW / aspect
+        let u = (anchor.x - oldRect.minX) / oldRect.width
+        let v = (anchor.y - oldRect.minY) / oldRect.height
+        let newRect = CGRect(
+            x: anchor.x - u * newW,
+            y: anchor.y - v * newH,
+            width: newW,
+            height: newH
+        )
+        editorRectLocal = SelectionGeometry.movedPartiallyVisible(newRect, by: .zero, in: bounds)
+        controller.zoomStandaloneSelection(to: convertToGlobalRect(editorRectLocal))
+        let pct = Int(round((editorRectLocal.width / max(1, nativeW)) * 100))
+        showStandaloneZoomHUD("\(pct)%")
+        needsDisplay = true
+    }
+
+    private func panStandalone(dx: CGFloat, dy: CGFloat) {
+        guard editorSession != nil else { return }
+        let next = SelectionGeometry.movedPartiallyVisible(editorRectLocal, by: CGSize(width: dx, height: dy), in: bounds)
+        guard next != editorRectLocal else { return }
+        editorRectLocal = next
+        controller.zoomStandaloneSelection(to: convertToGlobalRect(editorRectLocal))
+        needsDisplay = true
+    }
+
+    private func toggleStandaloneDoubleClickZoom(at point: CGPoint) {
+        guard let session = editorSession else { return }
+        let (_, maxW, nativeW, aspect) = standaloneWidthBounds(for: session)
+        let fitRect = standaloneFitRectLocal.width > 10 ? standaloneFitRectLocal : editorRectLocal
+        let isNearFit = abs(editorRectLocal.width - fitRect.width) < 6
+        if isNearFit && nativeW > fitRect.width * 1.15 {
+            let targetW = min(nativeW, maxW)
+            let targetH = targetW / aspect
+            let u = (point.x - editorRectLocal.minX) / max(1, editorRectLocal.width)
+            let v = (point.y - editorRectLocal.minY) / max(1, editorRectLocal.height)
+            let zoomed = CGRect(x: point.x - u * targetW, y: point.y - v * targetH, width: targetW, height: targetH)
+            editorRectLocal = SelectionGeometry.movedPartiallyVisible(zoomed, by: .zero, in: bounds)
+            controller.zoomStandaloneSelection(to: convertToGlobalRect(editorRectLocal))
+            showStandaloneZoomHUD("1:1")
+        } else {
+            editorRectLocal = fitRect
+            controller.zoomStandaloneSelection(to: convertToGlobalRect(editorRectLocal))
+            let pct = Int(round((fitRect.width / max(1, nativeW)) * 100))
+            showStandaloneZoomHUD("\(pct)%")
+        }
+        needsDisplay = true
+    }
+
+    private func showStandaloneZoomHUD(_ text: String) {
+        standaloneZoomHudText = text
+        standaloneZoomHudWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.standaloneZoomHudText = nil
+            self?.needsDisplay = true
+        }
+        standaloneZoomHudWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -352,33 +646,93 @@ final class OverlayView: NSView {
         clearHover()
     }
 
-    /// 鼠标位置的窗口探测（50ms 节流：窗口枚举有成本）
+    /// 鼠标位置的选区探测：
+    /// - 鼠标靠近屏幕四边（≤14pt）：框体平滑变形为整屏预览（点击/Enter 框选整屏）；
+    /// - 鼠标在屏幕内部：默认不自动框选全屏（近似满屏的最大化窗口不高亮），只高亮非满屏的独立小窗，随时可直接拖选任意区域。
     private func updateHover(at local: CGPoint) {
+        let edgeMargin: CGFloat = 14
+        let nearEdge = local.x <= edgeMargin
+            || local.x >= bounds.width - edgeMargin
+            || local.y <= edgeMargin
+            || local.y >= bounds.height - edgeMargin
+
+        if nearEdge {
+            if !edgeFullScreenHover {
+                let startRect = currentHoverVisualRect()
+                    ?? CGRect(x: local.x - 40, y: local.y - 30, width: 80, height: 60)
+                hoverMorphFromRect = startRect
+                hoverMorphStart = CACurrentMediaTime()
+                hoverFadeStart = hoverMorphStart
+                edgeFullScreenHover = true
+                hovered = nil
+                hoveredLocalRect = bounds
+                needsDisplay = true
+            }
+            return
+        }
+
+        let leavingEdge = edgeFullScreenHover
+        if leavingEdge {
+            edgeFullScreenHover = false
+        }
+
         let now = CACurrentMediaTime()
         let moved = abs(local.x - hoverProbePoint.x) > 1.5 || abs(local.y - hoverProbePoint.y) > 1.5
-        guard moved || now - hoverProbeTime > 0.08 else { return }
+        guard leavingEdge || moved || now - hoverProbeTime > 0.08 else { return }
         hoverProbePoint = local
         hoverProbeTime = now
         guard let frame = window?.frame else { return }
         let global = CGPoint(x: frame.minX + local.x, y: frame.maxY - local.y)
-        let found = WindowLocator.window(atGlobalPoint: global, excludingPID: getpid())
-        guard found != hovered else { return }
+        let rawFound = WindowLocator.window(atGlobalPoint: global, excludingPID: getpid())
+        // 近似占满整屏的最大化窗口默认不自动框选（避免唤起截图即全屏框住），
+        // 仅在鼠标移动到屏幕边缘时变形框选整屏
+        let found: HoveredWindow? = rawFound.flatMap { win in
+            let nearlyFull = win.rectGlobal.width >= bounds.width * 0.88
+                && win.rectGlobal.height >= bounds.height * 0.86
+            return nearlyFull ? nil : win
+        }
+        guard leavingEdge || found != hovered else { return }
+        let prevRect = currentHoverVisualRect()
         hovered = found
-        if found != nil { hoverFadeStart = CACurrentMediaTime() }
-        hoveredLocalRect = found.map {
-            CGRect(
-                x: $0.rectGlobal.minX - frame.minX,
-                y: frame.maxY - $0.rectGlobal.maxY,
-                width: $0.rectGlobal.width,
-                height: $0.rectGlobal.height
+        if let f = found {
+            let nextRect = CGRect(
+                x: f.rectGlobal.minX - frame.minX,
+                y: frame.maxY - f.rectGlobal.maxY,
+                width: f.rectGlobal.width,
+                height: f.rectGlobal.height
             )
+            hoverMorphFromRect = prevRect
+            hoverMorphStart = CACurrentMediaTime()
+            hoverFadeStart = hoverMorphStart
+            hoveredLocalRect = nextRect
+        } else {
+            hoverMorphFromRect = nil
+            hoveredLocalRect = nil
+            hoverFadeStart = 0
         }
         needsDisplay = true
     }
 
+    private func currentHoverVisualRect() -> CGRect? {
+        guard let target = hoveredLocalRect else { return nil }
+        guard let from = hoverMorphFromRect, hoverMorphStart > 0 else { return target }
+        let tRaw = min(1, max(0, (CACurrentMediaTime() - hoverMorphStart) / 0.16))
+        // ease-out cubic
+        let t = CGFloat(1 - pow(1 - tRaw, 3))
+        return CGRect(
+            x: from.minX + (target.minX - from.minX) * t,
+            y: from.minY + (target.minY - from.minY) * t,
+            width: from.width + (target.width - from.width) * t,
+            height: from.height + (target.height - from.height) * t
+        )
+    }
+
     private func clearHover() {
+        edgeFullScreenHover = false
         hovered = nil
         hoveredLocalRect = nil
+        hoverMorphFromRect = nil
+        hoverMorphStart = 0
         hoverFadeStart = 0
         needsDisplay = true
     }
@@ -495,9 +849,10 @@ final class OverlayView: NSView {
                 phase = .waitingForDrag
                 selectionLocal = .zero
                 needsDisplay = true
-                // 单击（未拖动）：命中窗口 → 220ms 宽限后整窗截图
-                // （宽限是为了让双击能被识别为全屏，见 mouseDown clickCount>=2）
-                if let target = hovered {
+                // 单击（未拖动）：在屏幕边缘全屏预览态 → 直接整屏；命中独立小窗 → 220ms 宽限后整窗截图
+                if edgeFullScreenHover {
+                    pickFullDisplay()
+                } else if let target = hovered {
                     scheduleWindowCapture(target)
                 }
                 return
@@ -604,6 +959,10 @@ final class OverlayView: NSView {
 
         switch session.currentTool {
         case .none:
+            if isStandaloneImage && event.clickCount >= 2 {
+                toggleStandaloneDoubleClickZoom(at: point)
+                return
+            }
             // 无工具默认态（用户裁定）：拖动 = 整体移动选区（不用按空格）
             editGesture = .move(startRect: editorRectLocal, startPoint: point)
         case .text:
@@ -656,14 +1015,28 @@ final class OverlayView: NSView {
     private func handleEditorDragged(_ point: CGPoint) {
         switch editGesture {
         case .resize(let edge, let startRect):
-            editorRectLocal = SelectionGeometry.resized(
-                startRect, edge: edge, to: point, limit: bounds
-            )
+            if isStandaloneImage, let session = editorSession {
+                let (minW, maxW, nativeW, aspect) = standaloneWidthBounds(for: session)
+                editorRectLocal = SelectionGeometry.resizedAspectLocked(
+                    startRect, edge: edge, to: point, aspect: aspect,
+                    minWidth: minW, maxWidth: maxW
+                )
+                let pct = Int(round((editorRectLocal.width / max(1, nativeW)) * 100))
+                showStandaloneZoomHUD("\(pct)%")
+            } else {
+                editorRectLocal = SelectionGeometry.resized(
+                    startRect, edge: edge, to: point, limit: bounds
+                )
+            }
             needsDisplay = true
             return
         case .move(let startRect, let startPoint):
             let delta = CGSize(width: point.x - startPoint.x, height: point.y - startPoint.y)
-            editorRectLocal = SelectionGeometry.moved(startRect, by: delta, limit: bounds)
+            if isStandaloneImage {
+                editorRectLocal = SelectionGeometry.movedPartiallyVisible(startRect, by: delta, in: bounds)
+            } else {
+                editorRectLocal = SelectionGeometry.moved(startRect, by: delta, limit: bounds)
+            }
             needsDisplay = true
             return
         case .none:
@@ -766,7 +1139,9 @@ final class OverlayView: NSView {
 
     /// 键盘微调选区（编辑态方向键）
     private func nudgeSelection(dx: CGFloat, dy: CGFloat) {
-        let newLocal = SelectionGeometry.nudged(editorRectLocal, dx: dx, dy: dy, limit: bounds)
+        let newLocal = isStandaloneImage
+            ? SelectionGeometry.movedPartiallyVisible(editorRectLocal, by: CGSize(width: dx, height: dy), in: bounds)
+            : SelectionGeometry.nudged(editorRectLocal, dx: dx, dy: dy, limit: bounds)
         guard newLocal != editorRectLocal else { return }
         editorRectLocal = newLocal
         needsDisplay = true
@@ -824,7 +1199,19 @@ final class OverlayView: NSView {
             final.shape = .rect(rect)
         case .mosaic:
             let rect = rectFromPoints(pendingStartPoint ?? a, a)
-            if rect.width < 3 || rect.height < 3 { pendingAnnotation = nil; needsDisplay = true; return false }
+            if rect.width < 3 || rect.height < 3 {
+                pendingAnnotation = nil
+                pendingStartPoint = nil
+                // 单击已有「自动脱敏」块：精准取消该处打码（压撤销栈，⌘Z 可恢复）
+                if session.store.removeAutoRedacted(at: a) {
+                    hoveredAutoRedactRect = nil
+                    controller.refreshToolbar()
+                    showEditorToast("已取消该处脱敏")
+                    Log.event(.editor, "redact.removeSingle", [:])
+                }
+                needsDisplay = true
+                return false
+            }
             final.shape = .mosaic(rect)
         case .ellipse(let center, let rx, let ry):
             if abs(rx) < 2 || abs(ry) < 2 { pendingAnnotation = nil; needsDisplay = true; return false }
@@ -900,26 +1287,28 @@ final class OverlayView: NSView {
     private var fontSizePicker: FontSizeBarView?
 
     private func beginTextEditing(at annotationPoint: CGPoint) {
-        // 已有输入框先落库
         commitTextFieldIfNeeded()
 
-        let pointSize = CGFloat(editorSession?.textFontSize
-            ?? OverlayView.textFontSizes[1])
+        let pointSize = CGFloat(editorSession?.textFontSize ?? OverlayView.textFontSizes[1])
         let localPoint = annotationToLocal(annotationPoint)
-        // §10-9 落地：无底透明框 + 0.5pt 当前标注色 α.60 描边（描边色 =「这段字会用
-        // 什么颜色」的语义）；placeholder 删除（空框 + caret 即最强「请输入」）
+        let font = NSFont.systemFont(ofSize: pointSize, weight: .semibold)
+        let fieldHeight = Self.preferredTextFieldHeight(for: font)
+        let initialWidth = Self.preferredTextFieldWidth(text: "", font: font, maxWidth: max(96, editorRectLocal.maxX - localPoint.x - 4))
+        // 使输入框内文字基线与点击处自然对齐，减少提交瞬间的位移跳动
+        let originX = min(max(localPoint.x - GlassTextField.padX, editorRectLocal.minX + 2), max(editorRectLocal.minX + 2, editorRectLocal.maxX - initialWidth - 2))
+        let originY = min(max(localPoint.y - fieldHeight / 2, editorRectLocal.minY + 2), max(editorRectLocal.minY + 2, editorRectLocal.maxY - fieldHeight - 2))
+
         let field = GlassTextField(frame: NSRect(
-            x: localPoint.x, y: localPoint.y - 16,
-            width: max(160, editorRectLocal.width - localPoint.x),
-            height: 32
+            x: originX.rounded(),
+            y: originY.rounded(),
+            width: initialWidth,
+            height: fieldHeight
         ))
-        field.font = .systemFont(ofSize: pointSize, weight: .medium)
-        field.textColor = .white
-        if let colorIndex = editorSession?.colorIndex, AnnotationModel.palette.indices.contains(colorIndex) {
-            let paletteColor = NSColor(cgColor: AnnotationModel.palette[colorIndex].cgColor) ?? .red
-            field.textColor = paletteColor
-            field.annotationColor = paletteColor
-        }
+        field.font = font
+        let paletteColor = currentAnnotationColor()
+        field.textColor = paletteColor
+        field.annotationColor = paletteColor
+        field.refreshPlaceholder()
         field.target = self
         field.action = #selector(textFieldCommit(_:))
         field.delegate = self
@@ -928,63 +1317,135 @@ final class OverlayView: NSView {
         window?.makeFirstResponder(field)
         textField = field
         installFontSizePicker(near: field.frame)
-        // 记录落点（确认时生成标注）
         textFieldAnchor = annotationPoint
     }
 
-    /// 文字件入场（motion.enter 缩小版）：fade + rise 8pt，0.22s spring
+    /// 供工具栏点选颜色时实时同步正在输入中的文字颜色与虚线框
+    func syncActiveTextColor() {
+        guard let field = textField as? GlassTextField else { return }
+        let color = currentAnnotationColor()
+        field.textColor = color
+        field.annotationColor = color
+        field.refreshPlaceholder()
+        if let editor = window?.fieldEditor(false, for: field) as? NSTextView {
+            editor.insertionPointColor = color
+        }
+    }
+
+    private func currentAnnotationColor() -> NSColor {
+        if let colorIndex = editorSession?.colorIndex, AnnotationModel.palette.indices.contains(colorIndex) {
+            return NSColor(cgColor: AnnotationModel.palette[colorIndex].cgColor) ?? .systemRed
+        }
+        return .systemRed
+    }
+
+    private static func preferredTextFieldHeight(for font: NSFont) -> CGFloat {
+        ceil(font.ascender - font.descender) + GlassTextField.padY * 2 + 4
+    }
+
+    private static func preferredTextFieldWidth(text: String, font: NSFont, maxWidth: CGFloat) -> CGFloat {
+        let sample = text.isEmpty ? "输入文字…" : text
+        let measured = (sample as NSString).size(withAttributes: [.font: font]).width
+        let desired = ceil(measured) + GlassTextField.padX * 2 + 18
+        return min(max(desired, 92), max(92, maxWidth))
+    }
+
+    /// 随输入内容或字号切换平滑自适应文本框宽高，紧贴文字不占满屏空白
+    private func resizeActiveTextField() {
+        guard let field = textField as? GlassTextField, let font = field.font else { return }
+        let liveText = (window?.fieldEditor(false, for: field) as? NSTextView)?.string ?? field.stringValue
+        let maxW = max(96, editorRectLocal.maxX - field.frame.minX - 4)
+        let newW = Self.preferredTextFieldWidth(text: liveText, font: font, maxWidth: maxW)
+        let newH = Self.preferredTextFieldHeight(for: font)
+        var next = field.frame
+        let midY = next.midY
+        next.size.width = newW
+        next.size.height = newH
+        next.origin.y = min(max((midY - newH / 2).rounded(), editorRectLocal.minY + 2), max(editorRectLocal.minY + 2, editorRectLocal.maxY - newH - 2))
+        if abs(next.width - field.frame.width) >= 1 || abs(next.height - field.frame.height) >= 1 {
+            field.frame = next
+            repositionFontSizePicker(near: next)
+        }
+    }
+
+    /// 文字件入场（motion.enter 缩小版）：fade + 轻浮 5pt，0.18s easeOutStrong
     private func playTextFieldEntrance(_ view: NSView) {
         let finalFrame = view.frame
-        view.frame = finalFrame.offsetBy(dx: 0, dy: 8)   // 翻转坐标 y+8 = 视觉在下方，起 步后上浮
+        let reduce = DesignTokens.Motion.reduceMotion
+        if !reduce {
+            view.frame = finalFrame.offsetBy(dx: 0, dy: 5)
+        }
         view.alphaValue = 0
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
-            view.animator().setFrameOrigin(finalFrame.origin)
+            ctx.duration = 0.18
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            if !reduce { view.animator().setFrameOrigin(finalFrame.origin) }
             view.animator().alphaValue = 1
         }
     }
 
-    /// 文字件退场：fade 0.12s（原瞬删）——completionHandler 持有视图至移除
+    /// 文字件退场：fade 0.12s strong ease-out（杜绝 ease-in）
     private func fadeOutTextField(_ view: NSView) {
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.12
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
             view.animator().alphaValue = 0
         }, completionHandler: { view.removeFromSuperview() })
     }
 
-    /// Esc 取消文字输入：框与字号条 fade 退场，不落标注
+    /// Esc 取消文字输入：先彻底结束 fieldEditor 编辑态，再让框与字号条 fade 退场
     private func cancelTextEditing() {
-        if let field = textField { fadeOutTextField(field) }
+        guard let field = textField else {
+            removeFontSizePicker()
+            return
+        }
         textField = nil
         textFieldAnchor = nil
+        field.delegate = nil
+        field.target = nil
+        window?.endEditing(for: field)
+        fadeOutTextField(field)
         removeFontSizePicker()
+        reclaimEditorFirstResponderAfterText()
     }
 
-    /// 浮动 4 档字号选择条（Aa12/Aa14/Aa17/Aa21）：贴在输入框上方 8pt（不遮挡输入框），
-    /// 放不下（贴近画布顶部/屏幕顶）则改到输入框下方，并夹在可视范围内
+    /// 浮动 4 档字号选择条（12 / 14 / 17 / 21）：贴在输入框上方 8pt，放不下翻下方
     private func installFontSizePicker(near fieldFrame: NSRect) {
         let sizes = OverlayView.textFontSizes
         let selectedIndex = sizes.firstIndex(of: editorSession?.textFontSize ?? 14) ?? 1
         let bar = FontSizeBarView(sizes: sizes, selectedIndex: selectedIndex)
         bar.onSelect = { [weak self] index in
-            guard sizes.indices.contains(index) else { return }
+            guard let self, sizes.indices.contains(index) else { return }
             let size = sizes[index]
-            self?.editorSession?.textFontSize = size
-            // 实时套用到正在编辑的输入框（所见 = 所选）
-            self?.textField?.font = .systemFont(ofSize: CGFloat(size), weight: .medium)
+            self.editorSession?.textFontSize = size
+            let newFont = NSFont.systemFont(ofSize: CGFloat(size), weight: .semibold)
+            self.textField?.font = newFont
+            (self.textField as? GlassTextField)?.refreshPlaceholder()
+            self.resizeActiveTextField()
+            if let tf = self.textField {
+                self.window?.makeFirstResponder(tf)
+            }
             Log.event(.editor, "editor.text.fontSize", ["size": "\(size)"])
         }
         let size = FontSizeBarView.preferredSize(buttonCount: sizes.count)
-        let aboveY = fieldFrame.minY - 8 - size.height
-        var origin = CGPoint(x: fieldFrame.minX, y: aboveY >= editorRectLocal.minY ? aboveY : fieldFrame.maxY + 8)
-        origin.x = min(max(origin.x, 4), bounds.width - size.width - 4)
-        origin.y = min(max(origin.y, 4), bounds.height - size.height - 4)
-        bar.frame = CGRect(origin: origin, size: size)
+        bar.frame = CGRect(origin: fontSizePickerOrigin(size: size, near: fieldFrame), size: size)
         addSubview(bar)
-        playTextFieldEntrance(bar)   // 字号件与输入框同源入场（fade + rise 8pt）
+        playTextFieldEntrance(bar)
         fontSizePicker = bar
+    }
+
+    private func repositionFontSizePicker(near fieldFrame: NSRect) {
+        guard let picker = fontSizePicker else { return }
+        let origin = fontSizePickerOrigin(size: picker.frame.size, near: fieldFrame)
+        picker.setFrameOrigin(origin)
+    }
+
+    private func fontSizePickerOrigin(size: CGSize, near fieldFrame: NSRect) -> CGPoint {
+        let aboveY = fieldFrame.minY - 8 - size.height
+        var origin = CGPoint(x: fieldFrame.minX, y: aboveY >= editorRectLocal.minY + 4 ? aboveY : fieldFrame.maxY + 8)
+        origin.x = min(max(origin.x, 6), bounds.width - size.width - 6)
+        origin.y = min(max(origin.y, 6), bounds.height - size.height - 6)
+        return CGPoint(x: origin.x.rounded(), y: origin.y.rounded())
     }
 
     private var textFieldAnchor: CGPoint?
@@ -994,13 +1455,32 @@ final class OverlayView: NSView {
     }
 
     private func commitTextFieldIfNeeded() {
-        guard let field = textField, let anchor = textFieldAnchor, let session = editorSession else { return }
-        let text = field.stringValue
+        guard let field = textField, let session = editorSession else { return }
+        // 在 doCommandBy(insertNewline:) 回调时机，field.stringValue 尚未从 fieldEditor 同步，
+        // 必须优先读取正在编辑中的 NSTextView.string
+        let text = (window?.fieldEditor(false, for: field) as? NSTextView)?.string ?? field.stringValue
+        let font = field.font ?? NSFont.systemFont(ofSize: CGFloat(session.textFontSize), weight: .semibold)
+        // 按输入框内文字的真实排版基线反推标注落点，提交瞬间文字零跳动
+        let textVisualHeight = font.ascender - font.descender
+        let topInset = (field.frame.height - textVisualHeight) / 2
+        let committedLocal = CGPoint(
+            x: field.frame.minX + GlassTextField.padX + 2,
+            y: field.frame.minY + topInset + font.ascender
+        )
+        let committedAnchor = localToAnnotation(committedLocal)
+
+        // 先清空引用并脱离 fieldEditor，防止 endEditing 触发重入，也不让退场动画中的旧输入框残留焦点
+        textField = nil
+        textFieldAnchor = nil
+        field.delegate = nil
+        field.target = nil
+        window?.endEditing(for: field)
+
         fadeOutTextField(field)
         removeFontSizePicker()
         if !text.isEmpty {
             controller.addAnnotation(AnnotationModel(
-                shape: .text(anchor: anchor),
+                shape: .text(anchor: committedAnchor),
                 colorIndex: session.colorIndex,
                 strokeWidth: session.strokeWidth,
                 text: text,
@@ -1008,9 +1488,16 @@ final class OverlayView: NSView {
                 fontSize: CGFloat(session.textFontSize)
             ))
         }
-        textField = nil
-        textFieldAnchor = nil
+        reclaimEditorFirstResponderAfterText()
+    }
+
+    /// 结束文字输入后把键盘焦点稳妥交回 OverlayView（含当前 doCommandBy 回退后的下一个 runloop tick 兜底）
+    private func reclaimEditorFirstResponderAfterText() {
         window?.makeFirstResponder(self)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.textField == nil, self.phase == .editing else { return }
+            self.window?.makeFirstResponder(self)
+        }
     }
 
     /// Esc/提交后一并拆掉浮动字号条（fade 0.12s）
@@ -1029,6 +1516,29 @@ final class OverlayView: NSView {
     }
 
     // MARK: - 键盘
+
+    /// 优先拦截 ⌘ 组合快捷键（如 ⌘Z 撤销 / ⌘⇧Z 重做 / ⌘S 保存 / ⌘⌥S 快存）：
+    /// 使用文字工具触发过 NSTextField 后，macOS 的系统菜单 Edit → Undo 与窗口残留 UndoManager
+    /// 会在 keyDown 之前于 performKeyEquivalent 阶段吞掉 ⌘Z；在这里先一步接管，彻底解决回车后 ⌘Z 失效。
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if controller.isScrollComposing { return true }
+        // 正在打字时把 ⌘A/⌘C/⌘V/⌘Z 留给文字输入框自己处理
+        if textField != nil { return super.performKeyEquivalent(with: event) }
+        guard event.modifierFlags.contains(.command) else {
+            return super.performKeyEquivalent(with: event)
+        }
+        if Int(event.keyCode) == kVK_ANSI_S,
+           event.modifierFlags.contains(.option),
+           phase == .editing || phase == .confirmed {
+            controller.perform(action: .quickSave)
+            return true
+        }
+        if phase == .editing, let action = matchEditorHotkey(event) {
+            performEditorHotkeyAction(action)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     override func keyDown(with event: NSEvent) {
         Log.logger(.overlay).debug("evt=overlay.keyDown key=\(event.keyCode, privacy: .public) phase=\(self.phaseLabel, privacy: .public)")
@@ -1099,12 +1609,9 @@ final class OverlayView: NSView {
                 controller.perform(action: .copy)
             } else if phase == .confirmed {
                 controller.perform(action: .copy)
+            } else if phase == .waitingForDrag, edgeFullScreenHover {
+                pickFullDisplay()
             } else if phase == .waitingForDrag, let target = hovered {
-                // 病例（用户 2026-11-17「默认选中的窗口回车要按两次」）：
-                // hover 高亮窗时回车——waitingForDrag 分支无处理=第一次回车
-                // 被吞，用户被迫回车两次（第二次时若已点击进 confirmed 才生效）。
-                // 修：回车=确认 hover 窗（与单击 hover 窗同路径，含 220ms
-                // 双击宽限——回车单发不触发双击，宽限后照常整窗确认）
                 scheduleWindowCapture(target)
             }
         case kVK_ANSI_S:
@@ -1117,7 +1624,22 @@ final class OverlayView: NSView {
                 super.keyDown(with: event)
             }
         default:
-            // 热键 1-6 直选工具（R6）；再按同键取消回 .none（用户裁定
+            // ⇧M：编辑器内一键智能脱敏（无需先点马赛克工具也可随手触发）
+            if phase == .editing, textField == nil,
+               Int(event.keyCode) == kVK_ANSI_M,
+               event.modifierFlags.contains(.shift),
+               !event.modifierFlags.contains(.command) {
+                controller.toolbarAction(.autoRedact)
+                return
+            }
+            // B：编辑器内切换克制画框美化（Smart Backdrop）
+            if phase == .editing, !scrollMode, textField == nil,
+               Int(event.keyCode) == kVK_ANSI_B,
+               event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
+                controller.toolbarAction(.toggleBackdrop)
+                return
+            }
+            // 热键 1-7 直选工具（R6）；再按同键取消回 .none（用户裁定
             // 2026-11-16：默认无工具拖动=移动选区，数字键即取即还）
             if phase == .editing,
                let tool = toolFor(keyCode: Int(event.keyCode)) {
@@ -1243,42 +1765,54 @@ final class OverlayView: NSView {
         ctx.restoreGState()
     }
 
-    /// 选区阶段：冻结帧 + 蒙层 + 橡皮筋 + 角标 + 窗口悬停高亮
+    /// 选区阶段：蒙层 + 橡皮筋 + 角标 + 窗口悬停高亮（冻结帧已由底层 GPU CALayer 托管，零每帧 CPU 重绘）
     private func drawSelection(ctx: CGContext) {
-        // 0. 冻结帧铺满（与编辑器同样的翻转处理：Y-down 上下文需镜像一次）
-        if let frozen = frozenImage {
-            ctx.saveGState()
-            ctx.translateBy(x: 0, y: bounds.height)
-            ctx.scaleBy(x: 1, y: -1)
-            ctx.interpolationQuality = .none
-            ctx.draw(frozen, in: CGRect(origin: .zero, size: bounds.size))
-            ctx.restoreGState()
-        }
         // 1. 蒙层
         ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
         ctx.fill(bounds)
 
-        // 1.5 窗口悬停高亮：挖出该窗口区域（提亮）+ 系统蓝描边 + 应用名角标
-        // 审查：悬停是未确认态，层级低于主选区 —— accent α.85 · 1.5pt（原 2pt α.95）
-        // + 0.12s alpha 淡入（draw 路径用时间插值，未满 1 时保持重绘）
+        // 1.5 窗口 / 边缘全屏悬停高亮：平滑变形挖空 + 系统蓝描边 + 角标
         let selectionEmpty = selectionLocal.width <= 0 && selectionLocal.height <= 0
-        if selectionEmpty, let rect = hoveredLocalRect, let target = hovered {
-            let elapsed = hoverFadeStart > 0 ? CACurrentMediaTime() - hoverFadeStart : 1
-            let hoverAlpha = min(1, CGFloat(elapsed / 0.12))
-            if hoverAlpha < 1 {
+        if selectionEmpty, let targetRect = hoveredLocalRect, (edgeFullScreenHover || hovered != nil) {
+            let now = CACurrentMediaTime()
+            let elapsed = hoverFadeStart > 0 ? now - hoverFadeStart : 1
+            let hoverAlpha = min(1, CGFloat(elapsed / 0.14))
+            let morphProgress = hoverMorphFromRect != nil ? min(1, (now - hoverMorphStart) / 0.16) : 1
+            let drawRect = currentHoverVisualRect() ?? targetRect
+            if hoverAlpha < 1 || morphProgress < 1 {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in
                     self?.needsDisplay = true
                 }
             }
+            let cornerR: CGFloat = edgeFullScreenHover ? 0 : 10
+            let clearPath = CGPath(roundedRect: drawRect, cornerWidth: cornerR, cornerHeight: cornerR, transform: nil)
             ctx.saveGState()
             ctx.setBlendMode(.clear)
-            ctx.fill(rect)
+            ctx.addPath(clearPath)
+            ctx.fillPath()
             ctx.restoreGState()
-            ctx.setStrokeColor(NSColor.controlAccentColor.withAlphaComponent(0.85 * hoverAlpha).cgColor)
+
+            let strokeRect = drawRect.insetBy(dx: 0.75, dy: 0.75)
+            let strokeR = max(0, cornerR - 0.75)
+            let strokePath = CGPath(roundedRect: strokeRect, cornerWidth: strokeR, cornerHeight: strokeR, transform: nil)
+            ctx.setFillColor(DesignTokens.accent.withAlphaComponent(0.04 * hoverAlpha).cgColor)
+            ctx.addPath(strokePath)
+            ctx.fillPath()
+            ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.88 * hoverAlpha).cgColor)
             ctx.setLineWidth(1.5)
-            ctx.stroke(rect.insetBy(dx: 1, dy: 1))
-            let label = target.title.isEmpty ? target.ownerName : "\(target.ownerName) · \(target.title)"
-            drawWindowBadge(text: label, below: rect)
+            ctx.addPath(strokePath)
+            ctx.strokePath()
+            let label: String
+            if edgeFullScreenHover {
+                label = "全屏 · 点击或回车确认"
+            } else if let target = hovered {
+                label = target.title.isEmpty ? target.ownerName : "\(target.ownerName) · \(target.title)"
+            } else {
+                label = ""
+            }
+            if !label.isEmpty {
+                drawWindowBadge(text: label, below: drawRect)
+            }
             return
         }
 
@@ -1351,129 +1885,322 @@ final class OverlayView: NSView {
     private func drawEditor(ctx: CGContext) {
         guard let session = editorSession else { return }
 
-        // 1. 选区外蒙层（比选区阶段浅，弱化干扰）
+        let backdropLayout = session.currentBackdropLayout(for: editorRectLocal.size)
+        let backdropRectLocal: CGRect?
+        let cardRectLocal: CGRect?
+        if let layout = backdropLayout {
+            let backdropOrigin = CGPoint(
+                x: editorRectLocal.minX - layout.imageRect.minX,
+                y: editorRectLocal.minY - layout.imageRect.minY
+            )
+            backdropRectLocal = CGRect(origin: backdropOrigin, size: layout.canvasSize)
+            cardRectLocal = layout.cardRect.offsetBy(dx: backdropOrigin.x, dy: backdropOrigin.y)
+        } else {
+            backdropRectLocal = nil
+            cardRectLocal = nil
+        }
+
+        // 1. 选区外蒙层（比选区阶段浅，弱化干扰；开启画框时按画框总画布挖空）
         ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha * 0.7).cgColor)
         ctx.fill(bounds)
         ctx.saveGState()
         ctx.setBlendMode(.clear)
-        ctx.fill(editorRectLocal)
+        ctx.fill(backdropRectLocal ?? editorRectLocal)
         ctx.restoreGState()
 
-        // 2. 冻结底图：像素精确 1:1 绘制（不重采样不模糊）。
-        // 坐标处理：CGContext.draw 假设 Y-up；本视图 Y-down ⇒ 局部翻转一次
-        // 再 draw，方向即正确（病例三连：①不翻=倒置 ②NSImage.draw 按 point
-        // size 重采样=模糊+错位 ③正确解=显式翻转+像素尺寸矩形）
-        let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
+        if let layout = backdropLayout, let backdropRect = backdropRectLocal, let cardRect = cardRectLocal {
+            // 1.1 画框渐变背景
+            CGRenderer.drawBackdropBackground(
+                style: session.backdropStyle,
+                in: backdropRect,
+                context: ctx,
+                contextIsYDown: true
+            )
+            // 1.2 圆角卡片双层柔影与可选边缘主色均衡内衬底
+            let cushionColor = layout.balanceInset > 0 ? session.backdropEdgeColor() : nil
+            CGRenderer.drawBackdropCardChrome(
+                cardRect: cardRect,
+                cornerRadius: layout.cornerRadius,
+                isDarkBackdrop: session.backdropStyle.preset.isDark,
+                cushionColor: cushionColor,
+                context: ctx,
+                contextIsYDown: true
+            )
+        }
 
-        // 2.5 马赛克预览：已提交 + 拖拽中（pending）的 mosaic 都走与导出 composite
-        // 完全相同的像素化算法（CGRenderer.applyMosaic → 「编辑器所见 = 导出所得」）。
-        // ⚠️ 病例：马赛克只有矢量层 5% 黑罩时，选区内拖拽看不到任何效果
-        //（用户实报「点了没反应」）——必须在底图上真实打码才有拖拽反馈。
+        // 2. 选区内画面：
+        // - 冻结桌面态且无马赛克（或正处于移动/缩放框选期间，未开画框）：
+        //   底层 GPU `frozenBackdropView` 已经按 1:1 屏幕坐标静止托管完整冻结帧，
+        //   上方 `.clear` 挖空直接透出绝对静止的原生画面——彻底根除 `liveFrozenCrop`
+        //   每帧裁剪 + nearest 亚像素重采样导致的「移动选框时背后文字轻微变形/热浪抖动」；
+        // - 开启画框时底下已铺渐变与卡片背景，必须绘制位图底图；
+        // - 独立外源图（frozenImage == nil）或静止态含马赛克：正常绘制 `baseForDraw`。
+        let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
         let hasMosaic = annotations.contains { annotation in
             if case .mosaic = annotation.shape { return true }
             return false
         }
-        let baseForDraw: CGImage
-        if hasMosaic {
-            baseForDraw = CGRenderer.renderMosaicPreview(
-                base: session.baseImage, annotations: annotations, scale: session.scale
-            )
-        } else {
-            baseForDraw = session.baseImage
-        }
-        // ⚠️ 用户裁定（2026-11-17「相机取景框」语义）：拖动选区期间，框内内容
-        // 必须实时映射冻结帧的对应区域（取景器对着的是世界，不是一张贴图）。
-        // 实现：move 手势进行中（editGesture == .move）从全屏 frozenImage 动态
-        // 裁 editorRectLocal 屏幕对应区域；松手时 adjustSelection 提交正式底图
-        // （标注 offset 平移）——拖动中标注跟框走，视觉连贯。
+        let isDraggingBox: Bool
+        let annotationOrigin: CGPoint
         switch editGesture {
-        case .move, .resize:
-            if let frozen = frozenImage, let live = liveFrozenCrop() {
-            // 1:1 绘制（drawRect 像素反算，整点对齐——热扭曲病例修复）：
-            // 翻转 CTM 的 rect 语义为「从顶部量」（与裁剪 px 同向），rect.minX/minY
-            // 即绘制原点；不再依赖 editorRectLocal 的浮点位置拉伸位图
-            ctx.saveGState()
-            ctx.clip(to: editorRectLocal)
-            ctx.translateBy(x: live.drawRect.minX, y: live.drawRect.maxY)
-            ctx.scaleBy(x: 1, y: -1)
-            ctx.translateBy(x: -live.drawRect.minX, y: -live.drawRect.minY)
-            ctx.interpolationQuality = .none
-            ctx.draw(live.crop, in: live.drawRect)
-            ctx.restoreGState()
-                return
-            }
-        default:
-            break
-        }
-        do {
-        ctx.saveGState()
-        ctx.clip(to: editorRectLocal)
-        ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.translateBy(x: -editorRectLocal.minX, y: -editorRectLocal.minY)
-        ctx.interpolationQuality = .none
-        ctx.draw(baseForDraw, in: editorRectLocal)
-        ctx.restoreGState()
+        case .move(let startRect, _), .resize(_, let startRect):
+            isDraggingBox = true
+            annotationOrigin = (frozenImage != nil) ? startRect.origin : editorRectLocal.origin
+        case .none:
+            isDraggingBox = false
+            annotationOrigin = editorRectLocal.origin
         }
 
-        // 3. 标注层（同一渲染器 = 导出所见）
-        // ⚠️ 病例：不能放在上面的「图像翻转 gstate」里画——那个 CTM 是为 Y-up 位图
-        // 准备的绝对坐标翻转，标注却是选区局部坐标 → 画出来必然被 clip 裁光
-        // （用户实报：矩形工具画不出任何东西；log 里 shape.commit 都在，屏幕零像素）。
-        // 正确姿势：回到视图原生 Y-down CTM，clip 选区 + 平移原点即可。
+        if let layout = backdropLayout, let cardRect = cardRectLocal {
+            let cardPath = CGPath(
+                roundedRect: cardRect,
+                cornerWidth: layout.cornerRadius,
+                cornerHeight: layout.cornerRadius,
+                transform: nil
+            )
+            ctx.saveGState()
+            ctx.addPath(cardPath)
+            ctx.clip()
+        }
+
+        let needsBitmapDraw = (backdropLayout != nil) || (frozenImage == nil) || (hasMosaic && !isDraggingBox)
+        if needsBitmapDraw {
+            if backdropLayout != nil, frozenImage != nil, isDraggingBox, let liveCrop = liveFrozenCrop() {
+                ctx.saveGState()
+                ctx.clip(to: editorRectLocal)
+                let drawRect = liveCrop.drawRect
+                ctx.translateBy(x: drawRect.minX, y: drawRect.maxY)
+                ctx.scaleBy(x: 1, y: -1)
+                ctx.translateBy(x: -drawRect.minX, y: -drawRect.minY)
+                ctx.interpolationQuality = .none
+                ctx.draw(liveCrop.crop, in: drawRect)
+                ctx.restoreGState()
+            } else {
+                let baseForDraw: CGImage
+                if hasMosaic {
+                    baseForDraw = CGRenderer.renderMosaicPreview(
+                        base: session.baseImage, annotations: annotations, scale: session.scale
+                    )
+                } else {
+                    baseForDraw = session.baseImage
+                }
+                if isStandaloneImage && backdropLayout == nil {
+                    ctx.saveGState()
+                    ctx.setShadow(
+                        offset: CGSize(width: 0, height: 10),
+                        blur: 28,
+                        color: NSColor.black.withAlphaComponent(0.28).cgColor
+                    )
+                    ctx.setFillColor(NSColor.black.withAlphaComponent(0.01).cgColor)
+                    ctx.fill(editorRectLocal)
+                    ctx.restoreGState()
+                }
+                ctx.saveGState()
+                ctx.clip(to: editorRectLocal)
+                ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.maxY)
+                ctx.scaleBy(x: 1, y: -1)
+                ctx.translateBy(x: -editorRectLocal.minX, y: -editorRectLocal.minY)
+                let backing = window?.backingScaleFactor ?? 2
+                let exact1to1 = abs(editorRectLocal.width * backing - CGFloat(baseForDraw.width)) < 1.5
+                    && abs(editorRectLocal.height * backing - CGFloat(baseForDraw.height)) < 1.5
+                ctx.interpolationQuality = exact1to1 ? .none : .high
+                ctx.draw(baseForDraw, in: editorRectLocal)
+                ctx.restoreGState()
+            }
+        }
+
+        // 3. 标注层（移动/缩放取景框时锚定 startRect.origin，使既有标注钉死在屏幕内容上不漂移）
         Log.event(.editor, "editor.draw", [
             "count": "\(annotations.count)", "shapes": annotations.map { "\($0.shape)" }.joined(separator: "|"),
         ])
         ctx.saveGState()
         ctx.clip(to: editorRectLocal)
-        ctx.translateBy(x: editorRectLocal.minX, y: editorRectLocal.minY)
+        ctx.translateBy(x: annotationOrigin.x, y: annotationOrigin.y)
         CGRenderer.render(annotations: annotations, in: editorRectLocal.size, context: ctx, contextIsYDown: true)
+
+        // 3.5 自动脱敏视觉反馈（仅屏幕展示，绝不入导出图）：刚命中时的轻蓝闪框 + 悬停可点消虚线框
+        if !flashedAutoRedactRects.isEmpty {
+            ctx.saveGState()
+            ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.85).cgColor)
+            ctx.setFillColor(DesignTokens.accent.withAlphaComponent(0.10).cgColor)
+            ctx.setLineWidth(1.5)
+            for r in flashedAutoRedactRects {
+                let p = CGPath(roundedRect: r, cornerWidth: 3, cornerHeight: 3, transform: nil)
+                ctx.addPath(p)
+                ctx.fillPath()
+                ctx.addPath(p)
+                ctx.strokePath()
+            }
+            ctx.restoreGState()
+        }
+        if let hoveredRect = hoveredAutoRedactRect, !isDraggingBox {
+            ctx.saveGState()
+            let p = CGPath(roundedRect: hoveredRect.insetBy(dx: 0.5, dy: 0.5), cornerWidth: 3, cornerHeight: 3, transform: nil)
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.92).cgColor)
+            ctx.setLineWidth(1.25)
+            ctx.setLineDash(phase: 0, lengths: [3.5, 2.5])
+            ctx.addPath(p)
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
         ctx.restoreGState()
 
-        // 4. 选区描边（编辑态的画布边界；审查：与框选态统一线宽阶梯 white .85 · 1.5pt）
-        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.85).cgColor)
-        ctx.setLineWidth(borderWidth)
-        ctx.stroke(editorRectLocal)
+        if let layout = backdropLayout, let cardRect = cardRectLocal {
+            ctx.restoreGState()
+            CGRenderer.drawBackdropCardHairline(
+                cardRect: cardRect,
+                cornerRadius: layout.cornerRadius,
+                isDarkBackdrop: session.backdropStyle.preset.isDark,
+                lineWidth: 0.5,
+                context: ctx
+            )
+        }
 
-        // 4.5 手柄（选区足够大时）：8 个白色方块，悬停的加粗
+        // 4. 选区边界与画框外沿 0.5pt 边界线
+        if let backdropRect = backdropRectLocal {
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.32).cgColor)
+            ctx.setLineWidth(0.5)
+            ctx.stroke(backdropRect.insetBy(dx: 0.25, dy: 0.25))
+            ctx.restoreGState()
+
+            if hoverEdge != nil || isDraggingBox {
+                ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.18).cgColor)
+                ctx.setLineWidth(borderWidth + 0.5)
+                ctx.stroke(editorRectLocal)
+                ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.85).cgColor)
+                ctx.setLineWidth(0.75)
+                ctx.stroke(editorRectLocal)
+            } else {
+                ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.24).cgColor)
+                ctx.setLineWidth(0.5)
+                ctx.stroke(editorRectLocal)
+            }
+        } else {
+            ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.24).cgColor)
+            ctx.setLineWidth(borderWidth + 1.0)
+            ctx.stroke(editorRectLocal)
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.90).cgColor)
+            ctx.setLineWidth(1.0)
+            ctx.stroke(editorRectLocal)
+        }
+
+        // 4.7 编辑器顶部轻提示胶囊（如「已自动脱敏 3 处 · 单击可取消」）
+        if let toast = editorToastText {
+            drawEditorToastPill(text: toast, in: backdropRectLocal ?? editorRectLocal, ctx: ctx)
+        }
+
+        // 4.5 手柄（Apple Preview / Keynote 圆形精致手柄）
         drawSelectionHandles(ctx: ctx)
+
+        // 4.6 独立外源图缩放比例浮标（缩放时浮在可视画布右上角，1s 后自动淡隐）
+        if let zoomText = standaloneZoomHudText {
+            let visibleCanvas = (backdropRectLocal ?? editorRectLocal).intersection(bounds.insetBy(dx: 12, dy: 12))
+            if !visibleCanvas.isNull, visibleCanvas.width >= 60, visibleCanvas.height >= 40 {
+                drawZoomPill(text: zoomText, in: visibleCanvas, ctx: ctx)
+            }
+        }
 
         // 5. 提示条已移除（病例：长条提示与工具栏重叠、压住按钮，原型 scene 03 也没有它；
         //    快捷键教学放设置面板与首次引导，不占编辑画布）
     }
 
-    /// 窗口名角标（白底深字胶囊，贴窗口左上角内侧）
-    ///
-    /// ⚠️ 不能写 `NSColor.labelColor`：本覆盖层是 dark appearance，labelColor 解析成
-    /// 白色 ⇒ 白底白字不可读（实拍病例）。固定深色文字 + 白底。
+    /// 窗口名角标（统一深色半透玻璃胶囊族 + 0.5pt 发丝边 + 轻影，告别突兀纯白条）
     private func drawWindowBadge(text: String, below rect: CGRect) {
         let maxChars = 42
         let shown = text.count > maxChars ? String(text.prefix(maxChars)) + "…" : text
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor(calibratedWhite: 0.12, alpha: 1),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.94),
         ]
         let textSize = (shown as NSString).size(withAttributes: attributes)
-        let padding: CGFloat = 6
-        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + 4))
+        let padH: CGFloat = 9
+        let size = CGSize(width: ceil(textSize.width + padH * 2), height: 22)
         // 贴在窗口内侧左上（外侧会压到菜单栏）
-        var origin = CGPoint(x: rect.minX + 8, y: rect.minY + 8)
-        origin.x = min(max(origin.x, 4), bounds.width - size.width - 4)
+        var origin = CGPoint(x: rect.minX + 10, y: rect.minY + 10)
+        origin.x = min(max(origin.x, 8), bounds.width - size.width - 8)
         let badgeRect = CGRect(origin: origin, size: size)
-        let path = CGPath(roundedRect: badgeRect, cornerWidth: 5, cornerHeight: 5, transform: nil)
-        let ctx = NSGraphicsContext.current?.cgContext
-        ctx?.setFillColor(NSColor.white.withAlphaComponent(0.94).cgColor)
-        ctx?.addPath(path)
-        ctx?.fillPath()
-        (shown as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + 2), withAttributes: attributes)
+        let path = CGPath(roundedRect: badgeRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 8, color: NSColor.black.withAlphaComponent(0.28).cgColor)
+        ctx.setFillColor(NSColor(srgbRed: 24/255.0, green: 24/255.0, blue: 28/255.0, alpha: 0.78).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        ctx.restoreGState()
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.16).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(path)
+        ctx.strokePath()
+        (shown as NSString).draw(
+            at: CGPoint(x: origin.x + padH, y: origin.y + (size.height - textSize.height) / 2),
+            withAttributes: attributes
+        )
     }
 
-    /// 8 向手柄（四角 + 四边中点）
+    /// 编辑器顶部轻提示胶囊（如自动脱敏命中数、单点取消反馈；贴在选区上方 10pt，贴屏顶时回落选区内侧顶部）
+    private func drawEditorToastPill(text: String, in selection: CGRect, ctx: CGContext) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.95),
+        ]
+        let textSize = (text as NSString).size(withAttributes: attrs)
+        let padH: CGFloat = 11
+        let size = CGSize(width: ceil(textSize.width + padH * 2), height: 24)
+        let x = min(max(selection.midX - size.width / 2, 10), bounds.width - size.width - 10)
+        let aboveY = selection.minY - size.height - 10
+        let y = aboveY >= 10 ? aboveY : min(bounds.height - size.height - 10, selection.minY + 10)
+        let pillRect = CGRect(x: x.rounded(), y: y.rounded(), width: size.width, height: size.height)
+        let path = CGPath(roundedRect: pillRect, cornerWidth: size.height / 2, cornerHeight: size.height / 2, transform: nil)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -2), blur: 10, color: NSColor.black.withAlphaComponent(0.28).cgColor)
+        ctx.setFillColor(NSColor(srgbRed: 24/255.0, green: 24/255.0, blue: 28/255.0, alpha: 0.84).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        ctx.restoreGState()
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.18).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(path)
+        ctx.strokePath()
+        (text as NSString).draw(
+            at: CGPoint(x: pillRect.minX + padH, y: pillRect.minY + (size.height - textSize.height) / 2),
+            withAttributes: attrs
+        )
+    }
+
+    /// 独立图缩放比例浮标（可视画布右上角）
+    private func drawZoomPill(text: String, in canvas: CGRect, ctx: CGContext) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.94),
+        ]
+        let textSize = (text as NSString).size(withAttributes: attrs)
+        let padH: CGFloat = 9
+        let size = CGSize(width: ceil(textSize.width + padH * 2), height: 22)
+        let rect = CGRect(x: canvas.maxX - size.width - 10, y: canvas.minY + 10, width: size.width, height: size.height)
+        let path = CGPath(roundedRect: rect, cornerWidth: 6, cornerHeight: 6, transform: nil)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 8, color: NSColor.black.withAlphaComponent(0.26).cgColor)
+        ctx.setFillColor(NSColor(srgbRed: 24/255.0, green: 24/255.0, blue: 28/255.0, alpha: 0.76).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        ctx.restoreGState()
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.16).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(path)
+        ctx.strokePath()
+        (text as NSString).draw(
+            at: CGPoint(x: rect.minX + padH, y: rect.minY + (size.height - textSize.height) / 2),
+            withAttributes: attrs
+        )
+    }
+
+    /// 8 向圆形手柄（Apple Preview / Keynote 风格：圆形白点 + 悬停放大带蓝环 + 柔和投影）
     private func drawSelectionHandles(ctx: CGContext) {
         let rect = editorRectLocal
         guard rect.width >= SelectionGeometry.handleVisibilityThreshold
                 || rect.height >= SelectionGeometry.handleVisibilityThreshold else { return }
-        let size: CGFloat = 7
+        let baseSize: CGFloat = 7.5
         let points: [(CGPoint, SelectionEdge)] = [
             (CGPoint(x: rect.minX, y: rect.minY), .topLeft),
             (CGPoint(x: rect.midX, y: rect.minY), .top),
@@ -1486,16 +2213,17 @@ final class OverlayView: NSView {
         ]
         for (center, edge) in points {
             let isHot = hoverEdge == edge
-            let s = isHot ? size + 3 : size
-            let box = CGRect(x: center.x - s / 2, y: center.y - s / 2, width: s, height: s)
-            // 审查：删 black .45 描边（white 方块在冻结底图上自带对比，黑边是噪音）；
-            // 改 shadow(black .30, r2, offset 0 1) 承担分离度。翻转上下文 y+1 = 视觉向下
+            let d = isHot ? baseSize + 2.5 : baseSize
+            let circleRect = CGRect(x: center.x - d / 2, y: center.y - d / 2, width: d, height: d)
             ctx.saveGState()
-            ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 2,
-                          color: NSColor.black.withAlphaComponent(0.30).cgColor)
+            ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 3,
+                          color: NSColor.black.withAlphaComponent(0.32).cgColor)
             ctx.setFillColor(NSColor.white.cgColor)
-            ctx.fill(box)
+            ctx.fillEllipse(in: circleRect)
             ctx.restoreGState()
+            ctx.setStrokeColor((isHot ? DesignTokens.accent : NSColor.black.withAlphaComponent(0.24)).cgColor)
+            ctx.setLineWidth(isHot ? 1.5 : 0.6)
+            ctx.strokeEllipse(in: circleRect)
         }
     }
 
@@ -1516,31 +2244,36 @@ final class OverlayView: NSView {
         )
     }
 
-    /// 尺寸角标：深胶囊 rgba(24,24,27,.62) + 0.5pt stroke 白 .14（并入 tooltip 深胶囊家族；
-    /// 原 black .72 实心胶囊），文字 white .94
+    /// 尺寸角标：深色磨砂胶囊 + 等宽数字 tabular-nums（拖拽不横向抖动）+ 0.5pt 发丝边 + 轻影
     private func drawBadge(text: String, below rect: CGRect) {
         let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
             .foregroundColor: NSColor.white.withAlphaComponent(0.94),
         ]
         let textSize = (text as NSString).size(withAttributes: attributes)
-        let padding: CGFloat = 7
-        let size = CGSize(width: ceil(textSize.width + padding * 2), height: ceil(textSize.height + 3))
-        var origin = CGPoint(x: rect.maxX - size.width, y: min(rect.maxY + 6, bounds.height - size.height))
-        if origin.y + size.height > bounds.height { origin.y = rect.minY - size.height - 6 }
-        if origin.y < 0 { origin.y = 4 }
-        if origin.x < 0 { origin.x = 4 }
+        let padH: CGFloat = 8
+        let size = CGSize(width: ceil(textSize.width + padH * 2), height: 22)
+        var origin = CGPoint(x: rect.maxX - size.width, y: min(rect.maxY + 8, bounds.height - size.height - 4))
+        if origin.y + size.height > bounds.height { origin.y = rect.minY - size.height - 8 }
+        if origin.y < 4 { origin.y = 4 }
+        if origin.x < 4 { origin.x = 4 }
         let badgeRect = CGRect(origin: origin, size: size)
         let path = CGPath(roundedRect: badgeRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
-        let ctx = NSGraphicsContext.current?.cgContext
-        ctx?.setFillColor(DesignTokens.capsuleDark.cgColor)
-        ctx?.addPath(path)
-        ctx?.fillPath()
-        ctx?.setStrokeColor(NSColor.white.withAlphaComponent(0.14).cgColor)
-        ctx?.setLineWidth(0.5)
-        ctx?.addPath(path)
-        ctx?.strokePath()
-        (text as NSString).draw(at: CGPoint(x: origin.x + padding, y: origin.y + padding / 2), withAttributes: attributes)
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 8, color: NSColor.black.withAlphaComponent(0.28).cgColor)
+        ctx.setFillColor(NSColor(srgbRed: 24/255.0, green: 24/255.0, blue: 28/255.0, alpha: 0.78).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        ctx.restoreGState()
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.16).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(path)
+        ctx.strokePath()
+        (text as NSString).draw(
+            at: CGPoint(x: origin.x + padH, y: origin.y + (size.height - textSize.height) / 2),
+            withAttributes: attributes
+        )
     }
 
     private func drawHintText(_ text: String) {
@@ -1570,6 +2303,12 @@ final class OverlayView: NSView {
 // MARK: - 文字输入框委托（Enter 落库 / Esc 取消在 keyDown 里处理不了 field 的，走 doCommandBy）
 
 extension OverlayView: NSTextFieldDelegate {
+    nonisolated func controlTextDidChange(_ obj: Notification) {
+        MainActor.assumeIsolated {
+            resizeActiveTextField()
+        }
+    }
+
     nonisolated func control(_: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         MainActor.assumeIsolated {
             switch commandSelector {
@@ -1594,110 +2333,72 @@ private extension NSRect {
     func minus(_ other: NSRect) -> NSRect { self }
 }
 
-// MARK: - 文字输入视觉件（§10-9 落地：透明底 + 标注色描边；glass 不叠色、无发光）
-//
-// 视觉 token 对齐 tokens.md §10-9（轻盈感审查后落地）：
-// - 输入框：无底透明，唯一指示 = 0.5pt 当前标注色 α.60 描边（placeholder 删除）
-// - 字号条：hudWindow 玻璃（不叠 60% tint）+ 0.5pt 白 16% 描边；选中档不发光
+// MARK: - 文字输入框（Apple Preview / CleanShot 风格：紧凑内边距 + 柔和半透可读衬底 + 细腻虚线语义边框）
 
 @MainActor
-private enum TextUIStyle {
-    static let accent = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.0, alpha: 1)        // #0A84FF
-    static let accentHover = NSColor(srgbRed: 0.102, green: 0.549, blue: 1.0, alpha: 1)   // #1A8CFF
-    static let borderIdle = NSColor.white.withAlphaComponent(0.16)
-    static let textIdle = NSColor.white.withAlphaComponent(0.82)
-    static let textActive = NSColor.white
-    static let hoverFill = NSColor.white.withAlphaComponent(0.12)
-    /// 标注色描边 α .60（描边色即「这段字会用什么颜色」的语义，比通用蓝多一层信息）
-    static let annotationBorderAlpha: CGFloat = 0.60
-}
+private final class PaddedTextFieldCell: NSTextFieldCell {
+    var padX: CGFloat = 8
+    var padY: CGFloat = 4
 
-// MARK: - 文字输入框（§10-9：透明底 + 0.5pt 标注色 α.60 描边；无 placeholder 无聚焦框）
+    private func insetRect(for rect: NSRect) -> NSRect {
+        let base = rect.insetBy(dx: padX, dy: padY)
+        guard let font else { return base }
+        let textH = ceil(font.ascender - font.descender)
+        let extraY = max(0, floor((base.height - textH) / 2))
+        return NSRect(x: base.minX, y: base.minY + extraY, width: base.width, height: base.height - extraY)
+    }
+
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        insetRect(for: super.drawingRect(forBounds: rect))
+    }
+
+    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
+        super.edit(withFrame: insetRect(for: rect), in: controlView, editor: textObj, delegate: delegate, event: event)
+    }
+
+    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
+        super.select(withFrame: insetRect(for: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
+    }
+}
 
 @MainActor
 private final class GlassTextField: NSTextField {
-    /// 当前画笔色（描边语义色；未设置时回落 accent）
-    var annotationColor: NSColor = TextUIStyle.accent
+    static let padX: CGFloat = 8
+    static let padY: CGFloat = 4
+
+    /// 当前画笔色（变动时同步刷新虚线语义边框与轻度对比衬底）
+    var annotationColor: NSColor = DesignTokens.accent {
+        didSet { applyAnnotationChrome() }
+    }
+
+    private let dashedBorder = CAShapeLayer()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        let customCell = PaddedTextFieldCell(textCell: "")
+        customCell.padX = Self.padX
+        customCell.padY = Self.padY
+        customCell.isEditable = true
+        customCell.isSelectable = true
+        customCell.isScrollable = true
+        customCell.wraps = false
+        customCell.drawsBackground = false
+        customCell.isBezeled = false
+        customCell.isBordered = false
+        self.cell = customCell
+
         isBordered = false
         drawsBackground = false
         focusRingType = .none
         wantsLayer = true
-        layer?.cornerRadius = 10
-        layer?.masksToBounds = true
-        layer?.backgroundColor = NSColor.clear.cgColor   // 实心底已判死（token §10-9）
-        layer?.borderWidth = 0.5
-        applyAnnotationBorder()
-    }
+        layer?.cornerRadius = 7
+        layer?.masksToBounds = false
 
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("init(coder:) 不支持") }
-
-    private func applyAnnotationBorder() {
-        guard let layer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layer.borderWidth = 0.5
-        layer.borderColor = annotationColor.withAlphaComponent(TextUIStyle.annotationBorderAlpha).cgColor
-        CATransaction.commit()
-    }
-}
-
-// MARK: - 浮动字号条（磨砂玻璃小条：hudWindow + 60% 深着色，胶囊高 32）
-
-@MainActor
-private final class FontSizeBarView: NSView {
-    /// 按钮 28 高 × 34 宽（13pt「Aa14」需要 ~30pt 宽，28 放不下会截字）+ 间距 2 + 左右 padding 4
-    static let buttonSize = CGSize(width: 34, height: 28)
-    static let barHeight: CGFloat = 32
-
-    static func preferredSize(buttonCount: Int) -> CGSize {
-        CGSize(width: CGFloat(buttonCount) * buttonSize.width
-            + CGFloat(max(0, buttonCount - 1)) * 2 + 8,
-               height: barHeight)
-    }
-
-    var onSelect: ((Int) -> Void)?
-    private var buttons: [FontSizeOptionButton] = []
-    private var selectedIndex = 0
-    private let effect = NSVisualEffectView()
-    private let stack = NSStackView(views: [])
-
-    init(sizes: [Int], selectedIndex: Int) {
-        self.selectedIndex = selectedIndex
-        super.init(frame: .zero)
-        wantsLayer = true
-
-        // 玻璃容器（工具栏同款：hudWindow 磨砂 + 0.5pt 白 16% 描边；60% 叠色已判死，不再叠 tint）
-        effect.material = .hudWindow
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.wantsLayer = true
-        effect.layer?.cornerRadius = 12
-        effect.layer?.masksToBounds = true
-        effect.layer?.borderWidth = 0.5
-        effect.layer?.borderColor = TextUIStyle.borderIdle.cgColor
-        addSubview(effect)
-
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 2
-        stack.edgeInsets = NSEdgeInsets(top: 2, left: 4, bottom: 2, right: 4)
-        addSubview(stack)
-
-        for (i, size) in sizes.enumerated() {
-            let button = FontSizeOptionButton(label: "Aa\(size)")
-            button.onActivated = { [weak self] in
-                guard let self else { return }
-                self.select(index: i)
-                self.onSelect?(i)
-            }
-            buttons.append(button)
-            stack.addArrangedSubview(button)
-        }
-        select(index: selectedIndex)
+        dashedBorder.fillColor = NSColor.clear.cgColor
+        dashedBorder.lineWidth = 1.0
+        dashedBorder.lineDashPattern = [3.5, 2.5]
+        layer?.addSublayer(dashedBorder)
+        applyAnnotationChrome()
     }
 
     @available(*, unavailable)
@@ -1705,106 +2406,234 @@ private final class FontSizeBarView: NSView {
 
     override func layout() {
         super.layout()
-        effect.frame = bounds
-        stack.frame = bounds
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dashedBorder.frame = bounds
+        dashedBorder.path = CGPath(
+            roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
+            cornerWidth: 7, cornerHeight: 7, transform: nil
+        )
+        CATransaction.commit()
     }
 
-    func select(index: Int) {
-        selectedIndex = index
-        for (i, button) in buttons.enumerated() { button.setSelected(i == index) }
+    func refreshPlaceholder() {
+        let f = font ?? NSFont.systemFont(ofSize: 14, weight: .semibold)
+        let srgb = annotationColor.usingColorSpace(.sRGB) ?? annotationColor
+        let lum = 0.299 * srgb.redComponent + 0.587 * srgb.greenComponent + 0.114 * srgb.blueComponent
+        let placeholderColor = (lum < 0.25 ? NSColor.black : NSColor.white).withAlphaComponent(0.45)
+        placeholderAttributedString = NSAttributedString(string: "输入文字…", attributes: [
+            .font: f,
+            .foregroundColor: placeholderColor,
+        ])
+    }
+
+    private func applyAnnotationChrome() {
+        guard let layer else { return }
+        let srgb = annotationColor.usingColorSpace(.sRGB) ?? annotationColor
+        let lum = 0.299 * srgb.redComponent + 0.587 * srgb.greenComponent + 0.114 * srgb.blueComponent
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        // 极克制的编辑态对比衬底（仅打字时出现，回车提交后消失），让深/浅文字在杂乱背景上都能一眼看清
+        layer.backgroundColor = (lum < 0.25
+            ? NSColor.white.withAlphaComponent(0.28)
+            : NSColor.black.withAlphaComponent(0.26)).cgColor
+        dashedBorder.strokeColor = annotationColor.withAlphaComponent(0.72).cgColor
+        CATransaction.commit()
     }
 }
 
-// MARK: - 字号档按钮（28 高「Aa14」胶囊：选中 #0A84FF 高亮，hover 变亮；蓝色 glow 已删）
+// MARK: - 浮动字号条（Apple Liquid Glass 胶囊 + 克制呼吸感弹性滑动选中态，与工具栏统一语言）
 
+@MainActor
+private final class FontSizeBarView: NSView {
+    static let buttonSize = CGSize(width: 28, height: 22)
+    static let barHeight: CGFloat = 30
+    static let iconAreaWidth: CGFloat = 24
+    static let itemGap: CGFloat = 2
+
+    static func preferredSize(buttonCount: Int) -> CGSize {
+        let buttonsW = CGFloat(buttonCount) * buttonSize.width + CGFloat(max(0, buttonCount - 1)) * itemGap
+        return CGSize(width: 8 + iconAreaWidth + 7 + buttonsW + 6, height: barHeight)
+    }
+
+    var onSelect: ((Int) -> Void)?
+    private var buttons: [FontSizeOptionButton] = []
+    private var selectedIndex = 0
+    private let glassSurface: DesignTokens.Mat.LiquidGlassSurface
+    private let foregroundHost = NSView()
+    private let iconView = NSImageView()
+    private let divider = NSView()
+    private let pillIndicator = NSView()
+    private var indicatorPositioned = false
+
+    init(sizes: [Int], selectedIndex: Int) {
+        self.selectedIndex = selectedIndex
+        self.glassSurface = DesignTokens.Mat.fixedLightCrystalBlur(
+            cornerRadius: 10,
+            tintAlpha: 0.08
+        )
+        super.init(frame: .zero)
+        appearance = NSAppearance(named: .aqua)
+        wantsLayer = true
+        if !glassSurface.isNativeLiquidGlass {
+            layer?.shadowColor = NSColor.black.cgColor
+            layer?.shadowOpacity = 0.22
+            layer?.shadowRadius = 10
+            layer?.shadowOffset = CGSize(width: 0, height: -3)
+        }
+
+        addSubview(glassSurface.hostView)
+        foregroundHost.wantsLayer = true
+        foregroundHost.appearance = NSAppearance(named: .aqua)
+        addSubview(foregroundHost)
+        let contentHost = foregroundHost
+
+        iconView.image = TBIcon.symbolImage(named: "textformat.size", pointSize: 11.5, weight: .medium, hierarchical: true)
+        iconView.contentTintColor = DesignTokens.label3
+        contentHost.addSubview(iconView)
+
+        divider.wantsLayer = true
+        contentHost.addSubview(divider)
+
+        // 克制半透强调蓝滑动胶囊（同心圆角 11pt，与工具栏一致，不抢戏、有呼吸边距）
+        pillIndicator.wantsLayer = true
+        pillIndicator.layer?.cornerRadius = glassSurface.isNativeLiquidGlass ? 11 : 7
+        pillIndicator.layer?.borderWidth = 0.5
+        contentHost.addSubview(pillIndicator)
+
+        for (i, size) in sizes.enumerated() {
+            let button = FontSizeOptionButton(label: "\(size)")
+            button.onActivated = { [weak self] in
+                guard let self else { return }
+                self.select(index: i, animated: true)
+                self.onSelect?(i)
+            }
+            buttons.append(button)
+            contentHost.addSubview(button)
+        }
+        refreshAppearanceColors()
+        select(index: selectedIndex, animated: false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) 不支持") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshAppearanceColors()
+    }
+
+    private func refreshAppearanceColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let isDark = effectiveAppearance.isDark
+            divider.layer?.backgroundColor = DesignTokens.hair.cgColor
+            pillIndicator.layer?.backgroundColor = DesignTokens.accent
+                .withAlphaComponent(isDark ? 0.24 : 0.14).cgColor
+            pillIndicator.layer?.borderColor = DesignTokens.accent
+                .withAlphaComponent(isDark ? 0.36 : 0.26).cgColor
+            iconView.contentTintColor = DesignTokens.label3
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        glassSurface.hostView.frame = bounds
+        foregroundHost.frame = bounds
+        if !glassSurface.isNativeLiquidGlass {
+            layer?.shadowPath = CGPath(
+                roundedRect: bounds,
+                cornerWidth: Self.barHeight / 2,
+                cornerHeight: Self.barHeight / 2,
+                transform: nil
+            )
+        }
+        let midY = bounds.height / 2
+        iconView.frame = NSRect(x: 9, y: (midY - 7).rounded(), width: 15, height: 14)
+        divider.frame = NSRect(x: 28, y: (midY - 6.5).rounded(), width: 0.5, height: 13)
+
+        var x: CGFloat = 34
+        let btnY = ((bounds.height - Self.buttonSize.height) / 2).rounded()
+        for button in buttons {
+            button.frame = NSRect(x: x, y: btnY, width: Self.buttonSize.width, height: Self.buttonSize.height)
+            x += Self.buttonSize.width + Self.itemGap
+        }
+        moveIndicator(to: selectedIndex, animated: false)
+        indicatorPositioned = true
+    }
+
+    func select(index: Int, animated: Bool) {
+        selectedIndex = index
+        for (i, button) in buttons.enumerated() {
+            button.setSelected(i == index)
+        }
+        moveIndicator(to: index, animated: animated && indicatorPositioned)
+    }
+
+    private func moveIndicator(to index: Int, animated: Bool) {
+        guard buttons.indices.contains(index) else { return }
+        let target = buttons[index].frame
+        guard target.width > 0 else { return }
+        if !animated {
+            pillIndicator.frame = target
+            return
+        }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            pillIndicator.animator().frame = target
+        }
+    }
+}
+
+/// 字号档按钮（纯数字等宽 12 / 14 / 17 / 21，alignmentRectInsets=zero 严防 macOS 26 拉伸）
 @MainActor
 private final class FontSizeOptionButton: NSButton {
     var onActivated: (() -> Void)?
     private var isHot = false
     private var isSelectedState = false
     private var trackingArea: NSTrackingArea?
-    /// 选中态 inset 白高光（工具栏同款：顶部白 30% 渐变，mask 到圆角）
-    private let highlightGradient = CAGradientLayer()
-    private var highlightInstalled = false
+    private let digitText: String
 
     init(label: String) {
+        self.digitText = label
         super.init(frame: .zero)
         isBordered = false
         bezelStyle = .regularSquare
         title = label
-        translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 8
-        layer?.masksToBounds = false
-        widthAnchor.constraint(equalToConstant: FontSizeBarView.buttonSize.width).isActive = true
-        heightAnchor.constraint(equalToConstant: FontSizeBarView.buttonSize.height).isActive = true
-        setStyledTitle(TextUIStyle.textIdle, size: 13)
-
-        highlightGradient.colors = [
-            NSColor.white.withAlphaComponent(0.30).cgColor,
-            NSColor.white.withAlphaComponent(0.0).cgColor,
-        ]
-        highlightGradient.startPoint = CGPoint(x: 0.5, y: 0)
-        highlightGradient.endPoint = CGPoint(x: 0.5, y: 1)
-        highlightGradient.locations = [0, 0.45]
+        layer?.cornerRadius = 7
+        applyStyle()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) 不支持") }
 
-    private func setStyledTitle(_ color: NSColor, size: CGFloat) {
-        attributedTitle = NSAttributedString(string: title, attributes: [
-            .font: NSFont.systemFont(ofSize: size, weight: .medium),
-            .foregroundColor: color,
-        ])
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyStyle()
     }
 
     func setSelected(_ selected: Bool) {
         isSelectedState = selected
-        if !selected, highlightInstalled {
-            highlightGradient.removeFromSuperlayer()
-            highlightInstalled = false
-        }
-        needsDisplay = true
         applyStyle()
     }
 
-    override var wantsUpdateLayer: Bool { true }
-
-    override func updateLayer() { applyStyle() }
-
     private func applyStyle() {
-        guard let layer else { return }
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        if isSelectedState {
-            layer.backgroundColor = (isHot ? TextUIStyle.accentHover : TextUIStyle.accent).cgColor
-            setStyledTitle(TextUIStyle.textActive, size: 13)
-            // 蓝色外发光已删（token §1.1 删除项）：唯一彩块语义由 accent 底承担
-            layer.shadowOpacity = 0
-            if !highlightInstalled {
-                layer.addSublayer(highlightGradient)
-                highlightInstalled = true
-            }
-        } else if isHot {
-            layer.backgroundColor = TextUIStyle.hoverFill.cgColor
-            setStyledTitle(TextUIStyle.textActive, size: 13)
-            layer.shadowOpacity = 0
-        } else {
-            layer.backgroundColor = NSColor.clear.cgColor
-            setStyledTitle(TextUIStyle.textIdle, size: 13)
-            layer.shadowOpacity = 0
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = (!isSelectedState && isHot)
+                ? DesignTokens.fillHover.cgColor
+                : NSColor.clear.cgColor
+            let color: NSColor = isSelectedState
+                ? DesignTokens.accent
+                : (isHot ? DesignTokens.label1 : DesignTokens.label2)
+            let weight: NSFont.Weight = isSelectedState ? .semibold : .medium
+            attributedTitle = NSAttributedString(string: digitText, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: weight),
+                .foregroundColor: color,
+            ])
         }
-        CATransaction.commit()
-    }
-
-    override func layout() {
-        super.layout()
-        let path = CGPath(roundedRect: bounds, cornerWidth: 8, cornerHeight: 8, transform: nil)
-        let mask = CAShapeLayer()
-        mask.path = path
-        highlightGradient.frame = bounds
-        highlightGradient.mask = mask
     }
 
     override func updateTrackingAreas() {
@@ -1813,6 +2642,11 @@ private final class FontSizeOptionButton: NSButton {
         let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
         addTrackingArea(area)
         trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 
     override func mouseEntered(with event: NSEvent) {
@@ -1825,9 +2659,13 @@ private final class FontSizeOptionButton: NSButton {
         applyStyle()
     }
 
-    /// 点击即生效（不等 mouseUp，输入态下手感更快）
     override func mouseDown(with event: NSEvent) {
+        TactilePress.animate(view: self, pressed: true, scale: 0.94)
         onActivated?()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+            guard let self else { return }
+            TactilePress.animate(view: self, pressed: false)
+        }
     }
 }
 

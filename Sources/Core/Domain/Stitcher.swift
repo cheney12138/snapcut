@@ -3,62 +3,56 @@ import Foundation
 
 /// 滚动截图拼接器（Stitcher）
 ///
-/// 输入按时间顺序排列的帧（相邻帧之间存在垂直重叠），输出一张纵向长图与接缝信息。
-///
-/// 算法概述：
-/// 1. 每帧解码为 RGBA8 像素缓冲，并预计算每行的「行签名」（沿宽度均匀采样的亮度序列）；
-/// 2. 相邻两帧 (prev, cur) 之间，候选重叠行数从大到小枚举（overlap = prevH - d，
-///    d 为 cur 第 0 行对齐到 prev 的行号）；对每个候选，逐行比对 prev[d+i] 与 cur[i] 的
-///    行签名，行级容差（平均绝对差 ≤ 阈值）用于吸收 Retina 采样 / 抗锯齿噪声；
-///    不匹配行占比 ≤ 容差比例即视为该候选成立，取第一个（即最大重叠）成立的候选；
-/// 3. 从第一帧开始按累计偏移逐帧把 CGImage 画进同一个输出 CGContext（逐段 draw，
-///    不做整图像素级拷贝），最终 makeImage 得到长图。
-///
-/// 内存约束：除输入帧本身外，额外内存只有每帧的行签名（行数 × 采样数，约几十 KB）
-/// 和一张输出画布；输出画布通过 CGContext 逐帧 draw 合成，不会把长图展开成多份 RGBA。
-///
-/// 线程语义：`Stitcher` 是无状态的纯函数入口，`stitch` 为同步 CPU 密集型操作，
-/// 可在任意线程 / 队列调用（不要在主线程调用大图拼接）；内部不共享任何可变状态，
-/// 传入的 CGImage 在拼接过程中只读。
+/// 提供两种使用方式：
+/// 1. **流式增量会话（`Stitcher.Session`）**：采集期每帧 `push(frame)` 仅做一次解码与运动估计，
+///    采用 SnowShot 的 `band_height` 重绘带策略增量写入画布（天然剔除 sticky header/footer 重复印痕，
+///    容忍回弹/回滚），`finish()` 毫秒级直接出图；
+/// 2. **批量同步入口（`Stitcher.stitch(frames:options:)`）**：底层复用同一套运动估计与洁净合成核心，
+///    兼容原有 `Result` / `SeamInfo` 契约与不等高帧场景。
 enum Stitcher {
 
     // MARK: - 公共类型
 
     /// 单帧在长图中的接缝信息
-    struct SeamInfo: Equatable {
-        /// 帧在输入数组中的下标（0 起始）
+    struct SeamInfo: Equatable, Sendable {
+        /// 帧在输入序列中的下标（0 起始）
         let frameIndex: Int
-        /// 该帧与上一帧检测到的重叠行数（首帧为 0）
+        /// 该帧与上一状态检测到的重叠行数（首帧为 0）
         let overlapRows: Int
-        /// 该帧对长图的净贡献行数 = 帧高 - 重叠行数（首帧 = 帧高）
+        /// 该帧对长图的净贡献行数（首帧 = 帧高）
         let contributedRows: Int
         /// 该帧第 0 行在输出长图中的 y 偏移（像素，长图顶部为 0）
         let offsetY: Int
     }
 
     /// 拼接结果
-    struct Result {
-        /// 拼接成的长图（宽 = 输入帧宽，高 = Σ各帧净贡献行数）
+    struct Result: Sendable {
+        /// 拼接成的长图（宽 = 输入帧宽，高 = 最终画布高度）
         let image: CGImage
-        /// 每帧的接缝信息，与输入帧顺序一致
+        /// 每帧的接缝信息
         let seams: [SeamInfo]
     }
 
     /// 可调参数
-    struct Options {
+    struct Options: Sendable {
         /// 相邻帧最小可信重叠行数（小于此值不认为是滚动重叠）
         var minOverlap: Int = 16
-        /// 行签名比对容差：一行内采样点平均绝对亮度差超过该值视为「不匹配行」
-        /// （Retina 缩放 / 抗锯齿噪声通常在个位数）
-        /// 行签名比对容差：一行内采样点平均绝对亮度差超过该值视为「不匹配行」
-        /// （Retina 缩放 / 抗锯齿噪声通常在个位数；真实滚动帧实测需要 24：
-        /// 抗锯齿 + 滚动条 + 子像素位移会把正确对齐的行差拉到 17-23）
+        /// 保留兼容字段（PixelBuffer 行比对 / TestStitchMain 容差参考）
         var rowDiffThreshold: UInt32 = 24
-        /// 允许的「不匹配行」占比上限（0.10 = 10%；默认 2% 在真实帧上
-        /// 会把正确对齐误判为不匹配——2026-11-14 ScrollHost 实测病例）
         var maxMismatchRatio: Double = 0.10
-        /// 行签名沿宽度方向的采样点数
         var signatureSamples: Int = 64
+        /// 运动估计选项
+        var estimatorOptions: TileMotionEstimator.Options = TileMotionEstimator.Options()
+    }
+
+    /// 增量会话单帧推送结论
+    enum PushStatus: Equatable, Sendable {
+        case firstFrame
+        case appended(growthRows: Int, totalHeight: Int)
+        case prepended(growthRows: Int, totalHeight: Int)
+        case contained(positionY: Int, totalHeight: Int)
+        case staticFrame
+        case skipped
     }
 
     // MARK: - 错误
@@ -88,216 +82,422 @@ enum Stitcher {
         }
     }
 
-    // MARK: - 入口
+    // MARK: - 流式增量拼接会话
 
-    /// 拼接帧序列为纵向长图。
-    ///
-    /// - Parameters:
-    ///   - frames: 按时间顺序排列的帧，宽度必须一致（行数可以不等——滚动区域
-    ///     grow 后新帧更高是正常序列，纵向拼接按内容行对齐）；相邻帧需存在垂直重叠。
-    ///   - options: 可调参数，见 `Options`。
-    /// - Returns: 长图与每帧接缝信息。
-    /// - Throws: `StitcherError`。
-    ///
-    /// 线程语义：同步、阻塞、无状态；可在任意线程调用，大图建议放后台队列。
-    static func stitch(frames: [CGImage], options: Options = Options()) throws -> Result {
-        guard !frames.isEmpty else { throw StitcherError.noFrames }
-
-        let buffers = try frames.enumerated().map { index, image -> PixelBuffer in
-            guard index == 0 || image.width == frames[0].width else {
-                throw StitcherError.widthMismatch(
-                    expected: frames[0].width, actual: image.width, frameIndex: index)
-            }
-            return PixelBuffer(cgImage: image)
+    /// 流式增量拼接会话（非线程安全；由调用方在串行 actor / 队列内驱动）。
+    final class Session {
+        private enum ReferenceMode {
+            case previousFrame
+            case canvasWindow
         }
 
-        var seams: [SeamInfo] = []
-        var offsets: [Int] = []
-        var runningY = 0
+        private let options: Options
+        private(set) var canvasWidth: Int = 0
+        private(set) var canvasHeight: Int = 0
+        private(set) var viewportHeight: Int = 0
+        private(set) var viewportPosition: Int = 0
+        private(set) var maxViewportPosition: Int = 0
+        private(set) var pushedCount: Int = 0
+        /// 对画布有净贡献的帧数（首帧 + 每次扩展画布的帧）
+        private(set) var contributingFrameCount: Int = 0
+        private(set) var seams: [SeamInfo] = []
+        private(set) var firstFrameImage: CGImage?
 
-        for (index, buffer) in buffers.enumerated() {
-            // 协作取消（compose 超时保险丝依赖）：detached 上下文里 cancelAll
-            // 才能真正中断拼接（reviewer Critical#1 配套——超时即走不等 stitch）
-            if index % 2 == 0, Task.isCancelled { throw StitcherError.cancelled }
-            if index == 0 {
-                guard buffer.height > options.minOverlap else {
-                    throw StitcherError.frameTooSmall(
-                        frameIndex: 0, height: buffer.height, minOverlap: options.minOverlap)
+        private var canvasPixels = Data()
+        private var referenceFrame: TileMotionEstimator.PreparedFrame?
+        /// 回滚进入已拼画布内部后切换为 CanvasWindow 对齐参考（对齐 SnowShot 零漂移策略）
+        private var referenceMode: ReferenceMode = .previousFrame
+        private var cachedCanvasWindowPos: Int?
+        private var cachedCanvasWindowFrame: TileMotionEstimator.PreparedFrame?
+        /// 最近一次 `push` 的诊断信息（供实时日志排查）
+        private(set) var lastEstimate: TileMotionEstimator.Estimate?
+        private(set) var lastPrepMs: Int = 0
+        private(set) var lastEstMs: Int = 0
+
+        var hasScrolled: Bool { contributingFrameCount > 1 || maxViewportPosition > 0 }
+
+        init(options: Options = Options()) {
+            self.options = options
+        }
+
+        /// 从已拼画布提取当前 `viewportPosition` 处高度为 `height` 的参考切片（零漂移对齐用）
+        private func loadCanvasWindowReference(height: Int) -> TileMotionEstimator.PreparedFrame? {
+            guard canvasWidth > 8, height > options.minOverlap,
+                  viewportPosition >= 0, viewportPosition + height <= canvasHeight else {
+                return nil
+            }
+            if let cached = cachedCanvasWindowFrame,
+               cachedCanvasWindowPos == viewportPosition,
+               cached.height == height {
+                return cached
+            }
+            let rowBytes = canvasWidth * 4
+            let byteStart = viewportPosition * rowBytes
+            let byteEnd = (viewportPosition + height) * rowBytes
+            guard byteStart >= 0, byteEnd <= canvasPixels.count else { return nil }
+            let slice = canvasPixels.subdata(in: byteStart..<byteEnd)
+            guard let prepared = TileMotionEstimator.PreparedFrame(
+                rgbaSlice: slice, width: canvasWidth, height: height,
+                downsample: options.estimatorOptions.downsample) else {
+                return nil
+            }
+            cachedCanvasWindowPos = viewportPosition
+            cachedCanvasWindowFrame = prepared
+            return prepared
+        }
+
+        /// 推入一帧并立即完成运动估计与增量画布合成。
+        @discardableResult
+        func push(_ frame: CGImage) -> PushStatus {
+            pushedCount += 1
+            lastEstimate = nil
+            lastPrepMs = 0
+            lastEstMs = 0
+            let t0 = DispatchTime.now().uptimeNanoseconds
+
+            if referenceFrame == nil {
+                guard frame.width > 8, frame.height > options.minOverlap,
+                      let prepared = TileMotionEstimator.PreparedFrame(
+                          cgImage: frame, downsample: options.estimatorOptions.downsample),
+                      let initialRGBA = prepared.rgbaBand(yStart: 0, height: prepared.height) else {
+                    lastPrepMs = Int((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
+                    return .skipped
                 }
-                seams.append(SeamInfo(
+                lastPrepMs = Int((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
+                canvasWidth = prepared.width
+                canvasHeight = prepared.height
+                viewportHeight = prepared.height
+                viewportPosition = 0
+                maxViewportPosition = 0
+                contributingFrameCount = 1
+                firstFrameImage = frame
+                canvasPixels = Data(capacity: initialRGBA.count * 3)
+                canvasPixels.append(initialRGBA)
+                referenceFrame = prepared
+                referenceMode = .previousFrame
+                cachedCanvasWindowPos = nil
+                cachedCanvasWindowFrame = nil
+                seams = [SeamInfo(
                     frameIndex: 0, overlapRows: 0,
-                    contributedRows: buffer.height, offsetY: 0))
-                offsets.append(0)
-                // runningY 语义：当前帧第 0 行在输出中的偏移（帧 0 = 0）
-                runningY = 0
-                continue
+                    contributedRows: prepared.height, offsetY: 0)]
+                return .firstFrame
             }
 
-            // tile-NCC 位移优先（SnowShot 同思想,病例「卡片页拼不出长图」：
-            // 行签名对局部滚动的结构性误判在 stitch 阶段同样存在——逐对帧
-            // 重叠检测先行 tile 估计,可信则直接折算 overlap,失败回落行签名）
-            // tile-NCC 粗位移 → findOverlap 精搜（±32 行窗口,步长 1）：
-            // 粗定位毫秒级 + 精修像素级,精度与性能兼得（初版「tile 直接折算
-            // overlap」卡死病例的修正——全量 NCC 已裁剪,精修窗口替代折算）
-            let tileHint: Int? = {
-                guard let est = TileMotionEstimator.estimateShift(
-                    ref: frames[index - 1], cur: frames[index]),
-                    est.confidence >= 0.30, est.texturedTiles >= 6, est.dy < -2
-                else { return nil }
-                // dy（降采样,Y-down,负=页面下滚）→ 对齐参数 d：cur 第 0 行
-                // 对齐 prev 第 d 行;页面下滚 |dy|px=cur 顶 =prev 往下 d=|dy|×ds 行
-                return Int(-Double(est.dy) * Double(TileMotionEstimator.Estimate.downsample))
-            }()
-            let (overlap, _) = try findOverlap(
-                prev: buffers[index - 1], cur: buffer,
-                options: options, frameIndex: index, hintD: tileHint)
-            let contributed = buffer.height - overlap
-            // cur 第 0 行在输出中的位置 = prev 第 0 行位置 + prev 高度 - 重叠
-            runningY += buffers[index - 1].height - overlap
-            seams.append(SeamInfo(
-                frameIndex: index, overlapRows: overlap,
-                contributedRows: contributed, offsetY: runningY))
-            offsets.append(runningY)
+            guard let rawRef = referenceFrame,
+                  frame.width == canvasWidth,
+                  frame.height > options.minOverlap,
+                  let cur = TileMotionEstimator.PreparedFrame(
+                      cgImage: frame, downsample: options.estimatorOptions.downsample) else {
+                lastPrepMs = Int((DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
+                return .skipped
+            }
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            lastPrepMs = Int((t1 - t0) / 1_000_000)
+
+            // C memcmp 精确静止快判（始终对比最近原始帧，8MB < 0.4ms）+ 采样近静止快判
+            if rawRef.height == cur.height && (rawRef.fullGray == cur.fullGray || Self.fastFramesIdentical(ref: rawRef, cur: cur)) {
+                lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+                return .staticFrame
+            }
+
+            // 回滚进入已拼区域后，优先用 CanvasWindow 与当前帧直接对齐以消除来回滚动累计漂移；
+            // 若 CanvasWindow 未命中（如大幅越过边界或顶底栏占比较高），自动回退到 rawRef 兜底。
+            var estimate: TileMotionEstimator.Estimate?
+            var matchedRefHeight = rawRef.height
+            if referenceMode == .canvasWindow,
+               let canvasRef = loadCanvasWindowReference(height: cur.height),
+               let canvasEst = TileMotionEstimator.estimateShift(
+                   ref: canvasRef, cur: cur, options: options.estimatorOptions) {
+                if case .motion = canvasEst.outcome {
+                    estimate = canvasEst
+                    matchedRefHeight = canvasRef.height
+                }
+            }
+            if estimate == nil {
+                estimate = TileMotionEstimator.estimateShift(
+                    ref: rawRef, cur: cur, options: options.estimatorOptions)
+                matchedRefHeight = rawRef.height
+            }
+
+            guard let estimate else {
+                lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+                return .skipped
+            }
+            lastEstimate = estimate
+            lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+
+            switch estimate.outcome {
+            case .noMotion:
+                return .staticFrame
+            case .indeterminate:
+                return .skipped
+            case .motion(let dy):
+                guard dy != 0 else { return .staticFrame }
+                let minH = min(matchedRefHeight, cur.height)
+                let overlap = minH - abs(dy)
+                guard overlap >= options.minOverlap else {
+                    return .skipped
+                }
+
+                let curH = cur.height
+                let rowBytes = canvasWidth * 4
+                let candidate = viewportPosition - dy
+
+                // 检测相邻原始帧的静态顶栏/底栏带（必须用 rawRef 与 cur 比较，才能检出固定顶底栏）
+                let (staticTop, staticBottom) = rawRef.height == cur.height
+                    ? Self.detectStaticVerticalBands(ref: rawRef, cur: cur)
+                    : (0, 0)
+
+                if candidate + curH > canvasHeight {
+                    // 向下扩展画布（Append）
+                    let growth = (candidate + curH) - canvasHeight
+                    guard growth > 0, growth < curH else { return .skipped }
+                    let desiredBand = max(curH / 2, max(curH / 4 + growth, growth + staticBottom))
+                    let maxCleanBand = max(growth, curH - staticTop)
+                    let band = min(curH, min(desiredBand, maxCleanBand))
+                    let bandOverlap = band - growth
+                    guard bandOverlap >= 0, bandOverlap <= canvasHeight else { return .skipped }
+
+                    let oldEnd = canvasHeight - bandOverlap
+                    let incomingStart = curH - band
+                    guard let bandRGBA = cur.rgbaBand(yStart: incomingStart, height: band) else {
+                        return .skipped
+                    }
+                    if bandOverlap > 0 {
+                        canvasPixels.removeLast(bandOverlap * rowBytes)
+                    }
+                    canvasPixels.append(bandRGBA)
+                    canvasHeight = oldEnd + band
+                    viewportPosition = candidate
+                    maxViewportPosition = max(maxViewportPosition, candidate)
+                    referenceFrame = cur
+                    referenceMode = .previousFrame
+                    cachedCanvasWindowPos = nil
+                    cachedCanvasWindowFrame = nil
+                    contributingFrameCount += 1
+
+                    let seamOverlap = curH - growth
+                    seams.append(SeamInfo(
+                        frameIndex: seams.count,
+                        overlapRows: seamOverlap,
+                        contributedRows: growth,
+                        offsetY: candidate
+                    ))
+                    return .appended(growthRows: growth, totalHeight: canvasHeight)
+                } else if candidate >= 0 {
+                    // 在已合成画布范围内回弹/回滚（Contained）：不破坏画布，切到 CanvasWindow 参考模式防漂移
+                    viewportPosition = candidate
+                    referenceFrame = cur
+                    referenceMode = .canvasWindow
+                    return .contained(positionY: candidate, totalHeight: canvasHeight)
+                } else {
+                    // 向上超出画布顶部（Prepend）
+                    let growth = -candidate
+                    guard growth > 0, growth < curH else { return .skipped }
+                    let desiredBand = max(curH / 2, max(curH / 4 + growth, growth + staticTop))
+                    let maxCleanBand = max(growth, curH - staticBottom)
+                    let band = min(curH, min(desiredBand, maxCleanBand))
+                    let oldStart = band - growth
+                    guard oldStart >= 0, oldStart <= canvasHeight else { return .skipped }
+                    guard let bandRGBA = cur.rgbaBand(yStart: 0, height: band) else {
+                        return .skipped
+                    }
+
+                    var nextCanvas = Data(capacity: (canvasHeight + growth) * rowBytes)
+                    nextCanvas.append(bandRGBA)
+                    nextCanvas.append(canvasPixels[(oldStart * rowBytes)..<(canvasHeight * rowBytes)])
+                    canvasPixels = nextCanvas
+                    canvasHeight += growth
+                    viewportPosition = 0
+                    maxViewportPosition += growth
+                    referenceFrame = cur
+                    referenceMode = .previousFrame
+                    cachedCanvasWindowPos = nil
+                    cachedCanvasWindowFrame = nil
+                    contributingFrameCount += 1
+
+                    seams = seams.map { seam in
+                        SeamInfo(
+                            frameIndex: seam.frameIndex + 1,
+                            overlapRows: seam.overlapRows,
+                            contributedRows: seam.contributedRows,
+                            offsetY: seam.offsetY + growth
+                        )
+                    }
+                    seams.insert(SeamInfo(
+                        frameIndex: 0,
+                        overlapRows: curH - growth,
+                        contributedRows: growth,
+                        offsetY: 0
+                    ), at: 0)
+                    return .prepended(growthRows: growth, totalHeight: canvasHeight)
+                }
+            }
         }
 
-        // 总高 = 最后一帧第 0 行位置 + 最后一帧高度
-        let totalHeight = runningY + buffers[buffers.count - 1].height
-        let image = try compose(frames: frames, offsets: offsets,
-                                totalHeight: totalHeight, width: frames[0].width)
-        return Result(image: image, seams: seams)
-    }
-
-    // MARK: - 重叠检测
-
-    /// 在 prev / cur 之间寻找最大可信垂直重叠。
-    /// 返回 `(overlap, d)`：cur 的第 i 行对齐 prev 的第 d+i 行，overlap = prevH - d。
-    /// 线程语义：纯函数，任意线程可调用。
-    static func findOverlap(
-        prev: PixelBuffer, cur: PixelBuffer, options: Options, frameIndex: Int,
-        hintD: Int? = nil
-    ) throws -> (overlap: Int, d: Int) {
-        guard prev.height > options.minOverlap, cur.height > options.minOverlap else {
-            throw StitcherError.frameTooSmall(
-                frameIndex: frameIndex, height: min(prev.height, cur.height),
-                minOverlap: options.minOverlap)
+        /// 将增量画布毫秒级导出为 CGImage。
+        func finish() throws -> Result {
+            guard canvasWidth > 0, canvasHeight > 0, !canvasPixels.isEmpty else {
+                throw StitcherError.noFrames
+            }
+            if contributingFrameCount == 1, let single = firstFrameImage,
+               single.width == canvasWidth, single.height == canvasHeight {
+                return Result(image: single, seams: seams)
+            }
+            let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+            guard let ctx = CGContext(
+                data: nil,
+                width: canvasWidth,
+                height: canvasHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: canvasWidth * 4,
+                space: space,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            ), let ptr = ctx.data else {
+                throw StitcherError.renderFailed("CGContext 创建失败（\(canvasWidth)x\(canvasHeight)）")
+            }
+            canvasPixels.withUnsafeBytes { src in
+                if let base = src.baseAddress {
+                    memcpy(ptr, base, canvasPixels.count)
+                }
+            }
+            guard let image = ctx.makeImage() else {
+                throw StitcherError.renderFailed("makeImage 失败")
+            }
+            return Result(image: image, seams: seams)
         }
-        // cur 必须至少净贡献 1 行，否则会死循环拼接静止画面
-        let maxOverlap = min(prev.height, cur.height) - 1
-        guard maxOverlap >= options.minOverlap else {
-            throw StitcherError.noOverlapFound(frameIndex: frameIndex)
+
+        // MARK: - 静态带检测与快判
+
+        private static func fastFramesIdentical(
+            ref: TileMotionEstimator.PreparedFrame,
+            cur: TileMotionEstimator.PreparedFrame
+        ) -> Bool {
+            let w = ref.width
+            let h = ref.height
+            let stepY = max(1, h / 32)
+            let stepX = max(1, w / 32)
+            var sum = 0
+            var count = 0
+            var maxDiff = 0
+            ref.fullGray.withUnsafeBytes { rRaw in
+                cur.fullGray.withUnsafeBytes { cRaw in
+                    guard let rPtr = rRaw.bindMemory(to: UInt8.self).baseAddress,
+                          let cPtr = cRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    var y = 0
+                    while y < h {
+                        let row = y * w
+                        var x = 0
+                        while x < w {
+                            let d = abs(Int(rPtr[row + x]) - Int(cPtr[row + x]))
+                            sum += d
+                            if d > maxDiff { maxDiff = d }
+                            count += 1
+                            x += stepX
+                        }
+                        y += stepY
+                    }
+                }
+            }
+            return count > 0 && maxDiff <= 3 && Double(sum) / Double(count) < 0.8
         }
 
-        // tile-NCC 提示窗口（性能 + 精度分工：粗位移由 tile 投票给出,此处
-        // 只在 ±32 行内步长 1 精搜;无提示时回落全量从大到小枚举）
-        if let hint = hintD {
-            let dMin = max(0, hint - 32)
-            let dMax = min(prev.height - options.minOverlap - 1, hint + 32)
-            if dMax >= dMin {
-                // 窗口内优先靠近 hint（精搜步长 1,从 hint 向两侧扩）
-                for delta in 0...max(dMax - hint, hint - dMin) {
-                    for d in [hint - delta, hint + delta] where d >= dMin && d <= dMax {
-                        let overlap = prev.height - d
-                        guard overlap >= options.minOverlap, overlap <= maxOverlap else { continue }
-                        if alignmentPasses(prev: prev, cur: cur, d: d, overlap: overlap, options: options) {
-                            return (overlap, d)
+        /// 检测相邻两帧在顶缘与底缘的静止带（如 sticky header / footer），返回像素行数上限各 ≤ 45% 帧高。
+        private static func detectStaticVerticalBands(
+            ref: TileMotionEstimator.PreparedFrame,
+            cur: TileMotionEstimator.PreparedFrame
+        ) -> (top: Int, bottom: Int) {
+            let w = ref.width
+            let h = min(ref.height, cur.height)
+            let maxBand = (h * 45) / 100
+            let stepX = max(1, w / 48)
+
+            func rowMatches(_ y: Int, rPtr: UnsafePointer<UInt8>, cPtr: UnsafePointer<UInt8>) -> Bool {
+                let row = y * w
+                var sum = 0
+                var count = 0
+                var x = 0
+                while x < w {
+                    sum += abs(Int(rPtr[row + x]) - Int(cPtr[row + x]))
+                    count += 1
+                    x += stepX
+                }
+                return count > 0 && (sum * 10) <= (count * 35) // mean diff <= 3.5
+            }
+
+            var topRows = 0
+            var bottomRows = 0
+            ref.fullGray.withUnsafeBytes { rRaw in
+                cur.fullGray.withUnsafeBytes { cRaw in
+                    guard let rPtr = rRaw.bindMemory(to: UInt8.self).baseAddress,
+                          let cPtr = cRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    for y in 0..<maxBand {
+                        if rowMatches(y, rPtr: rPtr, cPtr: cPtr) {
+                            topRows += 1
+                        } else {
+                            break
+                        }
+                    }
+                    for offset in 0..<maxBand {
+                        let y = h - 1 - offset
+                        if y <= topRows { break }
+                        if rowMatches(y, rPtr: rPtr, cPtr: cPtr) {
+                            bottomRows += 1
+                        } else {
+                            break
                         }
                     }
                 }
             }
-            // hint 精搜失败不直接判死——回落全量枚举（卡片页行签名结构性
-            // 误判的风险由 tile hint 优先规避,但 hint 落空时老链兜底比
-            // noOverlap 崩掉整个拼接强）
+            // 仅把连续 ≥ 12px 的静止带视为 sticky UI，避免单行空白边缘误触发
+            return (topRows >= 12 ? topRows : 0, bottomRows >= 12 ? bottomRows : 0)
         }
-
-        // 重叠从大到小枚举：滚动捕获场景下最大可信重叠即真实重叠
-        for overlap in stride(from: maxOverlap, through: options.minOverlap, by: -1) {
-            if Task.isCancelled { throw StitcherError.cancelled }
-            let d = prev.height - overlap
-            if alignmentPasses(prev: prev, cur: cur, d: d, overlap: overlap, options: options) {
-                return (overlap, d)
-            }
-        }
-        throw StitcherError.noOverlapFound(frameIndex: frameIndex)
     }
 
-    /// 校验对齐假设：prev 第 d+i 行 ≈ cur 第 i 行（i ∈ [0, overlap)）。
-    /// 行级容差见 `Options.rowDiffThreshold` / `maxMismatchRatio`；不匹配行超限即刻短路返回。
-    ///
-    /// 性能（病例：3840×2098 两帧候选 ~2080 个 × 全行比对 ⇒ compose 卡 10s）：
-    /// 两阶段扫描——① 粗筛探针：每 overlap/24 行抽 1 行（行签名本身已是灰度降采样，
-    /// 64 采样点/行），伪候选在 ~几行内即被否掉（绝大多数候选在此剪枝，成本 ~24 次
-    /// rowMatch）；② 细验：只对通过粗筛的候选补齐其余行，最终判据与逐行全查完全
-    /// 一致（不匹配行总数 ≤ maxMismatch），无误放行。
-    /// 线程语义：纯函数，任意线程可调用。
-    private static func alignmentPasses(
-        prev: PixelBuffer, cur: PixelBuffer, d: Int, overlap: Int, options: Options
-    ) -> Bool {
-        var mismatches = 0
-        let maxMismatch = Int(Double(overlap) * options.maxMismatchRatio)
-        let probeStride = max(1, overlap / 24)
-        // ① 粗筛探针（剪枝）
-        var row = 0
-        while row < overlap {
-            if !PixelBuffer.rowMatches(prev.signature[d + row], cur.signature[row],
-                                       threshold: options.rowDiffThreshold) {
-                mismatches += 1
-                if mismatches > maxMismatch { return false }
-            }
-            row += probeStride
-        }
-        // ② 细验：粗筛未覆盖的行（保持与全量逐行一致的判据）
-        for i in 0..<overlap where i % probeStride != 0 {
-            if !PixelBuffer.rowMatches(prev.signature[d + i], cur.signature[i],
-                                       threshold: options.rowDiffThreshold) {
-                mismatches += 1
-                if mismatches > maxMismatch { return false }
-            }
-        }
-        return true
-    }
+    // MARK: - 批量入口
 
-    // MARK: - 合成
+    /// 拼接帧序列为纵向长图（底层复用 `Stitcher.Session` 与 `TileMotionEstimator`）。
+    static func stitch(frames: [CGImage], options: Options = Options()) throws -> Result {
+        guard !frames.isEmpty else { throw StitcherError.noFrames }
 
-    /// 把各帧按 offsetY 逐段 draw 进同一张输出画布（CGContext 逐帧 draw，
-    /// 不做长图整份像素拷贝），返回最终 CGImage。
-    /// 线程语义：纯函数，任意线程可调用。
-    private static func compose(
-        frames: [CGImage], offsets: [Int], totalHeight: Int, width: Int
-    ) throws -> CGImage {
-        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
-            width: width,
-            height: totalHeight,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: space,
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ) else {
-            throw StitcherError.renderFailed("CGContext 创建失败（\(width)x\(totalHeight)）")
-        }
-        // CGContext 坐标系原点在左下：第 i 帧顶部需落在长图第 offsetY_i 行，
-        // 故绘制矩形 y = totalHeight - offsetY - frameHeight（无翻转变换，
-        // 图像内容保持正向）。
+        let expectedWidth = frames[0].width
         for (index, frame) in frames.enumerated() {
-            let y = totalHeight - offsets[index] - frame.height
-            ctx.draw(frame, in: CGRect(x: 0, y: CGFloat(y),
-                                       width: CGFloat(frame.width),
-                                       height: CGFloat(frame.height)))
+            if frame.width != expectedWidth {
+                throw StitcherError.widthMismatch(
+                    expected: expectedWidth, actual: frame.width, frameIndex: index)
+            }
+            if frame.height <= options.minOverlap {
+                throw StitcherError.frameTooSmall(
+                    frameIndex: index, height: frame.height, minOverlap: options.minOverlap)
+            }
         }
-        guard let image = ctx.makeImage() else {
-            throw StitcherError.renderFailed("makeImage 失败")
+
+        let session = Session(options: options)
+        for (index, frame) in frames.enumerated() {
+            if index % 2 == 0, Task.isCancelled { throw StitcherError.cancelled }
+            let status = session.push(frame)
+            if index == 0 {
+                guard case .firstFrame = status else {
+                    throw StitcherError.frameTooSmall(
+                        frameIndex: 0, height: frame.height, minOverlap: options.minOverlap)
+                }
+                continue
+            }
+            switch status {
+            case .appended, .prepended, .contained:
+                break
+            case .staticFrame, .skipped, .firstFrame:
+                throw StitcherError.noOverlapFound(frameIndex: index)
+            }
         }
-        return image
+        return try session.finish()
     }
 }
 
-// MARK: - 像素缓冲与行签名
+// MARK: - 像素缓冲与行签名（保留供校验工具与外部对比使用）
 
 /// 单帧的只读像素缓冲（RGBA8）+ 预计算行签名。
-///
-/// 线程语义：初始化后完全不可变，可在任意线程并发读取。
-struct PixelBuffer {
+struct PixelBuffer: Sendable {
     let width: Int
     let height: Int
     private let data: [UInt8]
@@ -311,7 +511,6 @@ struct PixelBuffer {
         self.height = h
 
         let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        // 统一转成 RGBA8（RGBX），屏蔽输入图各自的字节序 / alpha 布局差异
         guard let ctx = CGContext(
             data: nil,
             width: w,
@@ -321,10 +520,8 @@ struct PixelBuffer {
             space: space,
             bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         ) else {
-            // 极端情况（超大图分配失败）——给空缓冲，后续比对自然失败并报 noOverlap
             self.data = []
             self.signature = []
-            print("[Stitcher] PixelBuffer: CGContext 创建失败 (\(w)x\(h))")
             return
         }
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
@@ -333,7 +530,6 @@ struct PixelBuffer {
                 start: ptr.assumingMemoryBound(to: UInt8.self), count: w * h * 4))
         } else {
             self.data = []
-            print("[Stitcher] PixelBuffer: 位图数据指针为空 (\(w)x\(h))")
         }
         let pixelData = self.data
         self.signature = (0..<h).map { row in
@@ -341,13 +537,11 @@ struct PixelBuffer {
         }
     }
 
-    /// 计算第 y 行的亮度签名（77R+150G+29B 近似 BT.601 亮度）。
     private static func rowSignatureY(data: [UInt8], width: Int, y: Int, samples: Int) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: samples)
         let base = y * width * 4
         guard !data.isEmpty else { return out }
         for s in 0..<samples {
-            // 等距采样，落在像素中心
             let x = (2 * s + 1) * width / (2 * samples)
             let p = base + x * 4
             let r = UInt32(data[p])
@@ -358,8 +552,6 @@ struct PixelBuffer {
         return out
     }
 
-    /// 两行签名是否在容差内视为同一行。
-    /// 判据：采样点平均绝对亮度差 ≤ threshold（Retina 噪声 / 抗锯齿通常 < 5）。
     static func rowMatches(_ a: [UInt8], _ b: [UInt8], threshold: UInt32) -> Bool {
         guard a.count == b.count, !a.isEmpty else { return false }
         var total: UInt32 = 0

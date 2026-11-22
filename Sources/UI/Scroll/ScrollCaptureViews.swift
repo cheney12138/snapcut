@@ -3,33 +3,43 @@ import CoreGraphics
 import QuartzCore
 
 /// 滚动截图采集态视觉件（重设计 scene 06，档 1 HUD 钉暗）：
-/// - ScrollCaptureHUDPanel：贴选区下缘 8pt 的进度 HUD（呼吸点×3 + tabular 帧数 +
-///   44×3pt 进度条）；到底切确认态（OK 图标 status.ok + 「已到底 · 自动合成」）
+/// - ScrollCaptureHUDPanel：贴选区下缘 8pt 的实时状态 HUD（三点波浪呼吸 + tabular 屏数/像素高度 +
+///   状态提示，去掉无总长分母的伪进度条）；到底切确认态（OK 图标 status.ok + 「已到底 · 自动合成」）
 /// - ScrollRegionGlowView：采集区域边缘光晕（motion.pulse：opacity .35↔.70
 ///   autoreverse 1.6s）+ 到底底缘 2pt status.ok 条
 ///
 /// token 全部取自 DesignTokens（§9 场景 06 规格）。
 
-// MARK: - 采集进度 HUD（独立 NSPanel，nonactivating，档 1 钉暗）
+// MARK: - 采集状态 HUD（独立 NSPanel，nonactivating，档 1 钉暗）
 
 @MainActor
 final class ScrollCaptureHUDPanel: NSPanel {
-    private var dots: [NSView] = []
+    enum State: Equatable {
+        case waiting
+        case capturing(screens: Double, heightPx: Int)
+        case contained(screens: Double, heightPx: Int)
+        case dropped
+    }
+
+    private let dotContainer = NSView()
+    private var dotLayers: [CALayer] = []
     private let countLabel = NSTextField(labelWithString: "")
-    private let progressTrack = NSView()
-    private let progressFill = NSView()
-    /// 进度条宽度约束（只改 constant，不重建）——旧实现每次 update 都 deactivate
-    /// progressFill.constraints，把 leading/top/bottom 钉扎约束一起拆了 ⇒
-    /// fill 位置悬空、进度条看起来不动/错位
-    private var progressFillWidthConstraint: NSLayoutConstraint?
     private let okIconView = NSImageView()
     private let okLabel = NSTextField(labelWithString: "已到底 · 自动合成")
     private var capturingStack: NSStackView!
     private var okStack: NSStackView!
+    private var glassView: NSVisualEffectView!
+    private var shadowView: NSView!
+    /// 投影外扩留白（让圆角软影自然落在胶囊外，消除无影浮片感）
+    private static let shadowMargin: CGFloat = 12
+    /// 锚定选区与屏幕：宽度自适应时始终基于选区中心重算，避免动画叠加引起水平漂移
+    private var anchorSelectionGlobal: CGRect?
+    private weak var anchorScreen: NSScreen?
 
     init() {
+        let m = Self.shadowMargin
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 220, height: 28),
+            contentRect: NSRect(x: 0, y: 0, width: 220 + m * 2, height: 28 + m * 2),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -47,59 +57,78 @@ final class ScrollCaptureHUDPanel: NSPanel {
     }
 
     private func buildUI() {
-        // 玻璃容器：radius 9、padding 6/10、0.5pt stroke、inset.hi、shadow.card
+        let m = Self.shadowMargin
+        let outer = NSView()
+        outer.wantsLayer = true
+
+        // 圆角柔和投影层
+        let shadow = NSView()
+        shadow.wantsLayer = true
+        shadow.translatesAutoresizingMaskIntoConstraints = false
+        shadow.layer?.backgroundColor = NSColor.clear.cgColor
+        shadow.layer?.shadowColor = NSColor.black.cgColor
+        shadow.layer?.shadowOpacity = 0.28
+        shadow.layer?.shadowRadius = 10
+        shadow.layer?.shadowOffset = CGSize(width: 0, height: -4)
+        outer.addSubview(shadow)
+        shadowView = shadow
+
+        // 自适应玻璃容器：radius 10、maskImage 消白边 + 对称顶缘高光 + 0.5pt stroke
         let glass = DesignTokens.Mat.glass(
             material: DesignTokens.Mat.hud,
-            cornerRadius: DesignTokens.Radius.hudSmall
+            cornerRadius: DesignTokens.Radius.lg
         )
         glass.translatesAutoresizingMaskIntoConstraints = false
-        contentView = glass
-        glass.widthAnchor.constraint(greaterThanOrEqualToConstant: 80).isActive = true
+        outer.addSubview(glass)
+        glassView = glass
+        contentView = outer
 
-        // 采集态：呼吸点×3 + 帧数（tabular-nums）+ 44×3pt 进度条
-        for _ in 0..<3 {
-            let dot = NSView()
-            dot.wantsLayer = true
-            dot.layer?.backgroundColor = DesignTokens.accent.cgColor
-            dot.layer?.cornerRadius = DesignTokens.Scroll.breathingDotSide / 2
-            dot.translatesAutoresizingMaskIntoConstraints = false
-            dot.widthAnchor.constraint(equalToConstant: DesignTokens.Scroll.breathingDotSide).isActive = true
-            dot.heightAnchor.constraint(equalToConstant: DesignTokens.Scroll.breathingDotSide).isActive = true
-            installBreathingAnimation(on: dot)
-            dots.append(dot)
-        }
-        countLabel.attributedStringValue = Self.framesText(0)
-        countLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        progressTrack.wantsLayer = true
-        progressTrack.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
-        progressTrack.layer?.cornerRadius = DesignTokens.Scroll.progressSize.height / 2
-        progressTrack.translatesAutoresizingMaskIntoConstraints = false
-        progressTrack.widthAnchor.constraint(equalToConstant: DesignTokens.Scroll.progressSize.width).isActive = true
-        progressTrack.heightAnchor.constraint(equalToConstant: DesignTokens.Scroll.progressSize.height).isActive = true
-
-        progressFill.wantsLayer = true
-        progressFill.layer?.backgroundColor = DesignTokens.accent.cgColor
-        progressFill.layer?.cornerRadius = DesignTokens.Scroll.progressSize.height / 2
-        progressFill.translatesAutoresizingMaskIntoConstraints = false
-        progressTrack.addSubview(progressFill)
-        let fillWidth = progressFill.widthAnchor.constraint(equalToConstant: 0)
-        progressFillWidthConstraint = fillWidth
         NSLayoutConstraint.activate([
-            progressFill.leadingAnchor.constraint(equalTo: progressTrack.leadingAnchor),
-            progressFill.topAnchor.constraint(equalTo: progressTrack.topAnchor),
-            progressFill.bottomAnchor.constraint(equalTo: progressTrack.bottomAnchor),
-            fillWidth,
+            glass.leadingAnchor.constraint(equalTo: outer.leadingAnchor, constant: m),
+            glass.trailingAnchor.constraint(equalTo: outer.trailingAnchor, constant: -m),
+            glass.topAnchor.constraint(equalTo: outer.topAnchor, constant: m),
+            glass.bottomAnchor.constraint(equalTo: outer.bottomAnchor, constant: -m),
+            glass.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            shadow.leadingAnchor.constraint(equalTo: glass.leadingAnchor),
+            shadow.trailingAnchor.constraint(equalTo: glass.trailingAnchor),
+            shadow.topAnchor.constraint(equalTo: glass.topAnchor),
+            shadow.bottomAnchor.constraint(equalTo: glass.bottomAnchor),
         ])
 
-        capturingStack = NSStackView(views: dots + [countLabel, progressTrack])
+        // 采集态：三颗 Q 弹波浪跳动点（独立 CALayer 居中锚点，支持挤压拉伸 + 回弹）+ 等宽状态读数
+        let dotSide: CGFloat = 5
+        let dotSpacing: CGFloat = 9
+        let containerW: CGFloat = 27
+        let containerH: CGFloat = 14
+        dotContainer.wantsLayer = true
+        dotContainer.layer?.masksToBounds = false
+        dotContainer.translatesAutoresizingMaskIntoConstraints = false
+        dotContainer.widthAnchor.constraint(equalToConstant: containerW).isActive = true
+        dotContainer.heightAnchor.constraint(equalToConstant: containerH).isActive = true
+
+        for i in 0..<3 {
+            let dot = CALayer()
+            dot.bounds = CGRect(x: 0, y: 0, width: dotSide, height: dotSide)
+            dot.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+            dot.position = CGPoint(x: 4.5 + CGFloat(i) * dotSpacing, y: 5.5)
+            dot.backgroundColor = DesignTokens.accent.cgColor
+            dot.cornerRadius = dotSide / 2
+            dotContainer.layer?.addSublayer(dot)
+            installJellyBounceAnimation(on: dot, delay: CFTimeInterval(i) * 0.14)
+            dotLayers.append(dot)
+        }
+
+        countLabel.attributedStringValue = Self.hintText("等待滚动… · Enter 结束")
+        countLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        capturingStack = NSStackView(views: [dotContainer, countLabel])
         capturingStack.orientation = .horizontal
         capturingStack.alignment = .centerY
         capturingStack.spacing = DesignTokens.Spacing.s2
         capturingStack.translatesAutoresizingMaskIntoConstraints = false
         glass.addSubview(capturingStack)
 
-        // 到底确认态：OK 图标（status.ok）+「已到底 · 自动合成」
+        // 到底/到顶确认态：OK 图标（status.ok）+ 文案
         okIconView.image = NSImage(systemSymbolName: "checkmark.circle.fill",
                                    accessibilityDescription: "已到底")?
             .withSymbolConfiguration(.init(pointSize: 13, weight: .medium))
@@ -129,57 +158,131 @@ final class ScrollCaptureHUDPanel: NSPanel {
         ])
     }
 
-    /// 呼吸点：opacity .35↔1 的 1.2s pulse，三点依次延迟 0.2s（scene 06 .s6-spin；
-    /// 审查：.22↔1 满幅闪烁 → .35↔1 呼吸）
-    private func installBreathingAnimation(on view: NSView) {
-        let anim = CABasicAnimation(keyPath: "opacity")
-        anim.fromValue = DesignTokens.Scroll.breathingAlphaMin
-        anim.toValue = 1.0
-        anim.duration = 1.2
-        anim.autoreverses = true
-        anim.repeatCount = .infinity
-        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        view.layer?.opacity = DesignTokens.Scroll.breathingAlphaMin
-        view.layer?.add(anim, forKey: "breathing")
+    /// Q 弹果冻波浪动效：蓄力压扁 → 轻盈弹起拉长 → 落地回弹微震（三点错峰 0.14s 接力；reduceMotion 降级为温和呼吸）
+    private func installJellyBounceAnimation(on layer: CALayer, delay: CFTimeInterval) {
+        if DesignTokens.Motion.reduceMotion {
+            let breath = CABasicAnimation(keyPath: "opacity")
+            breath.fromValue = 0.45
+            breath.toValue = 1.0
+            breath.duration = 0.9
+            breath.autoreverses = true
+            breath.repeatCount = .infinity
+            breath.beginTime = CACurrentMediaTime() + delay
+            layer.opacity = 0.45
+            layer.add(breath, forKey: "jellyBounce")
+            return
+        }
+        let keyTimes: [NSNumber] = [0.0, 0.08, 0.28, 0.48, 0.62, 0.74, 1.0]
+        let timingFunctions: [CAMediaTimingFunction] = [
+            CAMediaTimingFunction(name: .easeIn),
+            CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0),
+            CAMediaTimingFunction(controlPoints: 0.55, 0.0, 0.85, 0.6),
+            CAMediaTimingFunction(name: .easeOut),
+            CAMediaTimingFunction(name: .easeInEaseOut),
+            CAMediaTimingFunction(name: .linear),
+        ]
+
+        let bounceY = CAKeyframeAnimation(keyPath: "transform.translation.y")
+        bounceY.values = [0.0, -0.7, 5.0, -1.0, 0.7, 0.0, 0.0]
+        bounceY.keyTimes = keyTimes
+        bounceY.timingFunctions = timingFunctions
+
+        let scaleX = CAKeyframeAnimation(keyPath: "transform.scale.x")
+        scaleX.values = [1.0, 1.24, 0.82, 1.26, 0.92, 1.0, 1.0]
+        scaleX.keyTimes = keyTimes
+        scaleX.timingFunctions = timingFunctions
+
+        let scaleY = CAKeyframeAnimation(keyPath: "transform.scale.y")
+        scaleY.values = [1.0, 0.76, 1.24, 0.76, 1.08, 1.0, 1.0]
+        scaleY.keyTimes = keyTimes
+        scaleY.timingFunctions = timingFunctions
+
+        let opacity = CAKeyframeAnimation(keyPath: "opacity")
+        opacity.values = [0.55, 0.85, 1.0, 0.92, 0.68, 0.55, 0.55]
+        opacity.keyTimes = keyTimes
+
+        let group = CAAnimationGroup()
+        group.animations = [bounceY, scaleX, scaleY, opacity]
+        group.duration = 1.15
+        group.beginTime = CACurrentMediaTime() + delay
+        group.repeatCount = .infinity
+        group.isRemovedOnCompletion = false
+        layer.opacity = 0.55
+        layer.add(group, forKey: "jellyBounce")
     }
 
-    private static func framesText(_ n: Int) -> NSAttributedString {
-        // t.caption + tabular-nums（等宽数字）
-        NSAttributedString(string: "已采集 \(n) 帧", attributes: [
+    /// 每次有新帧净增拼接时，给三颗点一次轻巧的 Q 弹缩放反馈
+    func pulseOnGrowth() {
+        for (i, dot) in dotLayers.enumerated() {
+            let pop = CAKeyframeAnimation(keyPath: "transform.scale")
+            pop.values = [1.0, 1.32, 0.90, 1.06, 1.0]
+            pop.keyTimes = [0.0, 0.25, 0.58, 0.82, 1.0]
+            pop.duration = 0.28
+            pop.beginTime = CACurrentMediaTime() + CFTimeInterval(i) * 0.035
+            pop.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            dot.add(pop, forKey: "growthPop")
+        }
+    }
+
+    private static func capturingText(screens: Double, heightPx: Int) -> NSAttributedString {
+        let screenStr = String(format: "%.1f", max(1.0, screens))
+        let text = "已拼接 \(screenStr) 屏 · \(heightPx) px · Enter 完成"
+        return NSAttributedString(string: text, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
             .foregroundColor: DesignTokens.label1,
         ])
     }
 
+    private static func containedText(screens: Double) -> NSAttributedString {
+        let screenStr = String(format: "%.1f", max(1.0, screens))
+        let text = "已在已采集区 · \(screenStr) 屏 · Enter 完成"
+        return NSAttributedString(string: text, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.78),
+        ])
+    }
+
     // MARK: - 状态更新
 
-    /// HUD 状态语义（用户 2026-11-16：「没理解 HUD 表达的是什么」）：
-    /// - waiting：等待首次滚动（刚进入，还没净贡献帧）
-    /// - capturing(n)：采集中——已入列 n 帧（净贡献帧，非采样数）
-    /// - fastScroll(hint)：滚动过快提示（帧被丢弃，请放慢）——短暂显示后回落
     private var lastStateKind: String = ""
 
-    func update(frames: Int, progress: CGFloat, droppedHint: Bool = false) {
-        let kind = frames <= 0 ? "waiting" : (droppedHint ? "dropped" : "capturing")
+    func update(state: State) {
+        let kind: String
+        switch state {
+        case .waiting:
+            kind = "waiting"
+            countLabel.attributedStringValue = Self.hintText("等待滚动… · Enter 结束")
+            setDotsColor(DesignTokens.accent)
+        case .capturing(let screens, let heightPx):
+            kind = "capturing"
+            countLabel.attributedStringValue = Self.capturingText(screens: screens, heightPx: heightPx)
+            setDotsColor(DesignTokens.accent)
+        case .contained(let screens, _):
+            kind = "contained"
+            countLabel.attributedStringValue = Self.containedText(screens: screens)
+            setDotsColor(DesignTokens.statusOK)
+        case .dropped:
+            kind = "dropped"
+            countLabel.attributedStringValue = Self.hintText("滚动过快，请放慢")
+            setDotsColor(DesignTokens.statusWarn)
+        }
         let stateChanged = kind != lastStateKind
         lastStateKind = kind
-        if frames <= 0 {
-            countLabel.attributedStringValue = Self.hintText("等待滚动…")
-        } else if droppedHint {
-            countLabel.attributedStringValue = Self.hintText("滚动过快，帧丢失")
-        } else {
-            countLabel.attributedStringValue = Self.framesText(frames)
-        }
-        // 帧内进度条：只改宽度约束 constant（钉扎约束保持不动）
-        progressFillWidthConstraint?.constant =
-            DesignTokens.Scroll.progressSize.width * min(max(progress, 0), 1)
         contentView?.layoutSubtreeIfNeeded()
         if stateChanged {
-            // 三态切换 crossfade（motion.crossfade 0.15s ease-out）：等待/采集/过快
-            // 不再瞬跳，像一块连续的东西
             crossfade(capturingStack)
         }
-        adjustWindowSize()
+        adjustWindowSize(animated: stateChanged)
+    }
+
+    private func setDotsColor(_ color: NSColor) {
+        let cg = color.cgColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for dot in dotLayers {
+            dot.backgroundColor = cg
+        }
+        CATransaction.commit()
     }
 
     /// motion.crossfade：内容态切换 0.15s 透明度过渡（新内容淡入）
@@ -199,8 +302,9 @@ final class ScrollCaptureHUDPanel: NSPanel {
         ])
     }
 
-    /// 到底：切确认态（呼吸点/帧数/进度条 crossfade 出、OK 态 crossfade 入）
-    func setBottomState() {
+    /// 到底/到顶：切确认态（呼吸点/帧数 crossfade 出、OK 态 crossfade 入）
+    func setBottomState(isTop: Bool = false) {
+        okLabel.stringValue = isTop ? "已到顶 · 自动合成" : "已到底 · 自动合成"
         guard okStack.isHidden else { return }   // 已在确认态，幂等
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = DesignTokens.Motion.crossfadeDuration
@@ -231,47 +335,69 @@ final class ScrollCaptureHUDPanel: NSPanel {
         adjustWindowSize()
     }
 
-    /// HUD 贴选区下缘 8pt 居中（§9：贴选区下缘 8pt）
+    /// HUD 贴选区下缘 8pt 居中（§9：贴选区下缘 8pt，窗体含四周 shadowMargin）
     func reposition(below selectionGlobal: CGRect, on screen: NSScreen) {
-        let size = contentView?.fittingSize ?? frame.size
+        anchorSelectionGlobal = selectionGlobal
+        anchorScreen = screen
+        glassView.layoutSubtreeIfNeeded()
+        let pillSize = glassView.fittingSize
+        setFrame(targetFrame(forPillSize: pillSize, below: selectionGlobal, on: screen), display: true)
+        updateShadowPath(forPillSize: pillSize)
+    }
+
+    private func updateShadowPath(forPillSize pillSize: NSSize) {
+        let w = max(pillSize.width, 120)
+        let h = pillSize.height
+        shadowView.layer?.shadowPath = CGPath(
+            roundedRect: CGRect(x: 0, y: 0, width: w, height: h),
+            cornerWidth: DesignTokens.Radius.lg,
+            cornerHeight: DesignTokens.Radius.lg,
+            transform: nil
+        )
+    }
+
+    private func targetFrame(forPillSize size: NSSize, below selectionGlobal: CGRect, on screen: NSScreen) -> NSRect {
+        let m = Self.shadowMargin
+        let width = max(size.width, 120)
+        let height = size.height
         let visible = screen.visibleFrame
         var origin = CGPoint(
-            x: selectionGlobal.midX - size.width / 2,
-            y: selectionGlobal.minY - size.height - DesignTokens.Scroll.hudOffsetFromSelection
+            x: selectionGlobal.midX - width / 2,
+            y: selectionGlobal.minY - height - DesignTokens.Scroll.hudOffsetFromSelection
         )
         // 放不下（贴屏底）翻到选区上方；再夹回可视区
         if origin.y < visible.minY + 4 {
             origin.y = selectionGlobal.maxY + DesignTokens.Scroll.hudOffsetFromSelection
         }
-        origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
-        origin.y = min(max(origin.y, visible.minY + 4), visible.maxY - size.height - 4)
-        setFrameOrigin(origin)
+        origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - width - 8)
+        origin.y = min(max(origin.y, visible.minY + 4), visible.maxY - height - 4)
+        return NSRect(x: origin.x - m, y: origin.y - m, width: width + m * 2, height: height + m * 2)
     }
 
     func show(below selectionGlobal: CGRect, on screen: NSScreen) {
+        anchorSelectionGlobal = selectionGlobal
+        anchorScreen = screen
         contentView?.layoutSubtreeIfNeeded()
-        adjustWindowSize()
         reposition(below: selectionGlobal, on: screen)
-        // 入场：fade + rise 6pt（0.2s spring，与 toast 同语言；原仅 fade）
         let finalFrame = frame
-        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - 6))
+        let reduce = DesignTokens.Motion.reduceMotion
+        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - (reduce ? 0 : 6)))
         alphaValue = 0
         orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
-            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
-            self.animator().setFrame(finalFrame, display: true)
+            ctx.duration = DesignTokens.Motion.enterDuration
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            if !reduce { self.animator().setFrame(finalFrame, display: true) }
             self.animator().alphaValue = 1
         }
     }
 
-    /// 退场：fade 0.12s 后 orderOut（原 orderOut 直切；completion 强持有 self——
-    /// 调用方同步置 nil 也不会让窗口在动画中途被释放）
+    /// 退场：fade 0.14s strong ease-out（杜绝 ease-in）
     func hide() {
         guard isVisible else { return }
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.12
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            ctx.duration = DesignTokens.Motion.exitDuration
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
             self.animator().alphaValue = 0
         }, completionHandler: {
             self.orderOut(nil)
@@ -279,26 +405,36 @@ final class ScrollCaptureHUDPanel: NSPanel {
         })
     }
 
-    /// 内容自适应窗口尺寸（栈 fitting + padding）；宽度变化走 0.2s spring
-    /// （审查：三态内容宽度跳变 → spring 平滑）
-    private func adjustWindowSize() {
-        guard let glass = contentView else { return }
-        glass.layoutSubtreeIfNeeded()
-        let size = glass.fittingSize
-        let width = max(size.width, 80)
-        let height = size.height
-        var frame = self.frame
-        frame.origin.x += (frame.width - width) / 2
-        frame.origin.y += frame.height - height
-        frame.size = NSSize(width: width, height: height)
-        guard frame.size != self.frame.size else {
-            setFrameOrigin(frame.origin)
+    /// 内容自适应窗口尺寸（栈 fitting + padding），始终基于锚定选区居中，杜绝宽度微抖与水平漂移
+    private func adjustWindowSize(animated: Bool = true) {
+        glassView.layoutSubtreeIfNeeded()
+        let size = glassView.fittingSize
+        let nextFrame: NSRect
+        if let sel = anchorSelectionGlobal, let screen = anchorScreen {
+            nextFrame = targetFrame(forPillSize: size, below: sel, on: screen)
+        } else {
+            let m = Self.shadowMargin
+            let width = max(size.width, 120) + m * 2
+            let height = size.height + m * 2
+            var f = self.frame
+            f.origin.x += (f.width - width) / 2
+            f.origin.y += f.height - height
+            f.size = NSSize(width: width, height: height)
+            nextFrame = f
+        }
+        updateShadowPath(forPillSize: size)
+        let widthDelta = abs(nextFrame.width - self.frame.width)
+        let heightDelta = abs(nextFrame.height - self.frame.height)
+        guard widthDelta >= 1 || heightDelta >= 1 else { return }
+        // 数字位数小幅变化不走弹跳，状态切换且变化显著时才柔和过渡
+        guard animated && widthDelta > 6 && !DesignTokens.Motion.reduceMotion else {
+            setFrame(nextFrame, display: true)
             return
         }
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
-            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
-            self.animator().setFrame(frame, display: true)
+            ctx.duration = 0.18
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            self.animator().setFrame(nextFrame, display: true)
         }
     }
 }

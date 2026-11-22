@@ -10,10 +10,16 @@ import CoreGraphics
 /// - 权限引导**前置**：首启即引导，未授权不唤起截图（门禁语义）。
 @MainActor
 enum TCCPermission {
+    /// macOS 进程一旦获得屏幕录制权限，运行期间不会在无重启的情况下撤销；
+    /// 缓存 granted=true 可消除每次按 F1 时 2 次同步 TCCAccessRequest() IPC 开销。
+    private static var cachedGranted = false
+
     /// 启动时调用：**只查不弹**。
     @discardableResult
     static func preflight() -> Bool {
+        if cachedGranted { return true }
         let granted = CGPreflightScreenCaptureAccess()
+        if granted { cachedGranted = true }
         Log.event(.permission, "permission.preflight", ["granted": "\(granted)"])
         return granted
     }

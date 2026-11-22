@@ -1,6 +1,16 @@
 import AppKit
 import CoreGraphics
 
+/// 可传递的编辑会话导出快照（供上层在会话结束后持久化可重编矢量层与原始底图）
+struct EditableExportSnapshot: Sendable {
+    let baseImage: CGImage
+    let canvasSize: CGSize
+    let annotations: [AnnotationModel]
+    let strokeWidth: CGFloat
+    let sourceApp: String?
+    let windowTitle: String?
+}
+
 /// 编辑会话：选区冻结后的标注编辑状态（v0.3 功能 + 工具栏）
 ///
 /// 关键设计（需求「截图时隐藏工具栏/工具栏不入截图」的实现基础）：
@@ -46,17 +56,31 @@ final class EditorSession {
     private(set) var scale: CGFloat
     private(set) var selectionGlobal: CGRect
     let screen: NSScreen
+    /// 边缘主色缓存（双层 Optional 区分「尚未计算」与「已算但返回 nil」）
+    private var cachedEdgeColor: RGBAColor??
 
     /// 选区调整（拖手柄 / 方向键）：换底图 + 平移既有标注，保证标注钉在图像上
     func applySelectionChange(newSelection: CGRect, newBase: CGImage, annotationOffset: CGSize) {
         store.offsetAll(dx: annotationOffset.width, dy: annotationOffset.height)
         baseImage = newBase
+        cachedEdgeColor = nil
         selectionGlobal = newSelection
         scale = CGFloat(newBase.width) / max(1, newSelection.width)
         Log.event(.editor, "editor.selection.change", [
             "pxW": "\(newBase.width)", "pxH": "\(newBase.height)",
             "ptW": "\(Int(newSelection.width))", "ptH": "\(Int(newSelection.height))",
         ])
+    }
+
+    /// 独立外源图视口缩放/平移（无冻结桌面）：底图像素不变，按新展示矩形更新 scale 并同步缩放既有标注
+    func applyViewportTransform(newSelection: CGRect) {
+        let oldWidth = max(1, selectionGlobal.width)
+        let ratio = newSelection.width / oldWidth
+        if abs(ratio - 1) > 0.0001 {
+            store.scaleAll(by: ratio)
+        }
+        selectionGlobal = newSelection
+        scale = CGFloat(baseImage.width) / max(1, newSelection.width)
     }
 
     let store = AnnotationStore()
@@ -70,6 +94,9 @@ final class EditorSession {
     /// 真相源在 session：浮动字号面板（OverlayWindow）与未来的工具栏控件都读写它
     var textFontSize: Int = 14
 
+    /// 克制画框美化样式（每次新会话默认 enabled == false，保留上次色板/边距/比例/均衡偏好）
+    var backdropStyle: BackdropStyle = BackdropStyle.loadSavedPreference()
+
     init(baseImage: CGImage, scale: CGFloat, selectionGlobal: CGRect, screen: NSScreen) {
         self.baseImage = baseImage
         self.scale = scale
@@ -77,9 +104,59 @@ final class EditorSession {
         self.screen = screen
     }
 
+    // MARK: - 画框美化
+
+    func backdropEdgeColor() -> RGBAColor? {
+        if let cached = cachedEdgeColor { return cached }
+        let detected = CGRenderer.detectEdgeColor(of: baseImage)
+        cachedEdgeColor = .some(detected)
+        return detected
+    }
+
+    func currentBackdropLayout(for selectionSize: CGSize) -> BackdropLayout? {
+        guard backdropStyle.enabled else { return nil }
+        let edgeColor = backdropStyle.autoBalance ? backdropEdgeColor() : nil
+        let inset = CGRenderer.effectiveBalanceInset(
+            for: backdropStyle,
+            imagePointSize: selectionSize,
+            edgeColor: edgeColor
+        )
+        return backdropStyle.layout(for: selectionSize, balanceInset: inset)
+    }
+
+    // MARK: - 恢复与快照
+
+    /// 从历史/Toast 恢复矢量标注，按当前画布与保存时画布宽度比例精确缩放并重建撤销栈
+    func restoreAnnotations(_ annotations: [AnnotationModel], savedCanvasSize: CGSize?) {
+        let scaled: [AnnotationModel]
+        if let savedCanvasSize, savedCanvasSize.width > 1 {
+            let ratio = selectionGlobal.width / savedCanvasSize.width
+            if ratio > 0, abs(ratio - 1) > 0.0001 {
+                scaled = annotations.map { $0.scaled(by: ratio) }
+            } else {
+                scaled = annotations
+            }
+        } else {
+            scaled = annotations
+        }
+        store.restore(annotations: scaled)
+    }
+
+    /// 导出当前编辑会话快照（在 end() 销毁 editorSession 之前调用）
+    func makeExportSnapshot(sourceApp: String?, windowTitle: String?) -> EditableExportSnapshot {
+        EditableExportSnapshot(
+            baseImage: baseImage,
+            canvasSize: selectionGlobal.size,
+            annotations: store.annotations,
+            strokeWidth: strokeWidth,
+            sourceApp: sourceApp,
+            windowTitle: windowTitle
+        )
+    }
+
     // MARK: - 导出
 
-    /// 合成最终图：底图 + 标注（含马赛克像素化），编辑器所见 = 导出所得
+    /// 合成最终图：底图 + 标注（含马赛克像素化 + 可选画框美化），编辑器所见 = 导出所得
     func renderFinalImage() -> CGImage {
         var image = baseImage
         // 先马赛克（直接改底图像素），再画矢量标注
@@ -94,6 +171,13 @@ final class EditorSession {
                 image = CGRenderer.pixelate(image: image, rect: pxRect, blockSize: max(2, Int(strokeWidth + 4)))
             }
         }
-        return CGRenderer.composite(base: image, annotations: store.annotations, scale: scale)
+        let composited = CGRenderer.composite(base: image, annotations: store.annotations, scale: scale)
+        guard backdropStyle.enabled else { return composited }
+        return CGRenderer.renderWithBackdrop(
+            image: composited,
+            style: backdropStyle,
+            scale: scale,
+            precomputedEdgeColor: backdropStyle.autoBalance ? backdropEdgeColor() : nil
+        )
     }
 }

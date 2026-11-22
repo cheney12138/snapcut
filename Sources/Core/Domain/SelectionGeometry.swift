@@ -102,6 +102,99 @@ public enum SelectionGeometry {
         return CGRect(x: x, y: y, width: rect.width, height: rect.height)
     }
 
+    /// 独立外源图等比缩放拖拽（锁定原图宽高比，绝不横向/纵向拉伸变形；支持任意 8 向手柄与超屏放大）
+    public static func resizedAspectLocked(
+        _ rect: CGRect,
+        edge: SelectionEdge,
+        to point: CGPoint,
+        aspect: CGFloat,
+        minWidth: CGFloat = 60,
+        maxWidth: CGFloat = 6000
+    ) -> CGRect {
+        let safeAspect = max(0.01, aspect)
+        let clampedMinW = max(20, minWidth)
+        let clampedMaxW = max(clampedMinW, maxWidth)
+
+        var targetW: CGFloat
+        switch edge {
+        case .left:
+            targetW = rect.maxX - point.x
+        case .right:
+            targetW = point.x - rect.minX
+        case .top:
+            targetW = (rect.maxY - point.y) * safeAspect
+        case .bottom:
+            targetW = (point.y - rect.minY) * safeAspect
+        case .topLeft:
+            let wFromX = rect.maxX - point.x
+            let wFromY = (rect.maxY - point.y) * safeAspect
+            targetW = abs(wFromX - rect.width) >= abs(wFromY - rect.width) ? wFromX : wFromY
+        case .topRight:
+            let wFromX = point.x - rect.minX
+            let wFromY = (rect.maxY - point.y) * safeAspect
+            targetW = abs(wFromX - rect.width) >= abs(wFromY - rect.width) ? wFromX : wFromY
+        case .bottomLeft:
+            let wFromX = rect.maxX - point.x
+            let wFromY = (point.y - rect.minY) * safeAspect
+            targetW = abs(wFromX - rect.width) >= abs(wFromY - rect.width) ? wFromX : wFromY
+        case .bottomRight:
+            let wFromX = point.x - rect.minX
+            let wFromY = (point.y - rect.minY) * safeAspect
+            targetW = abs(wFromX - rect.width) >= abs(wFromY - rect.width) ? wFromX : wFromY
+        }
+
+        targetW = min(max(targetW, clampedMinW), clampedMaxW)
+        let targetH = targetW / safeAspect
+
+        let originX: CGFloat
+        let originY: CGFloat
+        switch edge {
+        case .left:
+            originX = rect.maxX - targetW
+            originY = rect.midY - targetH / 2
+        case .right:
+            originX = rect.minX
+            originY = rect.midY - targetH / 2
+        case .top:
+            originX = rect.midX - targetW / 2
+            originY = rect.maxY - targetH
+        case .bottom:
+            originX = rect.midX - targetW / 2
+            originY = rect.minY
+        case .topLeft:
+            originX = rect.maxX - targetW
+            originY = rect.maxY - targetH
+        case .topRight:
+            originX = rect.minX
+            originY = rect.maxY - targetH
+        case .bottomLeft:
+            originX = rect.maxX - targetW
+            originY = rect.minY
+        case .bottomRight:
+            originX = rect.minX
+            originY = rect.minY
+        }
+        return CGRect(x: originX, y: originY, width: targetW, height: targetH)
+    }
+
+    /// 放大超屏时的平滑拖拽平移（允许图超出屏幕上下/左右边界，只保证至少保留 minVisible 可见）
+    public static func movedPartiallyVisible(
+        _ rect: CGRect,
+        by delta: CGSize,
+        in bounds: CGRect,
+        minVisible: CGFloat = 80
+    ) -> CGRect {
+        let visX = min(minVisible, rect.width)
+        let visY = min(minVisible, rect.height)
+        let minX = bounds.minX + visX - rect.width
+        let maxX = bounds.maxX - visX
+        let minY = bounds.minY + visY - rect.height
+        let maxY = bounds.maxY - visY
+        let x = min(max(rect.minX + delta.width, minX), maxX)
+        let y = min(max(rect.minY + delta.height, minY), maxY)
+        return CGRect(x: x, y: y, width: rect.width, height: rect.height)
+    }
+
     /// 键盘微调（dx/dy 为本地 Y 向下方向）
     public static func nudged(_ rect: CGRect, dx: CGFloat, dy: CGFloat, limit: CGRect) -> CGRect {
         moved(rect, by: CGSize(width: dx, height: dy), limit: limit)

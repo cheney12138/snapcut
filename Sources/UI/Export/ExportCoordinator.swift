@@ -7,6 +7,7 @@ final class ExportCoordinator {
     /// 复制到剪贴板
     func copyToClipboard(_ image: CGImage) {
         ClipboardWriter.writeImage(image)
+        CaptureSoundPlayer.play()
     }
 
     /// 原生保存面板（R4：⌘S = NSSavePanel）
@@ -80,6 +81,7 @@ final class ExportCoordinator {
         }
         do {
             try data.write(to: url)
+            CaptureSoundPlayer.play()
             Log.event(.export, "export.save.ok", [
                 "bytes": "\(data.count)",
                 "path": "<private>", // privacy: .private（docs/03 §7.2）

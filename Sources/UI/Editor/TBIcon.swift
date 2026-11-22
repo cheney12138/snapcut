@@ -1,254 +1,93 @@
 import AppKit
-import CoreGraphics
 
-/// 工具栏图标渲染器（设计稿 1:1：snapcut-design-redesign/index.html 的 15 个
-/// 自绘 SVG 线性图标——SF Symbol 字形比例与设计稿不符，用户实报「竖着拉长/
-/// 没跟设计稿对齐」）。
+/// 工具栏图标工厂：全面采用 Apple 原生 SF Symbols 矢量渲染 + 光学字号微调 + Hierarchical 分层质感。
 ///
-/// 视觉规格（2026-11-17 工具栏图标重设计落地）：viewBox 16、stroke 1.8pt、圆头/圆角连接、
-/// 线色 currentColor（本层 = 调用方 tint）。真源：html-pages/snapcut-toolbar-icons/index.html
-/// 页尾 path 坐标清单（15 个 icon 按清单逐一替换；马赛克单独深设计中，保持现状跳过）。
-/// 实现：NSBitmapImageRep 2x 栅格化，
-/// isTemplate = true → NSButton image + contentTintColor 上色（选中/强调态自动
-/// 白字）。非模板色元素（马赛克块的 opacity 阶）在模板下不可表达——马赛克块
-/// 改用描边 + 半数填充块表达网格语义（模板安全）。
+/// 相比早期手绘 16×16 2x 位图：
+/// - 原生矢量随任意 DPI 屏幕锐利呈现，具备 SF Pro 同源光学字重补偿与连续圆角曲率；
+/// - 复合图标启用 `.preferringHierarchical()` 保持 `isTemplate = true`，
+///   随 `NSButton.contentTintColor` 自动在浅/暗玻璃、悬停、选中态之间呈现主次层次；
+/// - 针对不同字形的视觉体量做 ±1pt 光学平衡（如 `xmark` 收紧至 14pt、形状类统一 15.5pt），
+///   让整排 16 个图标视觉中轴与墨量完全对齐。
+@MainActor
 enum TBIcon {
-    /// 图标全集（tag 顺序 = 设计稿工具栏序）
+    /// 图标全集（与工具栏按钮一一对应）
     enum Kind {
         case arrow, rect, text, mosaic, sequence, highlight, ellipse
-        case undo, redo, ocr, pin, eye
+        case undo, redo, ocr, pin, backdrop, eye
         case save, cancel, copy, scroll
     }
 
-    static func image(_ kind: Kind, pointSize: CGFloat = 20) -> NSImage {
-        let scale: Int = 2
-        let px = Int(pointSize) * scale
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil,
-            pixelsWide: px, pixelsHigh: px,
-            bitsPerSample: 8, samplesPerPixel: 4,
-            hasAlpha: true, isPlanar: false,
-            colorSpaceName: .calibratedRGB,
-            bytesPerRow: 0, bitsPerPixel: 0
-        ) else { return NSImage(size: NSSize(width: pointSize, height: pointSize)) }
-        rep.size = NSSize(width: pointSize, height: pointSize)
-        NSGraphicsContext.saveGraphicsState()
-        guard let ctx = NSGraphicsContext(bitmapImageRep: rep)?.cgContext else {
-            NSGraphicsContext.restoreGraphicsState()
-            return NSImage(size: NSSize(width: pointSize, height: pointSize))
-        }
-        // viewBox 16 → pointSize 缩放（stroke 1.8 同步缩放）
-        let unit = pointSize / 16
-        ctx.scaleBy(x: unit, y: unit)
-        // 翻转到 Y-down（SVG 坐标系）
-        ctx.translateBy(x: 0, y: 16)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.setStrokeColor(NSColor.black.cgColor)   // 模板：黑 = tint 通道
-        ctx.setFillColor(NSColor.black.cgColor)
-        ctx.setLineWidth(1.35)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-
-        draw(kind, in: ctx)
-        NSGraphicsContext.restoreGraphicsState()
-
-        let img = NSImage()
-        img.addRepresentation(rep)
-        img.isTemplate = true
-        img.size = NSSize(width: pointSize, height: pointSize)
-        return img
+    private struct Spec {
+        let symbol: String
+        let pointSizeDelta: CGFloat
+        let weight: NSFont.Weight
+        let hierarchical: Bool
     }
 
-    /// SVG viewBox(0..16) 坐标的描边路径绘制（与设计稿 path 一一对应）
-    private static func draw(_ kind: Kind, in ctx: CGContext) {
-        func stroke(_ path: CGPath, alpha: CGFloat = 1) {
-            ctx.saveGState()
-            ctx.setAlpha(alpha)
-            ctx.addPath(path)
-            ctx.strokePath()
-            ctx.restoreGState()
-        }
-        func strokeLine(_ x1: CGFloat, _ y1: CGFloat, _ x2: CGFloat, _ y2: CGFloat, alpha: CGFloat = 1) {
-            let p = CGMutablePath()
-            p.move(to: CGPoint(x: x1, y: y1))
-            p.addLine(to: CGPoint(x: x2, y: y2))
-            stroke(p, alpha: alpha)
-        }
-        func fillRoundedRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, r: CGFloat) {
-            let p = CGPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerWidth: r, cornerHeight: r, transform: nil)
-            ctx.addPath(p)
-            ctx.fillPath()
-        }
-
-        func strokeRoundedRect(_ x: CGFloat, _ y: CGFloat, _ w: CGFloat, _ h: CGFloat, r: CGFloat, alpha: CGFloat = 1) {
-            let p = CGPath(roundedRect: CGRect(x: x, y: y, width: w, height: h), cornerWidth: r, cornerHeight: r, transform: nil)
-            stroke(p, alpha: alpha)
-        }
-        func strokeEllipseAt(_ cx: CGFloat, _ cy: CGFloat, rx: CGFloat, ry: CGFloat) {
-            let p = CGMutablePath()
-            p.addEllipse(in: CGRect(x: cx - rx, y: cy - ry, width: rx * 2, height: ry * 2))
-            stroke(p)
-        }
-
-        func strokeCircle(_ cx: CGFloat, _ cy: CGFloat, r: CGFloat) {
-            let p = CGMutablePath()
-            p.addArc(center: CGPoint(x: cx, y: cy), radius: r, startAngle: 0, endAngle: .pi * 2, clockwise: false)
-            stroke(p)
-        }
-
+    private static func spec(for kind: Kind) -> Spec {
         switch kind {
         case .arrow:
-            // 箭头 1：斜线 + 端箭头（重设计 2笔）
-            strokeLine(3.2, 12.8, 12.6, 3.4)
-            let arrowHead = CGMutablePath()
-            arrowHead.move(to: CGPoint(x: 12.8, y: 8.6))
-            arrowHead.addLine(to: CGPoint(x: 12.8, y: 3.2))
-            arrowHead.addLine(to: CGPoint(x: 7.4, y: 3.2))
-            stroke(arrowHead)
+            return Spec(symbol: "arrow.up.right", pointSizeDelta: 0, weight: .medium, hierarchical: false)
         case .rect:
-            // 矩形 2：圆角矩形（重设计：外扩至视窗 ~70%、rx 1.8）
-            strokeRoundedRect(2.4, 4, 11.2, 8, r: 1.8)
-        case .text:
-            // 文字 3：T 带衬线（重设计 3笔：衬线折笔合并）
-            let serif = CGMutablePath()
-            serif.move(to: CGPoint(x: 4.6, y: 4.8)); serif.addLine(to: CGPoint(x: 3.2, y: 3.4))
-            serif.addLine(to: CGPoint(x: 12.8, y: 3.4)); serif.addLine(to: CGPoint(x: 11.4, y: 4.8))
-            stroke(serif)
-            strokeLine(8, 3.4, 8, 12.6)
-            strokeLine(5.8, 12.6, 10.2, 12.6)
-        case .mosaic:
-            // 马赛克（用户三稿裁定 A「散块拼贴」2026-11-16：语义=「模糊、没有
-            // 规律」——4 块大小/长宽/位置全不同（横长/竖长/近方/小方），1 实心
-            // 3 描边，零对齐零等分；网格/表格/点阵方案全被否）
-            // 块1 横长（描边）
-            strokeRoundedRect(2.6, 3.0, 5.2, 3.0, r: 0.9)
-            // 块2 竖长（描边）
-            strokeRoundedRect(9.0, 2.6, 3.0, 5.4, r: 0.9)
-            // 块3 近方（实心——墨量锚点）
-            fillRoundedRect(3.0, 8.0, 4.0, 4.0, r: 0.9)
-            // 块4 小方（描边，错位右下）
-            strokeRoundedRect(8.6, 9.4, 3.4, 3.0, r: 0.8)
-        case .sequence:
-            // 序号 5：圆 + 数字「2」（重设计：曲线整体重绘放大、下移居中）
-            strokeCircle(8, 8, r: 5.6)
-            let two = CGMutablePath()
-            two.move(to: CGPoint(x: 6.0, y: 6.3))
-            two.addCurve(to: CGPoint(x: 8.6, y: 5.8), control1: CGPoint(x: 6.5, y: 5.2), control2: CGPoint(x: 7.9, y: 5.1))
-            two.addCurve(to: CGPoint(x: 8.0, y: 8.2), control1: CGPoint(x: 9.2, y: 6.5), control2: CGPoint(x: 8.9, y: 7.4))
-            two.addCurve(to: CGPoint(x: 6.0, y: 10.1), control1: CGPoint(x: 7.2, y: 8.9), control2: CGPoint(x: 6.4, y: 9.4))
-            two.addLine(to: CGPoint(x: 10.2, y: 10.1))
-            stroke(two)
-        case .highlight:
-            // 高亮 6：荧光笔斜置 + 底线（重设计：笔身放大、底线加宽 alpha 0.5）
-            let pen = CGMutablePath()
-            pen.move(to: CGPoint(x: 9.6, y: 3))
-            pen.addLine(to: CGPoint(x: 13, y: 6.4))
-            pen.addLine(to: CGPoint(x: 7.2, y: 12.2))
-            pen.addLine(to: CGPoint(x: 4.0, y: 12.2))
-            pen.addLine(to: CGPoint(x: 4.0, y: 9))
-            pen.closeSubpath()
-            stroke(pen)
-            strokeLine(3.2, 14.2, 12.8, 14.2, alpha: 0.5)
-        case .undo:
-            // 撤销 ⌘Z（重设计：弧度加大、钩尾内收）
-            let p = CGMutablePath()
-            p.move(to: CGPoint(x: 5.8, y: 3)); p.addLine(to: CGPoint(x: 2.9, y: 5.9)); p.addLine(to: CGPoint(x: 5.8, y: 8.8))
-            stroke(p)
-            let p2 = CGMutablePath()
-            p2.move(to: CGPoint(x: 2.9, y: 5.9))
-            p2.addLine(to: CGPoint(x: 9.2, y: 5.9))
-            p2.addCurve(to: CGPoint(x: 13.1, y: 9.5), control1: CGPoint(x: 12.0, y: 5.9), control2: CGPoint(x: 13.1, y: 7.5))
-            p2.addCurve(to: CGPoint(x: 9.2, y: 13), control1: CGPoint(x: 13.1, y: 11.5), control2: CGPoint(x: 12.0, y: 13))
-            p2.addLine(to: CGPoint(x: 7.6, y: 13))
-            stroke(p2)
-        case .redo:
-            // 重做 ⇧⌘Z（undo 的严格镜像 x → 16 − x）
-            let p = CGMutablePath()
-            p.move(to: CGPoint(x: 10.2, y: 3)); p.addLine(to: CGPoint(x: 13.1, y: 5.9)); p.addLine(to: CGPoint(x: 10.2, y: 8.8))
-            stroke(p)
-            let p2 = CGMutablePath()
-            p2.move(to: CGPoint(x: 13.1, y: 5.9))
-            p2.addLine(to: CGPoint(x: 6.8, y: 5.9))
-            p2.addCurve(to: CGPoint(x: 2.9, y: 9.5), control1: CGPoint(x: 4.0, y: 5.9), control2: CGPoint(x: 2.9, y: 7.5))
-            p2.addCurve(to: CGPoint(x: 6.8, y: 13), control1: CGPoint(x: 2.9, y: 11.5), control2: CGPoint(x: 4.0, y: 13))
-            p2.addLine(to: CGPoint(x: 8.4, y: 13))
-            stroke(p2)
-        case .ocr:
-            // 取字 O：四角框 + 「文」（重设计 2笔：四角合并、「文」合并）
-            let corners = CGMutablePath()
-            corners.move(to: CGPoint(x: 3.0, y: 5.4)); corners.addLine(to: CGPoint(x: 3.0, y: 3.0)); corners.addLine(to: CGPoint(x: 5.4, y: 3.0))
-            corners.move(to: CGPoint(x: 10.6, y: 3.0)); corners.addLine(to: CGPoint(x: 13.0, y: 3.0)); corners.addLine(to: CGPoint(x: 13.0, y: 5.4))
-            corners.move(to: CGPoint(x: 13.0, y: 10.6)); corners.addLine(to: CGPoint(x: 13.0, y: 13.0)); corners.addLine(to: CGPoint(x: 10.6, y: 13.0))
-            corners.move(to: CGPoint(x: 5.4, y: 13.0)); corners.addLine(to: CGPoint(x: 3.0, y: 13.0)); corners.addLine(to: CGPoint(x: 3.0, y: 10.6))
-            stroke(corners)
-            let wen = CGMutablePath()
-            wen.move(to: CGPoint(x: 6.6, y: 7.0)); wen.addLine(to: CGPoint(x: 5.6, y: 6.2)); wen.addLine(to: CGPoint(x: 10.4, y: 6.2)); wen.addLine(to: CGPoint(x: 9.4, y: 7.0))
-            wen.move(to: CGPoint(x: 8, y: 6.2)); wen.addLine(to: CGPoint(x: 8, y: 10.8))
-            wen.move(to: CGPoint(x: 6.5, y: 10.8)); wen.addLine(to: CGPoint(x: 9.5, y: 10.8))
-            stroke(wen)
-        case .pin:
-            // 贴图 P：图钉（重设计：针杆加长出头，钉头/底座放大）
-            strokeLine(8, 2.8, 8, 6.0)
-            let head = CGMutablePath()
-            head.move(to: CGPoint(x: 5.8, y: 6.0)); head.addLine(to: CGPoint(x: 10.2, y: 6.0))
-            head.addLine(to: CGPoint(x: 11.2, y: 9.2)); head.addLine(to: CGPoint(x: 4.8, y: 9.2))
-            head.closeSubpath()
-            stroke(head)
-            let leg = CGMutablePath()
-            leg.move(to: CGPoint(x: 6.8, y: 9.2)); leg.addLine(to: CGPoint(x: 6.4, y: 13.2))
-            leg.addLine(to: CGPoint(x: 9.6, y: 13.2)); leg.addLine(to: CGPoint(x: 9.2, y: 9.2))
-            stroke(leg)
-        case .eye:
-            // 眼睛 H（重设计：轮廓放大至 70% 视窗、瞳孔随比例放大；与椭圆纯轮廓区分：眼形更扁 + 有瞳）
-            let p = CGMutablePath()
-            p.move(to: CGPoint(x: 2.4, y: 8))
-            p.addCurve(to: CGPoint(x: 8, y: 3.9), control1: CGPoint(x: 4.0, y: 5.0), control2: CGPoint(x: 5.9, y: 3.9))
-            p.addCurve(to: CGPoint(x: 13.6, y: 8), control1: CGPoint(x: 10.1, y: 3.9), control2: CGPoint(x: 12.0, y: 5.0))
-            p.addCurve(to: CGPoint(x: 8, y: 12.1), control1: CGPoint(x: 12.0, y: 11.0), control2: CGPoint(x: 10.1, y: 12.1))
-            p.addCurve(to: CGPoint(x: 2.4, y: 8), control1: CGPoint(x: 5.9, y: 12.1), control2: CGPoint(x: 4.0, y: 11.0))
-            p.closeSubpath()
-            stroke(p)
-            strokeCircle(8, 8, r: 2.0)
-        case .save:
-            // 保存 ⌘S：下箭头 + 托盘（重设计 2笔：箭头杆加长、托盘圆角收紧）
-            let shaft = CGMutablePath()
-            shaft.move(to: CGPoint(x: 8, y: 2.8)); shaft.addLine(to: CGPoint(x: 8, y: 10.2))
-            shaft.move(to: CGPoint(x: 5.0, y: 7.2)); shaft.addLine(to: CGPoint(x: 8, y: 10.2)); shaft.addLine(to: CGPoint(x: 11.0, y: 7.2))
-            stroke(shaft)
-            let tray = CGMutablePath()
-            tray.move(to: CGPoint(x: 3.0, y: 11.2)); tray.addLine(to: CGPoint(x: 3.0, y: 12.2))
-            tray.addCurve(to: CGPoint(x: 4.4, y: 13.5), control1: CGPoint(x: 3.0, y: 13.0), control2: CGPoint(x: 3.6, y: 13.5))
-            tray.addLine(to: CGPoint(x: 11.6, y: 13.5))
-            tray.addCurve(to: CGPoint(x: 13.0, y: 12.2), control1: CGPoint(x: 12.4, y: 13.5), control2: CGPoint(x: 13.0, y: 13.0))
-            tray.addLine(to: CGPoint(x: 13.0, y: 11.2))
-            stroke(tray)
-        case .cancel:
-            // 取消 Esc：×（重设计：两端外扩至 4.0–12.0）
-            strokeLine(4, 4, 12, 12)
-            strokeLine(12, 4, 4, 12)
-        case .copy:
-            // 复制（重设计：前纸外扩至 70% 视窗、后纸弧线重绘）
-            strokeRoundedRect(5.8, 5.8, 7.4, 7.4, r: 1.6)
-            let back = CGMutablePath()
-            back.move(to: CGPoint(x: 10.4, y: 5.8)); back.addLine(to: CGPoint(x: 10.4, y: 4.2))
-            back.addCurve(to: CGPoint(x: 9.0, y: 2.8), control1: CGPoint(x: 10.4, y: 3.3), control2: CGPoint(x: 9.9, y: 2.8))
-            back.addLine(to: CGPoint(x: 4.4, y: 2.8))
-            back.addCurve(to: CGPoint(x: 3.0, y: 4.2), control1: CGPoint(x: 3.5, y: 2.8), control2: CGPoint(x: 3.0, y: 3.3))
-            back.addLine(to: CGPoint(x: 3.0, y: 8.8))
-            back.addCurve(to: CGPoint(x: 4.4, y: 10.2), control1: CGPoint(x: 3.0, y: 9.7), control2: CGPoint(x: 3.5, y: 10.2))
-            back.addLine(to: CGPoint(x: 5.8, y: 10.2))
-            stroke(back)
+            return Spec(symbol: "rectangle", pointSizeDelta: 0.5, weight: .medium, hierarchical: false)
         case .ellipse:
-            // 椭圆工具（3）：纯轮廓 rx 5.6 / ry 4.2（去掉中心十字/点——与 Eye 彻底区分，
-            // 与矩形等高、圆角气质一致；紧贴矩形成「形状两兄弟」组）
-            strokeEllipseAt(8, 8, rx: 5.6, ry: 4.2)
+            return Spec(symbol: "oval", pointSizeDelta: 0.5, weight: .medium, hierarchical: false)
+        case .text:
+            return Spec(symbol: "character.textbox", pointSizeDelta: 0, weight: .medium, hierarchical: true)
+        case .mosaic:
+            return Spec(symbol: "checkerboard.rectangle", pointSizeDelta: 0.5, weight: .medium, hierarchical: true)
+        case .sequence:
+            return Spec(symbol: "1.circle", pointSizeDelta: 0, weight: .medium, hierarchical: true)
+        case .highlight:
+            return Spec(symbol: "highlighter", pointSizeDelta: 0, weight: .medium, hierarchical: true)
         case .scroll:
-            // 滚动截图（重设计 2笔：选区加高至 72% 视窗、箭头上移留笔尖呼吸空间）
-            strokeRoundedRect(3.2, 2.4, 9.6, 11.2, r: 1.8)
-            let stem = CGMutablePath()
-            stem.move(to: CGPoint(x: 8, y: 4.6)); stem.addLine(to: CGPoint(x: 8, y: 10.4))
-            stem.move(to: CGPoint(x: 6.0, y: 8.4)); stem.addLine(to: CGPoint(x: 8, y: 10.4)); stem.addLine(to: CGPoint(x: 10.0, y: 8.4))
-            stroke(stem)
+            return Spec(symbol: "rectangle.expand.vertical", pointSizeDelta: 0, weight: .medium, hierarchical: true)
+        case .undo:
+            return Spec(symbol: "arrow.uturn.backward", pointSizeDelta: -0.5, weight: .medium, hierarchical: false)
+        case .redo:
+            return Spec(symbol: "arrow.uturn.forward", pointSizeDelta: -0.5, weight: .medium, hierarchical: false)
+        case .ocr:
+            return Spec(symbol: "text.viewfinder", pointSizeDelta: 0, weight: .medium, hierarchical: true)
+        case .pin:
+            return Spec(symbol: "pin", pointSizeDelta: -0.5, weight: .medium, hierarchical: false)
+        case .backdrop:
+            return Spec(symbol: "sparkles.rectangle.stack", pointSizeDelta: 0, weight: .medium, hierarchical: true)
+        case .eye:
+            return Spec(symbol: "eye", pointSizeDelta: -0.5, weight: .medium, hierarchical: true)
+        case .copy:
+            return Spec(symbol: "doc.on.doc", pointSizeDelta: -1.0, weight: .medium, hierarchical: false)
+        case .save:
+            return Spec(symbol: "square.and.arrow.down", pointSizeDelta: -0.5, weight: .medium, hierarchical: true)
+        case .cancel:
+            return Spec(symbol: "xmark", pointSizeDelta: -1.5, weight: .semibold, hierarchical: false)
         }
+    }
+
+    static func image(_ kind: Kind, pointSize: CGFloat = 15.5) -> NSImage {
+        let s = spec(for: kind)
+        return symbolImage(
+            named: s.symbol,
+            pointSize: max(11, pointSize + s.pointSizeDelta),
+            weight: s.weight,
+            hierarchical: s.hierarchical
+        )
+    }
+
+    static func symbolImage(
+        named name: String,
+        pointSize: CGFloat = 15.0,
+        weight: NSFont.Weight = .medium,
+        hierarchical: Bool = true
+    ) -> NSImage {
+        var config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: weight, scale: .medium)
+        if hierarchical {
+            config = config.applying(.preferringHierarchical())
+        }
+        guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil),
+              let configured = base.withSymbolConfiguration(config) else {
+            return NSImage(size: NSSize(width: pointSize, height: pointSize))
+        }
+        configured.isTemplate = true
+        return configured
     }
 }

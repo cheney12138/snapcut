@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
 import QuartzCore
 
@@ -25,6 +26,10 @@ final class PinContentView: NSView {
     /// 右下角百分比读数（缩放 / ⌥透明度共用）
     let hud = PinHUDView(frame: .zero)
 
+    /// 右上角悬停关闭按钮（20×20 深半透圆钮，悬停时柔显，一键关闭单张贴图）
+    private let closeButton = PinHoverCloseButton()
+    private var hoverTrackingArea: NSTrackingArea?
+
     /// 吸附预览（拖动中贴合：移动卡与目标卡都亮）；视觉由 CAShapeLayer 承担
     private var snapGlow = false
 
@@ -39,6 +44,12 @@ final class PinContentView: NSView {
         // 固定贴住右下角：翻转坐标下 min-Y 视觉上是顶部，顶部/左侧边距可伸缩
         hud.autoresizingMask = [.minXMargin, .minYMargin]
         addSubview(hud)
+
+        closeButton.alphaValue = 0
+        closeButton.isHidden = true
+        closeButton.target = self
+        closeButton.action = #selector(menuClose)
+        addSubview(closeButton)
     }
 
     @available(*, unavailable)
@@ -53,6 +64,54 @@ final class PinContentView: NSView {
     /// 时间三指无法移动截图」）——macOS 默认未激活窗的首击只激活不交互（三指
     /// 拖移同样走此路径），贴图窗独立于激活态，必须 override。
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func layout() {
+        super.layout()
+        let btnSide: CGFloat = 20
+        let inset: CGFloat = 8
+        closeButton.frame = NSRect(
+            x: max(4, bounds.width - btnSide - inset),
+            y: inset,
+            width: btnSide,
+            height: btnSide
+        )
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard bounds.width >= 56, bounds.height >= 44 else { return }
+        closeButton.isHidden = false
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.14
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            closeButton.animator().alphaValue = 1
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            closeButton.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.closeButton.alphaValue < 0.05 else { return }
+                self.closeButton.isHidden = true
+            }
+        })
+    }
 
     func setSnapGlow(_ on: Bool) {
         guard snapGlow != on else { return }
@@ -71,7 +130,7 @@ final class PinContentView: NSView {
     private func installSnapHighlight() {
         wantsLayer = true
         removeSnapHighlight()
-        let base = (controller?.inGroup ?? false) ? Self.groupCornerRadius : Self.cornerRadius
+        let base = Self.cornerRadius
 
         let outline = CAShapeLayer()
         outline.frame = bounds
@@ -137,9 +196,13 @@ final class PinContentView: NSView {
         // 拖动/松手事件由 mouseDragged/mouseUp 转发（不 performDrag）。
         let groupDrag = event.modifierFlags.contains(.command)
         let detach = event.modifierFlags.contains(.option)
-        // 双击复位到 100%（锚在光标处）
+        // 双击：长图在适配 ↔ 1:1 原生像素间切换，普通图复位 100%（锚在光标处）
         if event.clickCount >= 2 {
-            controller?.resetZoom(anchor: convert(event.locationInWindow, from: nil))
+            NSApp.activate()
+            window?.makeKeyAndOrderFront(nil)
+            window?.makeFirstResponder(self)
+            controller?.toggleDoubleClickZoom(anchor: convert(event.locationInWindow, from: nil))
+            return
         }
         controller?.beginDrag(groupDrag: groupDrag, detach: detach)
     }
@@ -157,26 +220,62 @@ final class PinContentView: NSView {
         controller?.handleScroll(event, anchor: convert(event.locationInWindow, from: nil))
     }
 
+    override func magnify(with event: NSEvent) {
+        // 触控板双指捏合缩放（以光标为锚点，兼容长图查看细节）
+        let factor = max(0.2, 1 + event.magnification)
+        controller?.applyZoom(factor: factor, anchor: convert(event.locationInWindow, from: nil))
+    }
+
     override func rightMouseDown(with event: NSEvent) {
         buildContextMenu().popUp(positioning: nil, at: convert(event.locationInWindow, from: nil), in: self)
     }
 
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { // Esc（仅窗口为 key 时事件才会到达这里）
+        let keyCode = Int(event.keyCode)
+        if keyCode == kVK_Escape { // Esc（仅窗口为 key 时事件才会到达这里）
             controller?.close()
-        } else {
-            super.keyDown(with: event)
+            return
         }
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if mods.isEmpty {
+            switch keyCode {
+            case kVK_ANSI_D, kVK_ANSI_5:
+                controller?.toggleCompareOpacity()
+                return
+            case kVK_ANSI_0:
+                controller?.resetOpacity()
+                return
+            default:
+                break
+            }
+        }
+        super.keyDown(with: event)
     }
 
     private func buildContextMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
-        let copy = NSMenuItem(title: "复制图像", action: #selector(menuCopyImage), keyEquivalent: "")
-        let reset = NSMenuItem(title: "缩放 100%", action: #selector(menuResetZoom), keyEquivalent: "")
-        let close = NSMenuItem(title: "关闭", action: #selector(menuClose), keyEquivalent: "")
-        for item in [copy, reset, close] {
-            item.target = self
+        let isComparing = controller?.isCompareOpacityActive == true
+        let compareItem = NSMenuItem(
+            title: isComparing ? "退出对比模式 (100%)" : "对比模式 50% (D)",
+            action: #selector(menuToggleCompareOpacity),
+            keyEquivalent: ""
+        )
+        compareItem.state = isComparing ? .on : .off
+        var items: [NSMenuItem] = [
+            NSMenuItem(title: "复制图像", action: #selector(menuCopyImage), keyEquivalent: ""),
+            NSMenuItem(title: "缩放 100%", action: #selector(menuResetZoom), keyEquivalent: ""),
+            compareItem,
+        ]
+        if controller?.inGroup == true {
+            items.append(NSMenuItem.separator())
+            items.append(NSMenuItem(title: "拆分拼贴组", action: #selector(menuUngroup), keyEquivalent: ""))
+            items.append(NSMenuItem(title: "关闭整组", action: #selector(menuCloseGroup), keyEquivalent: ""))
+        }
+        items.append(NSMenuItem.separator())
+        items.append(NSMenuItem(title: "关闭此贴图", action: #selector(menuClose), keyEquivalent: ""))
+        for item in items {
+            if !item.isSeparatorItem { item.target = self }
             menu.addItem(item)
         }
         return menu
@@ -184,6 +283,9 @@ final class PinContentView: NSView {
 
     @objc private func menuCopyImage() { controller?.copyImageToPasteboard() }
     @objc private func menuResetZoom() { controller?.resetZoom(anchor: CGPoint(x: bounds.midX, y: bounds.midY)) }
+    @objc private func menuToggleCompareOpacity() { controller?.toggleCompareOpacity() }
+    @objc private func menuUngroup() { controller?.ungroupCurrentGroup() }
+    @objc private func menuCloseGroup() { controller?.closeCurrentGroup() }
     @objc private func menuClose() { controller?.close() }
 
     // MARK: - 绘制
@@ -191,49 +293,39 @@ final class PinContentView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let controller, let ctx = NSGraphicsContext.current?.cgContext else { return }
         let rect = bounds
-        let inGroup = controller.inGroup
-        let pad: CGFloat = inGroup ? PinWindowController.groupPad : 0
-        let radius = inGroup ? Self.groupCornerRadius : Self.cornerRadius
+        let radius = Self.cornerRadius
 
-        // 1. 成组白垫（外层圆角矩形；未成组无垫）
-        if inGroup {
-            let padPath = CGPath(
-                roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil
-            )
-            ctx.addPath(padPath)
-            ctx.setFillColor(NSColor.white.cgColor)
-            ctx.fillPath()
-        }
-
-        // 2. 图像 1:1 像素精确绘制：Y-down 上下文需镜像一次再 draw，方向才正确。
-        //    成组时画在白垫+描边内缩 9pt 的矩形里（窗体外扩 9pt ⇒ 图像全局位置不变）
-        let imageRect = inGroup
-            ? rect.insetBy(dx: pad + Self.borderWidth, dy: pad + Self.borderWidth)
-            : rect
+        // 1. 图像 1:1 像素精确绘制（无论是否成组，贴图本体尺寸永不跳变；成组凝聚感由底层统一磨砂玻璃托盘承担）
         ctx.saveGState()
         ctx.addPath(CGPath(
-            roundedRect: imageRect, cornerWidth: Self.cornerRadius,
-            cornerHeight: Self.cornerRadius, transform: nil
+            roundedRect: rect, cornerWidth: radius,
+            cornerHeight: radius, transform: nil
         ))
         ctx.clip()
-        ctx.translateBy(x: imageRect.midX, y: imageRect.midY)
+        ctx.translateBy(x: rect.midX, y: rect.midY)
         ctx.scaleBy(x: 1, y: -1)
-        ctx.translateBy(x: -imageRect.midX, y: -imageRect.midY)
-        ctx.interpolationQuality = .none
-        ctx.draw(controller.image, in: imageRect)
+        ctx.translateBy(x: -rect.midX, y: -rect.midY)
+        // 精确 1:1 像素时用 .none 保持像素锐利；缩放/长图适配时切 .high 杜绝锯齿模糊
+        let backing = window?.backingScaleFactor ?? 2
+        let exact1to1 = abs(rect.width * backing - CGFloat(controller.image.width)) < 1.5
+            && abs(rect.height * backing - CGFloat(controller.image.height)) < 1.5
+        ctx.interpolationQuality = exact1to1 ? .none : .high
+        ctx.draw(controller.image, in: rect)
         ctx.restoreGState()
 
-        // 3. 描边：未成组 0.5pt white .55（原 1px 纯白 alpha 1.0 ——审查：全不透明白线
-        //    在深色壁纸上偏硬，比组框的 白.26 重一个数量级）；
-        //    成组 hair 发丝线骑在白垫外缘（白垫在深色桌面上自身已可见）
-        let borderRect = rect.insetBy(dx: Self.borderWidth / 2, dy: Self.borderWidth / 2)
-        let borderPath = CGPath(
-            roundedRect: borderRect, cornerWidth: radius, cornerHeight: radius, transform: nil
-        )
-        ctx.setStrokeColor(inGroup ? DesignTokens.hair.cgColor
-                                   : NSColor.white.withAlphaComponent(Self.looseBorderAlpha).cgColor)
-        ctx.setLineWidth(Self.borderWidth)
-        ctx.addPath(borderPath)
+        // 2. Apple 双重发丝边界（外圈 0.5pt 暗影线 + 内圈 0.5pt 柔和亮边，亮/暗桌面及磨砂托盘上都通透利落）
+        let outerRect = rect.insetBy(dx: 0.25, dy: 0.25)
+        let outerPath = CGPath(roundedRect: outerRect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        ctx.setStrokeColor(NSColor.black.withAlphaComponent(controller.inGroup ? 0.14 : 0.16).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(outerPath)
+        ctx.strokePath()
+
+        let innerRect = rect.insetBy(dx: 0.75, dy: 0.75)
+        let innerPath = CGPath(roundedRect: innerRect, cornerWidth: max(1, radius - 0.5), cornerHeight: max(1, radius - 0.5), transform: nil)
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(controller.inGroup ? 0.34 : 0.42).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(innerPath)
         ctx.strokePath()
     }
 
@@ -288,5 +380,69 @@ final class PinHUDView: NSView {
             y: (bounds.height - textSize.height) / 2
         )
         (text as NSString).draw(at: origin, withAttributes: Self.textAttributes)
+    }
+}
+
+/// 贴图右上角悬停关闭圆钮（20×20 深半透圆底 + 0.5pt 白发丝边 + 轻按缩放反馈）
+@MainActor
+private final class PinHoverCloseButton: NSButton {
+    private var isHot = false
+    private var trackingArea: NSTrackingArea?
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+        isBordered = false
+        bezelStyle = .regularSquare
+        title = ""
+        imagePosition = .imageOnly
+        image = TBIcon.symbolImage(named: "xmark", pointSize: 9.5, weight: .bold, hierarchical: false)
+        contentTintColor = NSColor.white.withAlphaComponent(0.92)
+        toolTip = "关闭 (Esc)"
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 0.5
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        applyStyle()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHot = true
+        applyStyle()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHot = false
+        applyStyle()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        TactilePress.animate(view: self, pressed: true, scale: 0.90)
+        super.mouseDown(with: event)
+        TactilePress.animate(view: self, pressed: false)
+    }
+
+    private func applyStyle() {
+        layer?.backgroundColor = (isHot
+            ? DesignTokens.statusError.withAlphaComponent(0.88)
+            : NSColor(srgbRed: 24/255.0, green: 24/255.0, blue: 28/255.0, alpha: 0.72)).cgColor
     }
 }

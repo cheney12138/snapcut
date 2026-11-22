@@ -8,7 +8,9 @@ final class StatusItemController: NSObject {
     
     private weak var coordinator: AppCoordinator?
     private var rootMenu: NSMenu?
-    private var historyMenu: NSMenu?
+    private var captureItem: NSMenuItem?
+    private var fullScreenItem: NSMenuItem?
+    private var historySpotlightItem: NSMenuItem?
 
     override init() {
         super.init()
@@ -41,6 +43,7 @@ final class StatusItemController: NSObject {
             keyEquivalent: ""
         )
         captureItem.target = self
+        self.captureItem = captureItem
         menu.addItem(captureItem)
 
         let fullScreenItem = NSMenuItem(
@@ -49,14 +52,25 @@ final class StatusItemController: NSObject {
             keyEquivalent: ""
         )
         fullScreenItem.target = self
+        self.fullScreenItem = fullScreenItem
         menu.addItem(fullScreenItem)
 
-        // 历史记录子菜单（点击条目 = 复制该图；每次弹出前重建，保证实时）
-        let historyItem = NSMenuItem(title: "历史记录", action: nil, keyEquivalent: "")
-        let historyMenu = NSMenu()
-        self.historyMenu = historyMenu
-        historyItem.submenu = historyMenu
-        menu.addItem(historyItem)
+        let historySpotlightItem = NSMenuItem(
+            title: "搜索视觉记忆  \(HotkeySpec.display(settings.hotkeyHistorySpotlight))",
+            action: #selector(openHistorySpotlight(_:)),
+            keyEquivalent: ""
+        )
+        historySpotlightItem.target = self
+        self.historySpotlightItem = historySpotlightItem
+        menu.addItem(historySpotlightItem)
+
+        let togglePinsItem = NSMenuItem(
+            title: "隐藏/显示全部贴图  ⌥ ⌘ P",
+            action: #selector(toggleAllPins(_:)),
+            keyEquivalent: ""
+        )
+        togglePinsItem.target = self
+        menu.addItem(togglePinsItem)
 
         menu.addItem(.separator())
 
@@ -89,10 +103,13 @@ final class StatusItemController: NSObject {
         return menu
     }
 
-    /// 图标被系统隐藏时的替代入口：在光标处弹出同一个菜单
-    /// （⌥⌘H 触发；菜单内容、历史子菜单重建逻辑与图标点击完全一致）
+    /// 图标被系统隐藏时的替代入口：在光标处弹出同一个菜单（⌥⌘H 触发）
     func showMenuAtCursor() {
-        if let historyMenu { rebuildHistoryMenu(historyMenu) }
+        if let settings = coordinator?.settings {
+            captureItem?.title = "截取区域  \(HotkeySpec.display(settings.hotkeyRegion))"
+            fullScreenItem?.title = "截取全屏  \(HotkeySpec.display(settings.hotkeyFullScreen))"
+            historySpotlightItem?.title = "搜索视觉记忆  \(HotkeySpec.display(settings.hotkeyHistorySpotlight))"
+        }
         guard let rootMenu else { return }
         let mouse = NSEvent.mouseLocation
         // accessory App 在后台时 popUp 不会显示，必须先激活自己
@@ -110,31 +127,28 @@ final class StatusItemController: NSObject {
         coordinator?.beginRegionCapture()
     }
 
-    /// 自测：重建历史子菜单并回报条目（不弹菜单）——验证接线用
+    /// 自测：回报托盘菜单项（不弹菜单）——验证接线用
     func selfTestDumpHistoryMenu() {
-        guard let historyMenu else { return }
-        rebuildHistoryMenu(historyMenu)
-        Log.event(.tray, "tray.history.dump", [
-            "count": "\(historyMenu.items.count)",
-            "first": historyMenu.items.first?.title ?? "-",
+        guard let rootMenu else { return }
+        Log.event(.tray, "tray.menu.dump", [
+            "count": "\(rootMenu.items.count)",
+            "first": rootMenu.items.first?.title ?? "-",
         ])
-    }
-
-    @objc private func copyHistoryItem(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              let item = HistoryStore.shared.items().first(where: { $0.id == id }) else { return }
-        _ = HistoryStore.shared.copyToPasteboard(item)
-        Log.event(.tray, "tray.action", ["item": "copyHistory", "id": id])
-    }
-
-    @objc private func clearHistory(_ sender: Any?) {
-        HistoryStore.shared.clearAll()
-        Log.event(.tray, "tray.action", ["item": "clearHistory"])
     }
 
     @objc private func captureFullScreen(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "captureFullScreen"])
         coordinator?.beginFullScreenCapture()
+    }
+
+    @objc private func openHistorySpotlight(_ sender: Any?) {
+        Log.event(.tray, "tray.action", ["item": "historySpotlight"])
+        coordinator?.toggleHistorySpotlight()
+    }
+
+    @objc private func toggleAllPins(_ sender: Any?) {
+        Log.event(.tray, "tray.action", ["item": "togglePins"])
+        AppCoordinatorShared.coordinator?.toggleAllPinsVisibility()
     }
 
     @objc private func captureDelayed(_ sender: Any?) {
@@ -151,44 +165,4 @@ final class StatusItemController: NSObject {
         Log.event(.tray, "tray.action", ["item": "quit"])
         SnapcutQuitController.quit()
     }
-}
-
-// MARK: - 历史菜单（每次展开重建：缩略图 + 时间 + 尺寸）
-
-extension StatusItemController: NSMenuDelegate {
-    func menuNeedsUpdate(_ menu: NSMenu) {
-    rebuildHistoryMenu(menu)
-}
-
-private func rebuildHistoryMenu(_ menu: NSMenu) {
-    menu.removeAllItems()
-    let items = HistoryStore.shared.items()
-    if items.isEmpty {
-        let empty = NSMenuItem(title: "（暂无记录）", action: nil, keyEquivalent: "")
-        empty.isEnabled = false
-        menu.addItem(empty)
-        return
-    }
-    let formatter = DateFormatter()
-    formatter.dateFormat = "MM-dd HH:mm:ss"
-    Log.event(.tray, "tray.history.menu", ["count": "\(items.count)"])
-    for item in items.prefix(30) {
-        let size = "\(Int(item.pixelSize.width))×\(Int(item.pixelSize.height))"
-        let menuItem = NSMenuItem(
-            title: "\(formatter.string(from: item.date))  ·  \(size)",
-            action: #selector(copyHistoryItem(_:)),
-            keyEquivalent: ""
-        )
-        menuItem.target = self
-        menuItem.representedObject = item.id
-        if let thumb = HistoryStore.shared.thumbnail(for: item, maxSize: 16) {
-            menuItem.image = thumb
-        }
-        menu.addItem(menuItem)
-    }
-    menu.addItem(.separator())
-    let clear = NSMenuItem(title: "清空历史", action: #selector(clearHistory(_:)), keyEquivalent: "")
-    clear.target = self
-    menu.addItem(clear)
-}
 }

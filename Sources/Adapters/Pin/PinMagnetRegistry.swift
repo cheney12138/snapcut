@@ -1,13 +1,11 @@
 import AppKit
 import CoreGraphics
 
-/// 贴图磁吸组注册表（设计定稿 §1.2）：live pins 的组关系唯一真相源。
+/// 贴图磁吸组注册表：live pins 的组关系唯一真相源。
 ///
-/// - `pinID → groupID` 的成员映射 + `groups: [Int: [PinWindowController]]`
-/// - 组视觉（GroupBorderPanel）生命周期在这里管理：成组 ≥2 张建框，
-///   只剩 1 张解散
-/// - 不做持久化（pin 本身不持久化，一致）
-/// - 吸附时机：拖动中实时预览；union 在 mouseUp 提交（可撤销、不闪烁）
+/// - 统一视觉：每个 ≥2 张的拼贴组配一枚底层 `GroupBackdropPanel`（磨砂玻璃托盘）+
+///   一枚顶部居中悬浮 `GroupBorderPanel`（[ ⊞ 已拼贴 · N 张 | 合并拼图 | 拆分 | × ]）；
+/// - 拖底层磨砂托盘或顶栏胶囊 = 整组刚体 1:1 移动 + 松手滑入吸附。
 @MainActor
 final class PinMagnetRegistry {
     static let shared = PinMagnetRegistry()
@@ -17,23 +15,22 @@ final class PinMagnetRegistry {
 
     private var groups: [Int: [PinWindowController]] = [:]
     private var memberships: [ObjectIdentifier: Int] = [:]
+    private var backdropPanels: [Int: GroupBackdropPanel] = [:]
     private var borderPanels: [Int: GroupBorderPanel] = [:]
     private var nextGroupID = 1
 
-    /// 组框拖空白处的整组刚体拖动（含磁吸，⌘拖同款语义）
+    /// 拖磨砂托盘或顶栏胶囊的整组刚体拖动
     private var borderDrag: BorderDragState?
     private struct BorderDragState {
         let groupID: Int
         let startCursor: CGPoint
         let startFrames: [ObjectIdentifier: CGRect]
         let startUnion: CGRect
-        var snap: (partner: PinWindowController, edge: MagnetEdge)?
-        /// 磁吸手感（任务 B，同 PinWindowController.DragState）
-        var easer = SnapEaser()
-        var resnap = SnapResnapGuard()
+        var snapOutcome: MagnetSnapOutcome?
+        var snapPartner: PinWindowController?
     }
 
-    // MARK: - pin 身份（MagnetSnapItem.id：进程内唯一即可）
+    // MARK: - pin 身份
 
     static func id(of pin: PinWindowController) -> String {
         String(describing: ObjectIdentifier(pin))
@@ -45,7 +42,6 @@ final class PinMagnetRegistry {
 
     // MARK: - 生命周期
 
-    /// pin 创建（无组状态，无需登记）
     func register(_ pin: PinWindowController) {}
 
     /// pin 关闭：摘出组；组只剩 1 张时解散
@@ -62,15 +58,12 @@ final class PinMagnetRegistry {
 
     func memberCount(_ gid: Int) -> Int { groups[gid]?.count ?? 0 }
 
-    /// pin 所在组的成员（未成组 → [pin] 自身）
     func groupMembers(of pin: PinWindowController) -> [PinWindowController] {
         guard let gid = groupID(for: pin) else { return [pin] }
         return groups[gid] ?? [pin]
     }
 
-    /// 磁吸候选：除排除集合外的全部存活 pin（外框空间；未成组 pin 用
-    /// frame 外扩 9pt 的虚拟外框——垫出现前后几何不跳变）。
-    /// ignoreGroupOf：拖动中剔除该 pin 所在组的成员（⌥拆组拖不吸回原组）。
+    /// 磁吸候选：除排除集合外的全部存活 pin（真实内容框，无虚拟垫偏移）
     func snapCandidates(
         excluding pins: [PinWindowController],
         ignoreGroupOf: PinWindowController? = nil
@@ -81,16 +74,13 @@ final class PinMagnetRegistry {
         for pin in PinWindowController.livePins {
             if exclude.contains(ObjectIdentifier(pin)) { continue }
             if let ignoreGroup, groupID(for: pin) == ignoreGroup { continue }
-            let outer = pin.windowFrame(insetByGroupPad: !pin.inGroup)
-            items.append(MagnetSnapItem(id: Self.id(of: pin), frame: outer))
+            items.append(MagnetSnapItem(id: Self.id(of: pin), frame: pin.windowFrame))
         }
         return items
     }
 
     // MARK: - 成组 / 拆组
 
-    /// union 提交（mouseUp 吸附生效时调用；a 可为组拖 leader）
-    /// a、b 同组 → 只刷新布局；否则并成大组并记 collage.group.merge
     func union(_ a: PinWindowController, _ b: PinWindowController) {
         let ga = groupID(for: a)
         let gb = groupID(for: b)
@@ -98,8 +88,6 @@ final class PinMagnetRegistry {
             refreshLayout(groupID: ga)
             return
         }
-        // 目标组：a 有组用 a 的（⌘组拖吸到散件保留原组 id）；
-        // 都无组 → 新建
         let target: Int
         switch (ga, gb) {
         case (nil, nil):
@@ -118,7 +106,7 @@ final class PinMagnetRegistry {
                     groups[target]?.append(member)
                 }
                 groups[g] = nil
-                closePanel(g)
+                closePanels(g)
             }
             if groupID(for: pin) == nil {
                 memberships[ObjectIdentifier(pin)] = target
@@ -132,64 +120,149 @@ final class PinMagnetRegistry {
         refreshLayout(groupID: target)
     }
 
-    /// ⌥拖拆组：pin 脱离所在组（组只剩 1 张时随之解散）
+    /// 单卡脱离所在组（组只剩 1 张时随之解散）
     func detach(_ pin: PinWindowController) {
         guard let gid = memberships[ObjectIdentifier(pin)] else { return }
         memberships[ObjectIdentifier(pin)] = nil
+        pin.setInGroup(false)
         groups[gid]?.removeAll { $0 === pin }
         Log.event(.pin, "collage.group.detach", ["group": "\(gid)"])
         refreshLayout(groupID: gid)
     }
 
-    // MARK: - 组框布局（成员几何变化 → 重算 union rect）
+    // MARK: - 组磨砂托盘 + 顶栏布局
 
-    /// 成员 frame 变化（重排 / 缩放 / 拖动中）后调用
     func notifyLayoutChanged(_ pin: PinWindowController) {
         if let gid = groupID(for: pin) {
             refreshLayout(groupID: gid)
         }
     }
 
-    func refreshLayout(groupID gid: Int) {
+    /// 组内单卡被拖远时，柔化磨砂托盘与顶栏透明度，直觉提示「松手即移出组」
+    func setDetachingPreview(groupID gid: Int, isDetaching: Bool) {
+        let targetAlpha: CGFloat = isDetaching ? 0.36 : 1.0
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.14
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            backdropPanels[gid]?.animator().alphaValue = targetAlpha
+            borderPanels[gid]?.animator().alphaValue = targetAlpha
+        }
+    }
+
+    func refreshLayout(groupID gid: Int, excluding excludedPin: PinWindowController? = nil) {
         guard let members = groups[gid], !members.isEmpty else {
             groups[gid] = nil
-            closePanel(gid)
+            closePanels(gid)
             return
         }
-        // reviewer 修正 2026-11-15：原 guard 含 borderDrag?.groupID != gid——
-        // 拖组框路径（borderDragMoved 末尾显式调本方法）正撞短路，虚线框/徽标/
-        // 合成键永远留在原地不跟随。改为纯成员数判断（borderDrag 期间成员只经
-        // setFrameOrigin 落位、不触发 notifyLayoutChanged，安全）。
         guard members.count >= 2 else {
             dissolve(groupID: gid, members: members)
             return
         }
         for member in members { member.setInGroup(true) }
-        let union = MagnetGroup.unionRect(members.map { $0.windowFrame })
-        let panel = borderPanels[gid] ?? makeBorderPanel(gid)
-        // 窗体外扩 22（GroupFrame.panelOutset）：浮标骑框顶外 −11pt 不再被窗缘裁切
-        let outset = DesignTokens.GroupFrame.panelOutset
-        panel.setFrame(union.insetBy(dx: -outset, dy: -outset), display: true)
-        panel.orderFrontRegardless()
-        panel.refresh(count: members.count)
-        panel.playEntranceIfNeeded()
+
+        let layoutMembers: [PinWindowController]
+        if let excludedPin {
+            let remaining = members.filter { $0 !== excludedPin }
+            layoutMembers = remaining.count >= 2 ? remaining : members
+        } else {
+            layoutMembers = members
+        }
+
+        let union = MagnetGroup.unionRect(layoutMembers.map(\.windowFrame))
+
+        let backdrop = backdropPanels[gid] ?? makeBackdropPanel(gid)
+        backdrop.update(forUnion: union)
+        backdrop.playEntranceIfNeeded()
+
+        let topBar = borderPanels[gid] ?? makeBorderPanel(gid)
+        topBar.refresh(count: members.count, union: union)
+        topBar.playEntranceIfNeeded()
+    }
+
+    /// 一键拆分整组
+    func dissolveGroup(groupID gid: Int) {
+        guard let members = groups[gid] else { return }
+        dissolve(groupID: gid, members: members)
+    }
+
+    /// 一键关闭整组内全部贴图（顶栏「×」按钮或 Esc）
+    func closeGroup(groupID gid: Int) {
+        guard let members = groups[gid] else { return }
+        let snapshot = members
+        closePanels(gid)
+        groups[gid] = nil
+        for member in snapshot {
+            memberships[ObjectIdentifier(member)] = nil
+            member.close()
+        }
+        Log.event(.pin, "collage.group.closeAll", ["group": "\(gid)", "count": "\(snapshot.count)"])
+    }
+
+    /// 全局隐藏或唤回所有拼贴组托盘与顶栏（Boss Key），严禁清空组状态与坐标
+    func setAllGroupPanelsHidden(_ hidden: Bool) {
+        if hidden {
+            for panel in backdropPanels.values {
+                panel.orderOut(nil)
+            }
+            for panel in borderPanels.values {
+                panel.orderOut(nil)
+            }
+        } else {
+            for panel in backdropPanels.values {
+                panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue - 1)
+                panel.orderFrontRegardless()
+            }
+            for panel in borderPanels.values {
+                panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+                panel.orderFrontRegardless()
+            }
+        }
+    }
+
+    /// 确保所有拼贴组顶栏严格位于贴图窗口之上
+    func bringBorderPanelsToFront() {
+        for panel in borderPanels.values {
+            panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+            panel.orderFrontRegardless()
+        }
     }
 
     private func dissolve(groupID gid: Int, members: [PinWindowController]) {
-        for member in members { member.setInGroup(false) }
+        for member in members {
+            memberships[ObjectIdentifier(member)] = nil
+            member.setInGroup(false)
+        }
         groups[gid] = nil
-        closePanel(gid)
+        closePanels(gid)
         Log.event(.pin, "collage.group.dissolve", ["group": "\(gid)"])
     }
 
-    private func closePanel(_ gid: Int) {
-        borderPanels[gid]?.dismissAnimated()   // 退场 fade 0.15s（completion 持有面板收窗）
+    private func closePanels(_ gid: Int) {
+        backdropPanels[gid]?.dismissAnimated()
+        backdropPanels[gid] = nil
+        borderPanels[gid]?.dismissAnimated()
         borderPanels[gid] = nil
+    }
+
+    private func makeBackdropPanel(_ gid: Int) -> GroupBackdropPanel {
+        let panel = GroupBackdropPanel(groupID: gid)
+        panel.onDragBegin = { [weak self] in
+            self?.beginBorderDrag(groupID: gid, at: NSEvent.mouseLocation)
+        }
+        panel.onDragMoved = { [weak self] in self?.borderDragMoved() }
+        panel.onDragEnd = { [weak self] in self?.endBorderDrag() }
+        panel.onCloseGroup = { [weak self] in self?.closeGroup(groupID: gid) }
+        backdropPanels[gid] = panel
+        return panel
     }
 
     private func makeBorderPanel(_ gid: Int) -> GroupBorderPanel {
         let panel = GroupBorderPanel(groupID: gid)
         panel.onAssemble = { [weak self] in self?.assemble(groupID: gid) }
+        panel.onQuickCopy = { [weak self] in self?.quickCopyGroup(gid) }
+        panel.onUngroup = { [weak self] in self?.dissolveGroup(groupID: gid) }
+        panel.onCloseGroup = { [weak self] in self?.closeGroup(groupID: gid) }
         panel.onDragBegin = { [weak self] in
             self?.beginBorderDrag(groupID: gid, at: NSEvent.mouseLocation)
         }
@@ -199,18 +272,20 @@ final class PinMagnetRegistry {
         return panel
     }
 
-    // MARK: - 组框拖空白处 = 整组刚体移动（含磁吸）
+    // MARK: - 拖磨砂托盘 / 顶栏胶囊 = 整组刚体 1:1 移动 + 松手滑入吸附
 
     private func beginBorderDrag(groupID gid: Int, at cursor: CGPoint) {
         guard borderDrag == nil, let members = groups[gid], members.count >= 2 else { return }
+        SnapGlideAnimator.shared.cancel()
         var frames: [ObjectIdentifier: CGRect] = [:]
         for member in members { frames[ObjectIdentifier(member)] = member.windowFrame }
         borderDrag = BorderDragState(
             groupID: gid,
             startCursor: cursor,
             startFrames: frames,
-            startUnion: MagnetGroup.unionRect(members.map { $0.windowFrame }),
-            snap: nil
+            startUnion: MagnetGroup.unionRect(members.map(\.windowFrame)),
+            snapOutcome: nil,
+            snapPartner: nil
         )
     }
 
@@ -218,117 +293,149 @@ final class PinMagnetRegistry {
         guard var state = borderDrag, let members = groups[state.groupID] else { return }
         let cursor = NSEvent.mouseLocation
         let delta = CGSize(width: cursor.x - state.startCursor.x, height: cursor.y - state.startCursor.y)
+
+        // 严格 1:1 跟随，零阻力死区
+        for member in members {
+            let start = state.startFrames[ObjectIdentifier(member)] ?? member.windowFrame
+            member.setFrameOrigin(start.origin.offsetBy(delta))
+        }
+
         let candidate = state.startUnion.offsetBy(dx: delta.width, dy: delta.height)
         let others = snapCandidates(excluding: members)
-        let active = state.snap.map { (Self.id(of: $0.partner), $0.edge) }
-        let now = CACurrentMediaTime()
-
-        func applyFree() {
-            let rendered = state.easer.freeFrame(target: candidate.origin, now: now)
-            let moveDelta = CGSize(
-                width: rendered.x - state.startUnion.origin.x,
-                height: rendered.y - state.startUnion.origin.y
-            )
-            for member in members {
-                let start = state.startFrames[ObjectIdentifier(member)] ?? member.windowFrame
-                member.setFrameOrigin(start.origin.offsetBy(moveDelta))
+        if let outcome = MagnetGroup.previewSnap(candidate: candidate, others: others),
+           let partner = pin(byID: outcome.partnerID) {
+            if state.snapPartner !== partner {
+                state.snapPartner?.contentView.setSnapGlow(false)
+                partner.contentView.setSnapGlow(true)
             }
-        }
-
-        if let outcome = MagnetGroup.snap(candidate: candidate, others: others, active: active),
-           // 重吸防抖：刚分离 200ms 内同伙伴同边不重吸
-           !state.resnap.shouldSuppress(partnerID: outcome.partnerID, edge: outcome.edge, now: now) {
-            // 分离阻力 + 落位缓动（同 PinWindowController.dragGroupMoved）
-            let resist = SnapFeel.resistOffset(candidate: candidate, outcome: outcome)
-            let target = candidate.origin.offsetBy(CGSize(
-                width: outcome.frame.minX - candidate.minX,
-                height: outcome.frame.minY - candidate.minY
-            )).offsetBy(resist)
-            let partner = pin(byID: outcome.partnerID)
-            let isNewSnap = state.snap.map {
-                $0.partner !== partner || $0.edge != outcome.edge
-            } ?? true
-            let rendered = state.easer.snapFrame(target: target, newSnap: isNewSnap, now: now)
-            let moveDelta = CGSize(
-                width: rendered.x - state.startUnion.origin.x,
-                height: rendered.y - state.startUnion.origin.y
-            )
-            for member in members {
-                let start = state.startFrames[ObjectIdentifier(member)] ?? member.windowFrame
-                member.setFrameOrigin(start.origin.offsetBy(moveDelta))
-            }
-            if state.snap?.partner !== partner {
-                state.snap?.partner.contentView.setSnapGlow(false)
-                partner?.contentView.setSnapGlow(true)
-            }
-            state.snap = partner.map { ($0, outcome.edge) }
-            borderDrag = state
+            state.snapOutcome = outcome
+            state.snapPartner = partner
+            SnapPreviewOverlay.shared.show(outcome: outcome)
         } else {
-            if let snapped = state.snap {
-                Log.event(.pin, "collage.magnet.release", [:])
-                snapped.partner.contentView.setSnapGlow(false)
-                state.resnap.noteRelease(
-                    partnerID: Self.id(of: snapped.partner),
-                    edge: snapped.edge,
-                    now: now
-                )
-                state.snap = nil
-                borderDrag = state
+            state.snapPartner?.contentView.setSnapGlow(false)
+            if state.snapOutcome != nil {
+                SnapPreviewOverlay.shared.hide()
             }
-            applyFree()
+            state.snapOutcome = nil
+            state.snapPartner = nil
         }
+
+        borderDrag = state
         refreshLayout(groupID: state.groupID)
     }
 
     func endBorderDrag() {
         guard let state = borderDrag else { return }
         borderDrag = nil
-        state.snap?.partner.contentView.setSnapGlow(false)
-        if let snap = state.snap {
-            Log.event(.pin, "collage.magnet.snap", [
-                "edge": snap.edge.rawValue,
-                "partner": Self.id(of: snap.partner),
-                "via": "border",
-            ])
-            // 整组吸到对方：leader 取组内任一成员做 union
-            // reviewer 补丁：partner 可能在拖动中途被 Esc 关掉（僵尸引用）——
-            // union 前校验存活，避免把已关窗塞回组
-            if let leader = groups[state.groupID]?.first,
-               PinWindowController.livePins.contains(where: { $0 === snap.partner }) {
-                union(leader, snap.partner)
-            }
+        SnapPreviewOverlay.shared.hide()
+        state.snapPartner?.contentView.setSnapGlow(false)
+
+        guard let outcome = state.snapOutcome,
+              let partner = state.snapPartner,
+              let members = groups[state.groupID],
+              !members.isEmpty,
+              PinWindowController.livePins.contains(where: { $0 === partner })
+        else { return }
+
+        Log.event(.pin, "collage.magnet.snap", [
+            "edge": outcome.edge.rawValue,
+            "align": outcome.alignKind?.rawValue ?? "free",
+            "partner": Self.id(of: partner),
+            "via": "tray",
+        ])
+
+        let currentUnion = MagnetGroup.unionRect(members.map(\.windowFrame))
+        let delta = CGSize(
+            width: outcome.frame.minX - currentUnion.minX,
+            height: outcome.frame.minY - currentUnion.minY
+        )
+        let glideItems = members.map { m in
+            let cur = m.windowFrame.origin
+            return (m, cur, cur.offsetBy(delta))
         }
+        let gid = state.groupID
+        SnapGlideAnimator.shared.glide(
+            items: glideItems,
+            onStep: { [weak self] in
+                self?.refreshLayout(groupID: gid)
+            },
+            onComplete: { [weak self, weak partner] in
+                guard let self, let partner,
+                      let leader = self.groups[gid]?.first,
+                      PinWindowController.livePins.contains(where: { $0 === partner })
+                else { return }
+                self.union(leader, partner)
+            }
+        )
     }
 
-    // MARK: - 合成整体（组 → 合成图 → 标注编辑器）
+    // MARK: - 合成整体（直接复制 / 合并进入标注编辑器）
 
-    func assemble(groupID gid: Int) {
-        guard let members = groups[gid], members.count >= 2 else { return }
+    private func composeGroup(_ members: [PinWindowController], logFailureEvent: String) -> (image: CGImage, pxScale: CGFloat)? {
         let items = members.map { (image: $0.image, frame: $0.windowFrame) }
         guard let composited = PinAssembleEngine.compose(members: items) else {
-            Log.error(.pin, "collage.assemble.fail", ["reason": "compose"])
-            return
+            Log.error(.pin, logFailureEvent, ["reason": "compose"])
+            return nil
         }
+        return composited
+    }
+
+    private func quickCopyGroup(_ gid: Int) {
+        guard let members = groups[gid], members.count >= 2,
+              let composited = composeGroup(members, logFailureEvent: "collage.quickCopy.fail")
+        else { return }
+        let image = composited.image
+        _ = AppCoordinatorShared.deps?.clipboard.writeImage(image) ?? ClipboardWriter.writeImage(image)
+        AppCoordinatorShared.deps?.history.record(image)
+        CaptureToast.show(
+            image: image,
+            message: "已复制拼图（\(members.count) 张）",
+            onClick: {
+                AppCoordinatorShared.coordinator?.openStandaloneEditor(image: image)
+            }
+        )
+        Log.event(.pin, "collage.group.quickCopy", [
+            "group": "\(gid)",
+            "members": "\(members.count)",
+        ])
+    }
+
+    func assemble(groupID gid: Int) {
+        guard let members = groups[gid], members.count >= 2,
+              let composited = composeGroup(members, logFailureEvent: "collage.assemble.fail")
+        else { return }
         let composite = composited.image
         Log.event(.export, "collage.assemble", [
             "members": "\(members.count)",
             "pxW": "\(composite.width)",
             "pxH": "\(composite.height)",
         ])
-        // 成员 pin 窗体全部关闭（图像已烤入合成图）；先摘组再关窗，
-        // 避免 close→remove 触发 dissolve 逻辑对残组的误处理
+        let union = MagnetGroup.unionRect(members.map(\.windowFrame))
+        let canvasRect = union.insetBy(
+            dx: -GroupBackdropPanel.matPadding,
+            dy: -GroupBackdropPanel.matPadding
+        )
+        let targetScreen = NSScreen.screens.first { $0.frame.intersects(union) } ?? NSScreen.main
+
         let pins = members
         for pin in pins { memberships[ObjectIdentifier(pin)] = nil }
         groups[gid] = nil
-        closePanel(gid)
+        closePanels(gid)
         for pin in pins { pin.close() }
-        // pxScale 透传（reviewer 补丁：多屏 pin 时 NSScreen.main 猜的 scale 会错
-        // → 编辑器 ptSize/标注/马赛克整体错位；用烤图时的真实 scale）
-        CollageEditorWindowController.present(composite: composite, pxScale: composited.pxScale)
+
+        // 直接进入一体化无边框 Apple 编辑器（原位无缝衔接 + 底部 Liquid Glass 悬浮工具栏），
+        // 彻底替代旧版带黑标题栏与红绿灯的 CollageEditorWindowController
+        if let coordinator = AppCoordinatorShared.coordinator {
+            coordinator.openStandaloneEditor(
+                image: composite,
+                preferredScreen: targetScreen,
+                preferredRect: canvasRect
+            )
+        } else {
+            CollageEditorWindowController.present(composite: composite, pxScale: composited.pxScale)
+        }
     }
 }
-
-// MARK: - 几何小工具
 
 private extension CGPoint {
     func offsetBy(_ size: CGSize) -> CGPoint {

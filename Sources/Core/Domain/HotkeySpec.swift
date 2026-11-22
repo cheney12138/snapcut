@@ -35,35 +35,48 @@ public struct HotkeySpec: Equatable, Sendable {
     private static let namedKeySymbols: [String: String] = [
         "return": "⏎", "esc": "esc", "space": "Space", "delete": "⌫", "tab": "⇥",
     ]
+    private static let compactNamedSymbols: [String: String] = [
+        "return": "↩", "esc": "Esc", "space": "Space", "delete": "⌫", "tab": "⇥",
+    ]
 
     /// 显示格式化："cmd+shift+a" → "⌘ ⇧ A"（UI 三处共用：引导窗/托盘菜单/设置页）
     /// （病例：用户改了快捷键，引导窗提示还是写死的 ⌘⇧A）
     /// 命名键显示符号（"return"→"⏎"，"esc"→"esc"）；裸键无前缀（"o"→"O"）
     public static func display(_ text: String) -> String {
+        formatDisplay(text, separator: " ", namedMap: namedKeySymbols)
+    }
+
+    /// 紧凑键帽显示："cmd+e" → "⌘E"，"return" → "↩"，"esc" → "Esc"
+    public static func compactDisplay(_ text: String) -> String {
+        formatDisplay(text, separator: "", namedMap: compactNamedSymbols)
+    }
+
+    private static func formatDisplay(_ text: String, separator: String, namedMap: [String: String]) -> String {
         let parts = text.lowercased().split(separator: "+").map(String.init)
         guard let key = parts.last, !key.isEmpty else { return text }
         var prefix = ""
         for mod in parts.dropLast() {
             switch mod {
-            case "cmd", "command": prefix += "⌘ "
-            case "shift": prefix += "⇧ "
-            case "opt", "option", "alt": prefix += "⌥ "
-            case "ctrl", "control": prefix += "⌃ "
+            case "cmd", "command": prefix += "⌘" + separator
+            case "shift": prefix += "⇧" + separator
+            case "opt", "option", "alt": prefix += "⌥" + separator
+            case "ctrl", "control": prefix += "⌃" + separator
             default: break
             }
         }
-        if let symbol = namedKeySymbols[key] { return prefix + symbol }
-        return prefix + (key.count == 1 ? key.uppercased() : key)
+        if let symbol = namedMap[key] { return prefix + symbol }
+        return prefix + (key.count == 1 ? key.uppercased() : key.uppercased())
     }
 
     /// 全局热键解析（原语义：至少一个修饰键，防抢打字）
     public static func parse(_ text: String) -> HotkeySpec? {
-        parse(text, allowBare: false)
+        parse(text, allowBare: false, allowNamedBare: false)
     }
 
-    /// 编辑器热键解析：allowBare = true 时允许裸键（"o"）与命名键
-    /// （"return"/"esc"）——编辑器作用域无打字冲突（文字输入态不走这条路径）。
-    public static func parse(_ text: String, allowBare: Bool) -> HotkeySpec? {
+    /// 编辑器/浮窗热键解析：
+    /// - `allowBare = true` 允许裸字母/数字（"o"）；
+    /// - `allowNamedBare = true` 额外允许无修饰键的命名键（如 `"return"` / `"esc"`）。
+    public static func parse(_ text: String, allowBare: Bool, allowNamedBare: Bool = false) -> HotkeySpec? {
         let parts = text.lowercased().split(separator: "+").map(String.init)
         guard let keyPart = parts.last, !keyPart.isEmpty else { return nil }
         var code: UInt32? = nil
@@ -84,14 +97,17 @@ public struct HotkeySpec: Equatable, Sendable {
             }
         }
         // 至少一个修饰键，否则会抢普通打字（例外：编辑器作用域 allowBare；
-        // F 键（功能键）任何作用域都无打字冲突，裸用安全——用户裁定 F 区
-        // 全局放开）
+        // F 键（功能键）任何作用域都无打字冲突，裸用安全；allowNamedBare 允许无修饰命名键如 return）
         if mods.isEmpty {
             let isFunctionKey = keyPart.count > 1 && namedKeys[keyPart] != nil
-                && keyPart.hasPrefix("f") && keyPart.dropFirst().first?.isNumber == true
+                && keyPart.hasPrefix("f") && keyPart.dropFirst().allSatisfy(\.isNumber)
             if !isFunctionKey {
-                guard allowBare else { return nil }
-                if keyPart.count != 1 { return nil }
+                let isNamed = namedKeys[keyPart] != nil
+                if isNamed {
+                    guard allowNamedBare else { return nil }
+                } else {
+                    guard allowBare, keyPart.count == 1 else { return nil }
+                }
             }
         }
         return HotkeySpec(keyCode: keyCode, modifiers: mods)

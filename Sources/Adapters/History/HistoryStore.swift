@@ -10,8 +10,20 @@ private enum HistoryPaths {
     static let directory = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Snapcut/history", isDirectory: true)
-    /// 索引文件：目录里每张 png 的元数据（尺寸/时间）都记在这里
+    /// 索引文件：目录里每张 png 的元数据（尺寸/时间/来源/OCR/可重编标记）都记在这里
     static let indexURL = directory.appendingPathComponent("index.json")
+
+    static func imageURL(for id: String) -> URL {
+        directory.appendingPathComponent("\(id).png")
+    }
+
+    static func baseImageURL(for id: String) -> URL {
+        directory.appendingPathComponent("\(id).base.png")
+    }
+
+    static func annotationsURL(for id: String) -> URL {
+        directory.appendingPathComponent("\(id).annotations.json")
+    }
 }
 
 // MARK: - 索引条目（index.json 的 Codable 形态，CGSize 拆成宽高）
@@ -21,18 +33,69 @@ private struct HistoryIndexEntry: Codable, Sendable {
     let date: Date
     let width: CGFloat
     let height: CGFloat
+    var sourceApp: String?
+    var windowTitle: String?
+    var ocrText: String
+    var hasEditableAnnotations: Bool
+
+    init(
+        id: String,
+        date: Date,
+        width: CGFloat,
+        height: CGFloat,
+        sourceApp: String? = nil,
+        windowTitle: String? = nil,
+        ocrText: String = "",
+        hasEditableAnnotations: Bool = false
+    ) {
+        self.id = id
+        self.date = date
+        self.width = width
+        self.height = height
+        self.sourceApp = sourceApp
+        self.windowTitle = windowTitle
+        self.ocrText = ocrText
+        self.hasEditableAnnotations = hasEditableAnnotations
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case date
+        case width
+        case height
+        case sourceApp
+        case windowTitle
+        case ocrText
+        case hasEditableAnnotations
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        date = try container.decode(Date.self, forKey: .date)
+        width = try container.decode(CGFloat.self, forKey: .width)
+        height = try container.decode(CGFloat.self, forKey: .height)
+        sourceApp = try container.decodeIfPresent(String.self, forKey: .sourceApp)
+        windowTitle = try container.decodeIfPresent(String.self, forKey: .windowTitle)
+        ocrText = try container.decodeIfPresent(String.self, forKey: .ocrText) ?? ""
+        hasEditableAnnotations = try container.decodeIfPresent(Bool.self, forKey: .hasEditableAnnotations) ?? false
+    }
 
     var pixelSize: CGSize { CGSize(width: width, height: height) }
-    var fileURL: URL { HistoryPaths.directory.appendingPathComponent("\(id).png") }
+    var fileURL: URL { HistoryPaths.imageURL(for: id) }
 }
 
-/// 历史记录（docs/03 §10：PNG 落盘 + index.json 索引，保留最近 30 条）。
+/// 历史记录（docs/03 §10 + v0.3 M2 视觉记忆库）：
+/// - PNG 落盘 + index.json 索引（向后兼容旧版 4 字段 JSON）
+/// - 最近 20 条可重编标注保留 `<id>.base.png` + `<id>.annotations.json` sidecar
+/// - 低优先级串行后台 OCR 索引队列，不阻塞前台截图与主线程
 ///
 /// 线程模型（Swift 6 strict concurrency）：
 /// - `@MainActor` 只维护内存索引 `itemsCache`（新 → 旧）；
-/// - PNG 编码、落盘、文件删除、index.json 写回全部走后台 Task；
+/// - PNG 编码、落盘、sidecar 写入、文件删除、index.json 写回与 OCR 全部走后台 Task；
 /// - `record` 失败只写日志，绝不抛错打断截图流程；
-/// - index.json 写回经 `indexWriteTask` 串行链，避免后台并发互相覆盖。
+/// - index.json 写回经 `indexWriteTask` 串行链，避免后台并发互相覆盖；
+/// - 增量 OCR 经 `ocrQueueTask` 串行链，启动补齐经 `backfillTask` 低优先级逐条串行。
 @MainActor
 final class HistoryStore {
 
@@ -43,11 +106,44 @@ final class HistoryStore {
         let date: Date
         let pixelSize: CGSize
         let url: URL
+        var sourceApp: String? = nil
+        var windowTitle: String? = nil
+        var ocrText: String = ""
+        var hasEditableAnnotations: Bool = false
+
+        var record: HistoryRecord {
+            HistoryRecord(
+                id: id,
+                createdAt: date,
+                width: Int(pixelSize.width.rounded()),
+                height: Int(pixelSize.height.rounded()),
+                sourceApp: sourceApp,
+                windowTitle: windowTitle,
+                ocrText: ocrText,
+                hasEditableAnnotations: hasEditableAnnotations
+            )
+        }
     }
 
-    /// 保留上限，超出删最旧（PNG 与索引条目一起删）
+    /// 保留上限，超出删最旧（成品 PNG、sidecar 与索引条目一起删）
     /// 保留条数（由设置面板配置，默认 30）
-    var maxItems = 30
+    var maxItems = 30 {
+        didSet {
+            thumbnailCache.countLimit = max(1, maxItems * 2)
+        }
+    }
+
+    /// 可重编矢量标注 sidecar（.base.png + .annotations.json）保留上限
+    var maxEditableItems = 20
+
+    /// 外部注入的文字识别端口（严禁在 HistoryStore 直接 import Vision）
+    var textRecognizer: (any TextRecognizing)?
+
+    /// 导出后是否自动后台执行本地 OCR 文本索引
+    var autoIndexOCREnabled: Bool = true
+
+    /// 条目新增、清空或后台 OCR 回填完成时在 MainActor 通知 UI（如刷新 Spotlight 面板）
+    var onItemsChanged: (() -> Void)?
 
     /// 内存索引（新 → 旧），MainActor 独占
     private var itemsCache: [Item] = []
@@ -58,14 +154,38 @@ final class HistoryStore {
     /// index.json 后台写回的串行链（后一次写等前一次完成，快照永不乱序）
     private var indexWriteTask: Task<Void, Never>?
 
+    /// 增量 OCR 后台串行队列（低优先级 .utility）
+    private var ocrQueueTask: Task<Void, Never>?
+
+    /// 启动后低优先级补齐存量缺失 OCR 的后台任务
+    private var backfillTask: Task<Void, Never>?
+
     private init() {
-        thumbnailCache.countLimit = maxItems
+        thumbnailCache.countLimit = max(1, maxItems * 2)
         if let entries = Self.readIndexEntries() {
-            // 索引可用：≤30 条的小 JSON，同步读保证 items() 首次调用即有数据；
-            // png 已被用户手动删掉的条目直接丢弃并回写索引
+            // 索引可用：同步读保证 items() 首次调用即有数据；
+            // png 已被用户手动删掉的条目直接丢弃并回写索引；
+            // sidecar 被删的条目自动修正 hasEditableAnnotations
+            var needsPersist = false
             let valid = entries.filter { FileManager.default.fileExists(atPath: $0.fileURL.path) }
-            itemsCache = valid.map { Self.item(from: $0) }
-            if valid.count != entries.count { persistIndex() }
+            if valid.count != entries.count { needsPersist = true }
+
+            itemsCache = valid.map { entry in
+                var item = Self.item(from: entry)
+                if item.hasEditableAnnotations && !Self.hasEditableSidecar(id: item.id) {
+                    item.hasEditableAnnotations = false
+                    needsPersist = true
+                }
+                return item
+            }
+            itemsCache.sort { $0.date > $1.date }
+
+            let prunedSidecars = pruneEditableSidecarsIfNeeded()
+            if !prunedSidecars.isEmpty {
+                needsPersist = true
+                deleteFiles(prunedSidecars)
+            }
+            if needsPersist { persistIndex() }
             Log.event(.history, "history.load", ["count": "\(itemsCache.count)", "source": "index"])
         } else {
             // 索引缺失/损坏：后台扫描目录里的 png 按文件时间重建，不阻塞启动
@@ -79,13 +199,24 @@ final class HistoryStore {
 
     // MARK: - 公开 API
 
-    /// 记录一张截图：后台编码 PNG → 落盘 → 更新索引；失败只写日志
+    /// 记录一张截图：转发到带可选元数据的版本
     func record(_ image: CGImage) {
+        record(image, metadata: nil)
+    }
+
+    /// 记录一张截图（含可选来源/底图/可重编标注）：后台编码落盘 → 更新索引 → 排队静默 OCR
+    func record(_ image: CGImage, metadata: HistoryCaptureMetadata?) {
         let date = Date()
         let id = Self.makeID(date: date)
-        let url = HistoryPaths.directory.appendingPathComponent("\(id).png")
+        let url = HistoryPaths.imageURL(for: id)
         let width = image.width
         let height = image.height
+        let sourceApp = Self.normalizedOptionalText(metadata?.sourceApp)
+        let windowTitle = Self.normalizedOptionalText(metadata?.windowTitle)
+        let baseImage = metadata?.baseImage
+        let canvasSize = metadata?.canvasSize
+        let annotations = metadata?.annotations ?? []
+        let strokeWidth = metadata?.strokeWidth ?? 2
 
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let data = Self.encodePNG(image) else {
@@ -103,13 +234,83 @@ final class HistoryStore {
                 ])
                 return
             }
-            await self?.commit(id: id, date: date, width: width, height: height, bytes: data.count)
+
+            var hasEditableAnnotations = false
+            if let baseImage,
+               let canvasSize,
+               canvasSize.width > 0,
+               canvasSize.height > 0,
+               !annotations.isEmpty {
+                hasEditableAnnotations = Self.writeEditableSidecar(
+                    id: id,
+                    baseImage: baseImage,
+                    canvasSize: canvasSize,
+                    annotations: annotations,
+                    strokeWidth: strokeWidth
+                )
+            }
+
+            await self?.commit(
+                id: id,
+                date: date,
+                width: width,
+                height: height,
+                bytes: data.count,
+                sourceApp: sourceApp,
+                windowTitle: windowTitle,
+                hasEditableAnnotations: hasEditableAnnotations,
+                imageForOCR: image
+            )
         }
     }
 
     /// 当前历史（新 → 旧）
     func items() -> [Item] {
         itemsCache
+    }
+
+    /// 当前历史纯领域记录（新 → 旧）
+    func records() -> [HistoryRecord] {
+        itemsCache.map(\.record)
+    }
+
+    /// 按 id 查找历史条目
+    func item(for id: String) -> Item? {
+        itemsCache.first { $0.id == id }
+    }
+
+    /// 内存级多字段历史检索（OCR 文本 / 应用名 / 窗口标题 / 尺寸 / 日期）
+    func search(query: String) -> [HistorySearchMatch] {
+        HistorySearch.filter(records(), query: query)
+    }
+
+    /// 从 `<id>.png` 解码完整原图
+    func loadFullImage(for id: String) -> CGImage? {
+        let url = HistoryPaths.imageURL(for: id)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let image = Self.decodeCGImage(at: url) else {
+            Log.error(.history, "history.load_image.fail", ["id": id])
+            return nil
+        }
+        return image
+    }
+
+    /// 读取可重编会话（`<id>.base.png` + `<id>.annotations.json`）；任一缺失或损坏返回 `nil`
+    func loadEditableSession(for id: String) -> (baseImage: CGImage, payload: EditableSessionPayload)? {
+        let baseURL = HistoryPaths.baseImageURL(for: id)
+        let annotationsURL = HistoryPaths.annotationsURL(for: id)
+        guard FileManager.default.fileExists(atPath: baseURL.path),
+              FileManager.default.fileExists(atPath: annotationsURL.path),
+              let baseImage = Self.decodeCGImage(at: baseURL),
+              let data = try? Data(contentsOf: annotationsURL) else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        guard let payload = try? decoder.decode(EditableSessionPayload.self, from: data) else {
+            Log.error(.history, "history.editable.decode_fail", ["id": id])
+            return nil
+        }
+        return (baseImage, payload)
     }
 
     /// 把指定历史条目复制到系统剪贴板（PNG + TIFF 双表示，对齐 ClipboardWriter）
@@ -134,12 +335,32 @@ final class HistoryStore {
         return ok
     }
 
+    /// 按 id 把历史图片复制到系统剪贴板（便捷封装）
+    @discardableResult
+    func copyToPasteboard(id: String) -> Bool {
+        if let existing = item(for: id) {
+            return copyToPasteboard(existing)
+        }
+        let url = HistoryPaths.imageURL(for: id)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            Log.error(.history, "history.copy.missing", ["id": id])
+            return false
+        }
+        let fallback = Item(id: id, date: Date(), pixelSize: .zero, url: url)
+        return copyToPasteboard(fallback)
+    }
+
     /// 一键清空：内存索引立即置空，磁盘删除放后台
     func clearAll() {
         let removed = itemsCache.count
         itemsCache = []
         thumbnailCache.removeAllObjects()
+        backfillTask?.cancel()
+        backfillTask = nil
+        ocrQueueTask?.cancel()
+        ocrQueueTask = nil
         Log.event(.history, "history.clear", ["removed": "\(removed)"])
+        onItemsChanged?()
         let previous = indexWriteTask
         indexWriteTask = Task.detached(priority: .utility) {
             await previous?.value
@@ -155,63 +376,230 @@ final class HistoryStore {
 
     /// 缩略图（CGImageSource 按需解码 + NSCache 缓存）
     func thumbnail(for item: Item, maxSize: CGFloat) -> NSImage? {
-        let key = "\(item.id)#\(Int(maxSize))" as NSString
+        thumbnail(forRecordID: item.id, pixelSize: item.pixelSize, maxSize: maxSize)
+    }
+
+    /// 按记录 ID 取缓存缩略图（供 Spotlight 面板直接按 `HistoryRecord` 取缩略图）
+    func thumbnail(forRecordID id: String, pixelSize: CGSize, maxSize: CGFloat) -> NSImage? {
+        let key = "\(id)#\(Int(maxSize))" as NSString
         if let cached = thumbnailCache.object(forKey: key) { return cached }
 
+        let url = HistoryPaths.imageURL(for: id)
         let maxPixelSize = max(1, maxSize * 2) // Retina 2x 像素密度
         let options = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
         ] as [CFString: Any] as CFDictionary
-        guard let source = CGImageSourceCreateWithURL(item.url as CFURL, nil),
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
-            Log.error(.history, "history.thumb.fail", ["id": item.id])
+            Log.error(.history, "history.thumb.fail", ["id": id])
             return nil
         }
+        let referenceSize: CGSize
+        if pixelSize.width > 0 && pixelSize.height > 0 {
+            referenceSize = pixelSize
+        } else {
+            referenceSize = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+        }
         let aspect = min(
-            maxSize / max(1, item.pixelSize.width),
-            maxSize / max(1, item.pixelSize.height)
+            maxSize / max(1, referenceSize.width),
+            maxSize / max(1, referenceSize.height)
         )
-        let image = NSImage(
-            cgImage: cgImage,
-            size: NSSize(width: item.pixelSize.width * aspect, height: item.pixelSize.height * aspect)
+        let targetSize = NSSize(
+            width: max(1, referenceSize.width * aspect),
+            height: max(1, referenceSize.height * aspect)
         )
+        let image = NSImage(cgImage: cgImage, size: targetSize)
         thumbnailCache.setObject(image, forKey: key)
         return image
+    }
+
+    /// 启动后低优先级懒补齐尚未有 OCR 文本的存量记录（逐条串行、间隔 150ms、可中途取消）
+    func backfillMissingOCRIfNeeded() {
+        guard autoIndexOCREnabled, let recognizer = textRecognizer else { return }
+        guard backfillTask == nil else { return }
+
+        let candidateIDs = itemsCache
+            .filter { $0.ocrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .map(\.id)
+        guard !candidateIDs.isEmpty else { return }
+
+        backfillTask = Task.detached(priority: .background) { [weak self] in
+            guard let self else { return }
+
+            for (offset, id) in candidateIDs.enumerated() {
+                if Task.isCancelled { break }
+                let canContinue = await MainActor.run {
+                    self.autoIndexOCREnabled && self.textRecognizer != nil
+                }
+                guard canContinue else { break }
+
+                if offset > 0 {
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    if Task.isCancelled { break }
+                    let stillEnabled = await MainActor.run {
+                        self.autoIndexOCREnabled && self.textRecognizer != nil
+                    }
+                    guard stillEnabled else { break }
+                }
+
+                // 若前台新截图正在做增量 OCR，等它完成后再执行，避免后台抢占 Vision CPU
+                if let pendingOCR = await MainActor.run(body: { self.ocrQueueTask }) {
+                    await pendingOCR.value
+                    if Task.isCancelled { break }
+                }
+
+                let stillNeedsOCR = await MainActor.run {
+                    guard self.autoIndexOCREnabled,
+                          let item = self.itemsCache.first(where: { $0.id == id }) else {
+                        return false
+                    }
+                    return item.ocrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                guard stillNeedsOCR else { continue }
+
+                guard let image = Self.decodeCGImage(at: HistoryPaths.imageURL(for: id)) else {
+                    continue
+                }
+
+                do {
+                    let raw = try await recognizer.recognize(image)
+                    let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    await self.applyBackfillOCRResult(id: id, text: normalized)
+                } catch {
+                    Log.error(.history, "history.ocr.fail", ["id": id, "err": error.localizedDescription])
+                }
+            }
+
+            await MainActor.run {
+                self.backfillTask = nil
+            }
+        }
     }
 
     // MARK: - 私有：索引状态维护（MainActor）
 
     /// 落盘成功后并入内存索引（后台任务完成顺序不定，按时间排序兜底）
-    private func commit(id: String, date: Date, width: Int, height: Int, bytes: Int) {
+    private func commit(
+        id: String,
+        date: Date,
+        width: Int,
+        height: Int,
+        bytes: Int,
+        sourceApp: String?,
+        windowTitle: String?,
+        hasEditableAnnotations: Bool,
+        imageForOCR: CGImage
+    ) {
         let item = Item(
             id: id,
             date: date,
             pixelSize: CGSize(width: CGFloat(width), height: CGFloat(height)),
-            url: HistoryPaths.directory.appendingPathComponent("\(id).png")
+            url: HistoryPaths.imageURL(for: id),
+            sourceApp: sourceApp,
+            windowTitle: windowTitle,
+            ocrText: "",
+            hasEditableAnnotations: hasEditableAnnotations
         )
         itemsCache.insert(item, at: 0)
         itemsCache.sort { $0.date > $1.date }
         let evicted = pruneIfNeeded()
-        Log.event(.history, "history.record", ["id": id, "count": "\(itemsCache.count)", "bytes": "\(bytes)"])
+        let evictedSidecars = pruneEditableSidecarsIfNeeded()
+        Log.event(.history, "history.record", [
+            "id": id,
+            "count": "\(itemsCache.count)",
+            "bytes": "\(bytes)",
+            "editable": "\(hasEditableAnnotations)",
+        ])
         if !evicted.isEmpty {
             Log.event(.history, "history.pruned", ["removed": "\(evicted.count)"])
         }
-        deleteFiles(evicted)
+        if !evictedSidecars.isEmpty {
+            Log.event(.history, "history.sidecar.pruned", ["removed": "\(evictedSidecars.count)"])
+        }
+        deleteFiles(evicted + evictedSidecars)
         persistIndex()
+        onItemsChanged?()
+        enqueueOCRIfNeeded(id: id, image: imageForOCR)
     }
 
-    /// 超出保留上限删最旧（只摘内存条目，文件删除交给 deleteFiles）
+    /// 为新落盘的条目排队执行低优先级串行 OCR 索引
+    private func enqueueOCRIfNeeded(id: String, image: CGImage) {
+        guard autoIndexOCREnabled, let recognizer = textRecognizer else { return }
+        let previous = ocrQueueTask
+        ocrQueueTask = Task.detached(priority: .utility) { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            let shouldRun = await MainActor.run {
+                self.autoIndexOCREnabled && self.itemsCache.contains { $0.id == id }
+            }
+            guard shouldRun else { return }
+
+            do {
+                let raw = try await recognizer.recognize(image)
+                let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                await self.applyOCRResult(id: id, text: normalized)
+            } catch {
+                Log.error(.history, "history.ocr.fail", ["id": id, "err": error.localizedDescription])
+            }
+        }
+    }
+
+    /// 增量 OCR 完成后回填内存索引并通知 UI
+    private func applyOCRResult(id: String, text: String) {
+        guard let idx = itemsCache.firstIndex(where: { $0.id == id }) else { return }
+        itemsCache[idx].ocrText = text
+        Log.event(.history, "history.ocr.indexed", ["id": id, "chars": "\(text.count)"])
+        persistIndex()
+        onItemsChanged?()
+    }
+
+    /// 存量补齐 OCR 结果回填（仅当非空或首次记录时落盘并通知 UI）
+    private func applyBackfillOCRResult(id: String, text: String) {
+        guard autoIndexOCREnabled else { return }
+        guard let idx = itemsCache.firstIndex(where: { $0.id == id }) else { return }
+        if text.isEmpty {
+            Log.event(.history, "history.ocr.indexed", ["id": id, "chars": "0"])
+            return
+        }
+        itemsCache[idx].ocrText = text
+        Log.event(.history, "history.ocr.indexed", ["id": id, "chars": "\(text.count)"])
+        persistIndex()
+        onItemsChanged?()
+    }
+
+    /// 超出保留上限删最旧（只摘内存条目，成品 PNG + sidecar 文件删除交给 deleteFiles）
     private func pruneIfNeeded() -> [URL] {
         var evicted: [URL] = []
-        while itemsCache.count > maxItems {
-            evicted.append(itemsCache.removeLast().url)
+        let limit = max(1, maxItems)
+        while itemsCache.count > limit {
+            let removed = itemsCache.removeLast()
+            evicted.append(removed.url)
+            evicted.append(HistoryPaths.baseImageURL(for: removed.id))
+            evicted.append(HistoryPaths.annotationsURL(for: removed.id))
         }
         return evicted
     }
 
-    /// 后台删除被逐出条目的 png
+    /// 可重编 sidecar 最多保留最近 `maxEditableItems` 条；超出条目清理 sidecar 并保留成品 PNG 与 OCR
+    private func pruneEditableSidecarsIfNeeded() -> [URL] {
+        var urlsToDelete: [URL] = []
+        var editableCount = 0
+        let editableLimit = max(0, maxEditableItems)
+        for index in itemsCache.indices where itemsCache[index].hasEditableAnnotations {
+            editableCount += 1
+            if editableCount > editableLimit {
+                let id = itemsCache[index].id
+                itemsCache[index].hasEditableAnnotations = false
+                urlsToDelete.append(HistoryPaths.baseImageURL(for: id))
+                urlsToDelete.append(HistoryPaths.annotationsURL(for: id))
+            }
+        }
+        return urlsToDelete
+    }
+
+    /// 后台删除被逐出条目的文件
     private func deleteFiles(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         Task.detached(priority: .utility) {
@@ -223,8 +611,15 @@ final class HistoryStore {
     private func persistIndex() {
         let entries = itemsCache.map {
             HistoryIndexEntry(
-                id: $0.id, date: $0.date,
-                width: $0.pixelSize.width, height: $0.pixelSize.height)
+                id: $0.id,
+                date: $0.date,
+                width: $0.pixelSize.width,
+                height: $0.pixelSize.height,
+                sourceApp: $0.sourceApp,
+                windowTitle: $0.windowTitle,
+                ocrText: $0.ocrText,
+                hasEditableAnnotations: $0.hasEditableAnnotations
+            )
         }
         let previous = indexWriteTask
         indexWriteTask = Task.detached(priority: .utility) {
@@ -241,18 +636,86 @@ final class HistoryStore {
         }
         itemsCache = byID.values.sorted { $0.date > $1.date }
         let evicted = pruneIfNeeded()
-        deleteFiles(evicted)
+        let evictedSidecars = pruneEditableSidecarsIfNeeded()
+        deleteFiles(evicted + evictedSidecars)
         Log.event(.history, "history.index.rebuilt", ["count": "\(itemsCache.count)"])
         persistIndex()
+        onItemsChanged?()
     }
 
     // MARK: - 私有：条目换算（MainActor）
 
     private static func item(from entry: HistoryIndexEntry) -> Item {
-        Item(id: entry.id, date: entry.date, pixelSize: entry.pixelSize, url: entry.fileURL)
+        Item(
+            id: entry.id,
+            date: entry.date,
+            pixelSize: entry.pixelSize,
+            url: entry.fileURL,
+            sourceApp: entry.sourceApp,
+            windowTitle: entry.windowTitle,
+            ocrText: entry.ocrText,
+            hasEditableAnnotations: entry.hasEditableAnnotations
+        )
     }
 
     // MARK: - 私有：磁盘 / 编码（非隔离静态，供后台任务直接使用）
+
+    private nonisolated static func normalizedOptionalText(_ text: String?) -> String? {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private nonisolated static func hasEditableSidecar(id: String) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: HistoryPaths.baseImageURL(for: id).path)
+            && fm.fileExists(atPath: HistoryPaths.annotationsURL(for: id).path)
+    }
+
+    private nonisolated static func writeEditableSidecar(
+        id: String,
+        baseImage: CGImage,
+        canvasSize: CGSize,
+        annotations: [AnnotationModel],
+        strokeWidth: CGFloat
+    ) -> Bool {
+        let baseURL = HistoryPaths.baseImageURL(for: id)
+        let annotationsURL = HistoryPaths.annotationsURL(for: id)
+
+        guard let baseData = encodePNG(baseImage) else {
+            Log.error(.history, "history.sidecar.encode_fail", ["id": id])
+            return false
+        }
+
+        do {
+            let payload = EditableSessionPayload(
+                canvasSize: canvasSize,
+                annotations: annotations,
+                strokeWidth: strokeWidth
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let payloadData = try encoder.encode(payload)
+
+            try baseData.write(to: baseURL, options: .atomic)
+            try payloadData.write(to: annotationsURL, options: .atomic)
+            return true
+        } catch {
+            try? FileManager.default.removeItem(at: baseURL)
+            try? FileManager.default.removeItem(at: annotationsURL)
+            Log.error(.history, "history.sidecar.write_fail", [
+                "id": id, "err": error.localizedDescription,
+            ])
+            return false
+        }
+    }
+
+    private nonisolated static func decodeCGImage(at url: URL) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
 
     /// 读 index.json；缺失或损坏返回 nil（触发重建）
     private nonisolated static func readIndexEntries() -> [HistoryIndexEntry]? {
@@ -276,7 +739,8 @@ final class HistoryStore {
         }
     }
 
-    /// 索引缺失/损坏时扫描目录重建：按 png 文件修改时间排序，尺寸读 PNG 头属性
+    /// 索引缺失/损坏时扫描目录重建：按主图 `<id>.png` 修改时间排序（严格排除 `*.base.png`），
+    /// 并探测配对 sidecar 还原 `hasEditableAnnotations`
     private nonisolated static func rebuildEntriesFromDirectory() -> [HistoryIndexEntry] {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
@@ -284,16 +748,25 @@ final class HistoryStore {
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: .skipsHiddenFiles)
         else { return [] }
-        let pngs = files.filter { $0.pathExtension.lowercased() == "png" }
+        let pngs = files.filter { url in
+            let filename = url.lastPathComponent.lowercased()
+            return url.pathExtension.lowercased() == "png" && !filename.hasSuffix(".base.png")
+        }
         return pngs
             .sorted { modifiedAt($0) > modifiedAt($1) }
             .compactMap { url in
-                guard let size = pixelSize(at: url) else { return nil }
+                let id = url.deletingPathExtension().lastPathComponent
+                guard !id.isEmpty, let size = pixelSize(at: url) else { return nil }
                 return HistoryIndexEntry(
-                    id: url.deletingPathExtension().lastPathComponent,
+                    id: id,
                     date: modifiedAt(url),
                     width: size.width,
-                    height: size.height)
+                    height: size.height,
+                    sourceApp: nil,
+                    windowTitle: nil,
+                    ocrText: "",
+                    hasEditableAnnotations: hasEditableSidecar(id: id)
+                )
             }
     }
 

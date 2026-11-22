@@ -19,6 +19,13 @@ public struct AppSettings: Equatable, Sendable, Codable {
         case askEveryTime   // 每次询问
     }
 
+    /// 标注工具栏尺寸档位（适配快捷键党与鼠标党不同点击手感）
+    public enum ToolbarSize: String, Codable, Sendable, CaseIterable {
+        case compact    // 紧凑（30pt 按钮 / 44pt 高）
+        case regular    // 标准（36pt 按钮 / 50pt 高，默认）
+        case large      // 大号（42pt 按钮 / 58pt 高）
+    }
+
     /// 截图完成后默认动作（默认 copy）
     public var afterCapture: AfterCaptureAction
     /// 默认保存目录（默认 ~/Pictures/Snapcut）
@@ -41,23 +48,30 @@ public struct AppSettings: Equatable, Sendable, Codable {
     /// 额外允许裸键（"o"/"s"）与命名键（"return" / "esc"）——编辑器作用域，
     /// 不注册 Carbon。scroll 清空则滚动截图无键（仅工具栏按钮入口）。
     public var editorHotkeys: [String: String]
-    /// 工具栏按钮自定义排序（EditorSession.Tool rawValue 序列 + 206 滚动；
-    /// 用户裁定 2026-11-17）。默认 = enum 顺序 + 滚动在尾
+    /// 工具栏标注工具自定义排序（仅包含可绑 1-7 数字快捷键的 `EditorSession.Tool`，滚动截图固定于取字前）。
     public var toolbarOrder: [Int]
+    /// 工具栏尺寸档位（默认 regular 标准档，更好点击）
+    public var toolbarSize: ToolbarSize
+    /// 视觉记忆库 Spotlight 面板全局热键（默认 "opt+cmd+v"，即 ⌥⌘V）
+    public var hotkeyHistorySpotlight: String
+    /// 截图导出后是否自动后台执行本地 OCR 文本索引（默认 true）
+    public var autoIndexHistoryOCR: Bool
+    /// 视觉记忆库浮窗内快捷操作键位（copyImage / reopenEdit / pin / copyOCR）
+    public var spotlightHotkeys: [String: String]
 
-    /// 编辑器热键的出厂默认（= 原 keyDown 硬编码 + 滚动截图 s；存量存档缺 scroll
-    /// 键时 editorHotkey(for:) 自动回落默认 —— s 从「内置」转「可自定义」零感知迁移）
-    public static let defaultToolbarOrder: [Int] = {
-        var order = EditorSession.Tool.allCases.filter { $0 != .none }.map { $0.rawValue }
-        order.append(206)   // 滚动截图（工具组尾）
-        return order
-    }()
+    /// 工具组出厂默认序（纯标注工具 1-7；滚动截图已独立置于后段「取字」前）
+    public static let defaultToolbarOrder: [Int] = EditorSession.Tool.allCases
+        .filter { $0 != .none }
+        .map { $0.rawValue }
 
-    /// 排序查找（缺省回落默认——旧存档兼容）
+    /// 排序查找（兼容旧存档：自动剔除早期混在工具组里的 206 滚动截图并补全缺漏工具）
     public func toolbarOrderSafe() -> [Int] {
-        let valid = Set(EditorSession.Tool.allCases.map { $0.rawValue }) .union([206])
-        let filtered = toolbarOrder.filter { valid.contains($0) }
-        return filtered.count > 0 ? filtered : Self.defaultToolbarOrder
+        let valid = Set(EditorSession.Tool.allCases.filter { $0 != .none }.map { $0.rawValue })
+        var filtered = toolbarOrder.filter { valid.contains($0) }
+        for raw in Self.defaultToolbarOrder where !filtered.contains(raw) {
+            filtered.append(raw)
+        }
+        return filtered
     }
 
     public static let defaultEditorHotkeys: [String: String] = [
@@ -77,6 +91,19 @@ public struct AppSettings: Equatable, Sendable, Codable {
         editorHotkeys[action] ?? Self.defaultEditorHotkeys[action] ?? ""
     }
 
+    public static let defaultSpotlightHotkeys: [String: String] = [
+        "copyImage": "return",
+        "reopenEdit": "cmd+e",
+        "pin": "cmd+p",
+        "copyOCR": "cmd+c",
+    ]
+
+    /// 视觉记忆面板内操作热键查找
+    public func spotlightHotkey(for action: String) -> String {
+        let stored = spotlightHotkeys[action] ?? ""
+        return stored.isEmpty ? (Self.defaultSpotlightHotkeys[action] ?? "") : stored
+    }
+
     /// 历史保留条数的合法范围
     public static let historyLimitRange: ClosedRange<Int> = 1...200
 
@@ -90,7 +117,11 @@ public struct AppSettings: Equatable, Sendable, Codable {
         hotkeyRegion: String = "cmd+shift+a",
         hotkeyFullScreen: String = "cmd+shift+s",
         editorHotkeys: [String: String] = AppSettings.defaultEditorHotkeys,
-        toolbarOrder: [Int] = AppSettings.defaultToolbarOrder
+        toolbarOrder: [Int] = AppSettings.defaultToolbarOrder,
+        toolbarSize: ToolbarSize = .regular,
+        hotkeyHistorySpotlight: String = "opt+cmd+v",
+        autoIndexHistoryOCR: Bool = true,
+        spotlightHotkeys: [String: String] = AppSettings.defaultSpotlightHotkeys
     ) {
         self.afterCapture = afterCapture
         self.saveDirectoryPath = saveDirectoryPath
@@ -102,6 +133,10 @@ public struct AppSettings: Equatable, Sendable, Codable {
         self.hotkeyFullScreen = hotkeyFullScreen
         self.editorHotkeys = editorHotkeys
         self.toolbarOrder = toolbarOrder
+        self.toolbarSize = toolbarSize
+        self.hotkeyHistorySpotlight = hotkeyHistorySpotlight
+        self.autoIndexHistoryOCR = autoIndexHistoryOCR
+        self.spotlightHotkeys = spotlightHotkeys
     }
 
     /// 出厂默认值
@@ -111,25 +146,20 @@ public struct AppSettings: Equatable, Sendable, Codable {
     /// 合成 Codable 在缺 key 时抛错整体回落默认，会把用户改过的其他设置
     /// 一起洗掉。自定义 decode：缺字段 = 默认编辑器热键，其余照旧。
     public init(from decoder: Decoder) throws {
-        afterCapture = try decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(AfterCaptureAction.self, forKey: .afterCapture) ?? .copy
-        saveDirectoryPath = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(String.self, forKey: .saveDirectoryPath)) ?? "~/Pictures/Snapcut"
-        filenameStyle = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(FilenameStyle.self, forKey: .filenameStyle)) ?? .timestamp
-        historyLimit = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(Int.self, forKey: .historyLimit)) ?? 30
-        showCopyNotification = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(Bool.self, forKey: .showCopyNotification)) ?? true
-        playCaptureSound = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(Bool.self, forKey: .playCaptureSound)) ?? false
-        hotkeyRegion = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(String.self, forKey: .hotkeyRegion)) ?? "cmd+shift+a"
-        hotkeyFullScreen = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent(String.self, forKey: .hotkeyFullScreen)) ?? "cmd+shift+s"
-        editorHotkeys = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent([String: String].self, forKey: .editorHotkeys)) ?? Self.defaultEditorHotkeys
-        toolbarOrder = (try? decoder.container(keyedBy: CodingKeys.self)
-            .decodeIfPresent([Int].self, forKey: .toolbarOrder)) ?? Self.defaultToolbarOrder
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        afterCapture = try container.decodeIfPresent(AfterCaptureAction.self, forKey: .afterCapture) ?? .copy
+        saveDirectoryPath = (try? container.decodeIfPresent(String.self, forKey: .saveDirectoryPath)) ?? "~/Pictures/Snapcut"
+        filenameStyle = (try? container.decodeIfPresent(FilenameStyle.self, forKey: .filenameStyle)) ?? .timestamp
+        historyLimit = (try? container.decodeIfPresent(Int.self, forKey: .historyLimit)) ?? 30
+        showCopyNotification = (try? container.decodeIfPresent(Bool.self, forKey: .showCopyNotification)) ?? true
+        playCaptureSound = (try? container.decodeIfPresent(Bool.self, forKey: .playCaptureSound)) ?? false
+        hotkeyRegion = (try? container.decodeIfPresent(String.self, forKey: .hotkeyRegion)) ?? "cmd+shift+a"
+        hotkeyFullScreen = (try? container.decodeIfPresent(String.self, forKey: .hotkeyFullScreen)) ?? "cmd+shift+s"
+        editorHotkeys = (try? container.decodeIfPresent([String: String].self, forKey: .editorHotkeys)) ?? Self.defaultEditorHotkeys
+        toolbarOrder = (try? container.decodeIfPresent([Int].self, forKey: .toolbarOrder)) ?? Self.defaultToolbarOrder
+        toolbarSize = (try? container.decodeIfPresent(ToolbarSize.self, forKey: .toolbarSize)) ?? .regular
+        hotkeyHistorySpotlight = (try? container.decodeIfPresent(String.self, forKey: .hotkeyHistorySpotlight)) ?? "opt+cmd+v"
+        autoIndexHistoryOCR = (try? container.decodeIfPresent(Bool.self, forKey: .autoIndexHistoryOCR)) ?? true
+        spotlightHotkeys = (try? container.decodeIfPresent([String: String].self, forKey: .spotlightHotkeys)) ?? Self.defaultSpotlightHotkeys
     }
 }

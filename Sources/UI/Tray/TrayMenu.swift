@@ -2,11 +2,8 @@ import SwiftUI
 
 /// MenuBarExtra 菜单内容（SwiftUI 声明式；NSMenu 版本在 StatusItemController，
 /// 服务于 ⌥⌘H 光标兜底菜单，两处动作语义保持一致）
-///
-/// 历史子菜单：每次展开时 body 重新求值 = 实时重建（对齐 NSMenu 的 rebuild 语义）
 @MainActor
 struct TrayMenuContent: View {
-    @State private var history: [HistoryStore.Item] = []
     /// 权限门禁状态。@AppStorage（UserDefaults 响应式桥）：
     /// .menu 风格的 MenuBarExtra content 是一次性快照（转 NSMenu 后不再重求
     /// body，onAppear/轮询改 @State 都刷不动缓存的菜单——用户实报「授权完
@@ -56,25 +53,14 @@ struct TrayMenuContent: View {
             AppCoordinatorShared.coordinator?.beginDelayedCapture(seconds: 3)
         }
 
+        Button("搜索视觉记忆  \(HotkeySpec.display(hotkeys.hotkeyHistorySpotlight))") {
+            Log.event(.tray, "tray.action", ["item": "historySpotlight"])
+            AppCoordinatorShared.coordinator?.toggleHistorySpotlight()
+        }
 
-        Menu("历史记录") {
-            if history.isEmpty {
-                Text("暂无记录")
-            }
-            ForEach(history) { item in
-                Button(Self.historyTitle(item)) {
-                    if HistoryStore.shared.copyToPasteboard(item) {
-                        Log.event(.tray, "tray.action", ["item": "copyHistory", "id": item.id])
-                    }
-                }
-            }
-            if !history.isEmpty {
-                Divider()
-                Button("清空历史记录") {
-                    HistoryStore.shared.clearAll()
-                    Log.event(.tray, "tray.action", ["item": "clearHistory"])
-                }
-            }
+        Button("隐藏/显示全部贴图  ⌥ ⌘ P") {
+            Log.event(.tray, "tray.action", ["item": "togglePins"])
+            AppCoordinatorShared.coordinator?.toggleAllPinsVisibility()
         }
 
         Divider()
@@ -93,17 +79,7 @@ struct TrayMenuContent: View {
         }
         .keyboardShortcut("q", modifiers: [.command])
         .onAppear {
-            history = HistoryStore.shared.items()
-            Log.event(.tray, "tray.menu.built", ["history": "\(history.count)", "granted": "\(permissionGranted)"])
+            Log.event(.tray, "tray.menu.built", ["granted": "\(permissionGranted)"])
         }
-    }
-
-    /// 历史条目标题：`11-14 23:07 · 680×680`
-    private static func historyTitle(_ item: HistoryStore.Item) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd HH:mm"
-        let size = Int(item.pixelSize.width)
-        let h = Int(item.pixelSize.height)
-        return "\(f.string(from: item.date)) · \(size)×\(h)"
     }
 }

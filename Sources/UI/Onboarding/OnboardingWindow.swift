@@ -55,7 +55,7 @@ final class OnboardingWindow: NSPanel {
     private func buildUI(size: NSSize, permissionGranted: Bool) {
         let container = NSView(frame: NSRect(origin: .zero,
                                              size: NSSize(width: size.width + 2, height: size.height + 2)))
-        // 玻璃卡（档 2：hudWindow 跟随外观；radius 16 + masksToBounds，无 maskImage）
+        // 玻璃卡（档 2：hudWindow 跟随外观；radius 16 + maskImage 精确圆角裁剪）
         let card = NSVisualEffectView(frame: NSRect(x: 1, y: 1, width: size.width, height: size.height))
         card.material = DesignTokens.Mat.card
         card.blendingMode = .behindWindow
@@ -63,6 +63,7 @@ final class OnboardingWindow: NSPanel {
         card.wantsLayer = true
         card.layer?.cornerRadius = DesignTokens.Radius.xxl
         card.layer?.masksToBounds = true
+        card.maskImage = DesignTokens.Mat.roundedMaskImage(cornerRadius: DesignTokens.Radius.xxl)
         // 内描边（0.5pt stroke，圆角路径内缩 0.25pt 整条落在卡内）
         let stroke = CAShapeLayer()
         let inset: CGFloat = 0.25
@@ -241,53 +242,64 @@ final class OnboardingWindow: NSPanel {
             y: visible.midY - size.height / 2 + 40,
             width: size.width, height: size.height
         )
-        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - DesignTokens.Motion.enterRise))
+        let reduce = DesignTokens.Motion.reduceMotion
+        setFrameOrigin(CGPoint(x: finalFrame.minX, y: finalFrame.minY - (reduce ? 0 : DesignTokens.Motion.enterRise)))
         alphaValue = 0
-        if let layer = contentView?.layer {
+        if !reduce, let layer = contentView?.layer {
+            let b = contentView?.bounds ?? .zero
+            var t = CATransform3DIdentity
+            t = CATransform3DTranslate(t, b.midX, b.midY, 0)
+            t = CATransform3DScale(t, DesignTokens.Motion.enterCenterScale, DesignTokens.Motion.enterCenterScale, 1)
+            t = CATransform3DTranslate(t, -b.midX, -b.midY, 0)
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            layer.transform = CATransform3DMakeScale(DesignTokens.Motion.enterCenterScale,
-                                                     DesignTokens.Motion.enterCenterScale, 1)
+            layer.transform = t
             CATransaction.commit()
         }
         orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = DesignTokens.Motion.enterCenterDuration
-            ctx.timingFunction = DesignTokens.Motion.springTimingFunction
-            self.animator().setFrame(finalFrame, display: true)
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            if !reduce { self.animator().setFrame(finalFrame, display: true) }
             self.animator().alphaValue = 1
         }
-        if let layer = contentView?.layer {
+        if !reduce, let layer = contentView?.layer {
             CATransaction.begin()
             CATransaction.setAnimationDuration(DesignTokens.Motion.enterCenterDuration)
-            CATransaction.setAnimationTimingFunction(DesignTokens.Motion.springTimingFunction)
+            CATransaction.setAnimationTimingFunction(DesignTokens.Motion.easeOutStrong)
             layer.transform = CATransform3DIdentity
             CATransaction.commit()
         }
     }
 
-    /// motion.exit 退场：fade + scale→.98 + 下沉 6pt，0.16s ease-in；
-    /// orderOut 延迟到动画尾（完成 / 权限跳转共用；completionHandler 强持有 self，
-    /// 调用方同步置 nil 也不会中断动画）
+    /// motion.exit 退场：fade + 居中 scale→.98 + 下沉 6pt，0.14s strong ease-out（杜绝 ease-in）
     func dismissAnimated() {
         guard isVisible else {
             orderOut(nil)
             return
         }
-        if let layer = contentView?.layer {
+        let reduce = DesignTokens.Motion.reduceMotion
+        if !reduce, let layer = contentView?.layer {
+            let b = contentView?.bounds ?? .zero
+            var t = CATransform3DIdentity
+            t = CATransform3DTranslate(t, b.midX, b.midY, 0)
+            t = CATransform3DScale(t, 0.98, 0.98, 1)
+            t = CATransform3DTranslate(t, -b.midX, -b.midY, 0)
             CATransaction.begin()
             CATransaction.setAnimationDuration(DesignTokens.Motion.exitDuration)
-            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeIn))
-            layer.transform = CATransform3DMakeScale(0.98, 0.98, 1)
+            CATransaction.setAnimationTimingFunction(DesignTokens.Motion.easeOutStrong)
+            layer.transform = t
             CATransaction.commit()
         }
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = DesignTokens.Motion.exitDuration
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
             self.animator().alphaValue = 0
-            var sinkFrame = frame
-            sinkFrame.origin.y -= 6
-            self.animator().setFrame(sinkFrame, display: true)
+            if !reduce {
+                var sinkFrame = frame
+                sinkFrame.origin.y -= 6
+                self.animator().setFrame(sinkFrame, display: true)
+            }
         }, completionHandler: {
             self.orderOut(nil)
             if let layer = self.contentView?.layer {
@@ -390,4 +402,10 @@ final class HoverButton: NSButton {
 
     override func mouseEntered(with event: NSEvent) { onHover?(true) }
     override func mouseExited(with event: NSEvent) { onHover?(false) }
+
+    override func mouseDown(with event: NSEvent) {
+        TactilePress.animate(view: self, pressed: true)
+        super.mouseDown(with: event)
+        TactilePress.animate(view: self, pressed: false)
+    }
 }

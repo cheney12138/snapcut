@@ -89,19 +89,31 @@ enum MagnifierPainter {
         let py = Int(cursorLocal.y / bounds.height * imageSize.height)
         guard px >= 0, px < sampler.width, py >= 0, py < sampler.height else { return }
 
-        // 面板位置：光标右下 16pt，右侧/下方放不下则翻到另一侧
-        var origin = CGPoint(x: cursorLocal.x + gap, y: cursorLocal.y + gap)
-        if origin.x + panelSize + 8 > bounds.maxX { origin.x = cursorLocal.x - gap - panelSize }
-        if origin.y + panelSize + 40 > bounds.maxY { origin.y = cursorLocal.y - gap - panelSize - 40 }
-        origin.x = max(8, min(origin.x, bounds.maxX - panelSize - 8))
-        origin.y = max(8, min(origin.y, bounds.maxY - panelSize - 40))
+        let footerHeight: CGFloat = 42
+        let cardHeight = panelSize + footerHeight
+        let cornerR: CGFloat = 10
 
-        // 背景卡片（放大区 + 两行读数）
-        let cardRect = CGRect(x: origin.x, y: origin.y, width: panelSize, height: panelSize + 34)
+        // 面板位置：光标右下 18pt，右侧/下方放不下则翻到另一侧
+        var origin = CGPoint(x: cursorLocal.x + gap + 2, y: cursorLocal.y + gap + 2)
+        if origin.x + panelSize + 10 > bounds.maxX { origin.x = cursorLocal.x - gap - 2 - panelSize }
+        if origin.y + cardHeight + 10 > bounds.maxY { origin.y = cursorLocal.y - gap - 2 - cardHeight }
+        origin.x = max(8, min(origin.x, bounds.maxX - panelSize - 8))
+        origin.y = max(8, min(origin.y, bounds.maxY - cardHeight - 8))
+
+        // 背景卡片（Apple Digital Color Meter 风格：柔和圆角投影 + 深半透底 + 0.5pt 发丝边）
+        let cardRect = CGRect(x: origin.x, y: origin.y, width: panelSize, height: cardHeight)
+        let cardPath = CGPath(roundedRect: cardRect, cornerWidth: cornerR, cornerHeight: cornerR, transform: nil)
         ctx.saveGState()
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.82).cgColor)
-        ctx.addPath(CGPath(roundedRect: cardRect, cornerWidth: 8, cornerHeight: 8, transform: nil))
+        ctx.setShadow(offset: CGSize(width: 0, height: 6), blur: 18, color: NSColor.black.withAlphaComponent(0.38).cgColor)
+        ctx.setFillColor(NSColor(srgbRed: 22/255.0, green: 22/255.0, blue: 26/255.0, alpha: 0.90).cgColor)
+        ctx.addPath(cardPath)
         ctx.fillPath()
+        ctx.restoreGState()
+
+        // 放大区裁进卡片圆角内
+        ctx.saveGState()
+        ctx.addPath(cardPath)
+        ctx.clip()
         ctx.clip(to: CGRect(x: origin.x, y: origin.y, width: panelSize, height: panelSize))
 
         // 逐源像素绘制 12×12 方块（最近邻，不插值）
@@ -126,13 +138,11 @@ enum MagnifierPainter {
                 ))
             }
         }
-        ctx.restoreGState()
 
-        // 网格线（每 4 像素一条，弱）
-        ctx.saveGState()
-        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.10).cgColor)
+        // 精细像素网格线（克制白 α.07）
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.07).cgColor)
         ctx.setLineWidth(0.5)
-        for i in 1..<sampleCount where i % 4 == 0 {
+        for i in 1..<sampleCount {
             let x = origin.x + CGFloat(i) * zoom
             let y = origin.y + CGFloat(i) * zoom
             ctx.move(to: CGPoint(x: x, y: origin.y))
@@ -141,54 +151,91 @@ enum MagnifierPainter {
             ctx.addLine(to: CGPoint(x: origin.x + panelSize, y: y))
         }
         ctx.strokePath()
-        ctx.restoreGState()
 
-        // 中心像素：白框 + 黑框（深浅背景都可见）
+        // 柔和十字准线（白 α.45，避免喧宾夺主）
         let centerRect = CGRect(
             x: origin.x + CGFloat(half) * zoom,
             y: origin.y + CGFloat(half) * zoom,
             width: zoom, height: zoom
         )
-        ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.85).cgColor)
-        ctx.setLineWidth(3)
-        ctx.stroke(centerRect.insetBy(dx: -1.5, dy: -1.5))
-        ctx.setStrokeColor(NSColor.white.cgColor)
-        ctx.setLineWidth(1.5)
-        ctx.stroke(centerRect.insetBy(dx: -1.5, dy: -1.5))
-
-        // 十字准线（贯穿中心单元格）
-        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
-        ctx.setLineWidth(1)
         let cx = centerRect.midX
         let cy = centerRect.midY
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.45).cgColor)
+        ctx.setLineWidth(0.75)
         ctx.move(to: CGPoint(x: origin.x, y: cy))
+        ctx.addLine(to: CGPoint(x: centerRect.minX - 1, y: cy))
+        ctx.move(to: CGPoint(x: centerRect.maxX + 1, y: cy))
         ctx.addLine(to: CGPoint(x: origin.x + panelSize, y: cy))
         ctx.move(to: CGPoint(x: cx, y: origin.y))
+        ctx.addLine(to: CGPoint(x: cx, y: centerRect.minY - 1))
+        ctx.move(to: CGPoint(x: cx, y: centerRect.maxY + 1))
         ctx.addLine(to: CGPoint(x: cx, y: origin.y + panelSize))
         ctx.strokePath()
 
-        // 读数：坐标（屏幕点）+ 色值
-        let scaleX = screenPoints.width / CGFloat(sampler.width)
-        let scaleY = screenPoints.height / CGFloat(sampler.height)
-        let screenX = Int(globalOrigin.x + CGFloat(px) * scaleX)
-        // 全局坐标 Y 向上，屏幕读数按用户直觉用「距顶部」的 Y 向下值
-        let screenY = Int(screenPoints.height - (globalOrigin.y - 0 + CGFloat(py) * scaleY) - screenPoints.height) * -1
-        let coordText = "X: \(screenX)  Y: \(max(0, screenY))"
-        let colorText = sampler.hex(x: px, y: py)
+        // 中心像素取色框（内白外暗双边，深浅底色皆清晰）
+        let reticle = centerRect.insetBy(dx: -0.75, dy: -0.75)
+        ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.65).cgColor)
+        ctx.setLineWidth(2.2)
+        ctx.stroke(reticle)
+        ctx.setStrokeColor(NSColor.white.cgColor)
+        ctx.setLineWidth(1.2)
+        ctx.stroke(reticle)
+        ctx.restoreGState()
 
-        let coordAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.92),
-        ]
+        // 放大区与读数区分隔发丝线 + 外框 0.5pt 发丝边
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.14).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.move(to: CGPoint(x: origin.x, y: origin.y + panelSize))
+        ctx.addLine(to: CGPoint(x: origin.x + panelSize, y: origin.y + panelSize))
+        ctx.strokePath()
+
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.18).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(cardPath)
+        ctx.strokePath()
+
+        // 读数区：首行 = 实时色点 + HEX + 「C」取色提示；次行 = 精确坐标（等宽数字）
+        let centerRGBA = sampler.rgba(x: px, y: py) ?? (0, 0, 0, 255)
+        let colorText = sampler.hex(x: px, y: py)
+        let swatchRect = CGRect(x: origin.x + 8, y: origin.y + panelSize + 8, width: 9, height: 9)
+        ctx.setFillColor(NSColor(
+            srgbRed: CGFloat(centerRGBA.r) / 255,
+            green: CGFloat(centerRGBA.g) / 255,
+            blue: CGFloat(centerRGBA.b) / 255,
+            alpha: 1
+        ).cgColor)
+        ctx.fillEllipse(in: swatchRect)
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.32).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.strokeEllipse(in: swatchRect)
+
         let colorAttrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.white,
+            .foregroundColor: NSColor.white.withAlphaComponent(0.95),
+        ]
+        let hintAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9.5, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.46),
+        ]
+        (colorText as NSString).draw(
+            at: CGPoint(x: origin.x + 22, y: origin.y + panelSize + 5.5),
+            withAttributes: colorAttrs
+        )
+        ("C 取色" as NSString).draw(
+            at: CGPoint(x: origin.x + panelSize - 34, y: origin.y + panelSize + 6.5),
+            withAttributes: hintAttrs
+        )
+
+        let screenX = Int(cursorLocal.x.rounded())
+        let screenY = Int(cursorLocal.y.rounded())
+        let coordText = "X \(screenX)  Y \(screenY)"
+        let coordAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.58),
         ]
         (coordText as NSString).draw(
-            at: CGPoint(x: origin.x + 6, y: origin.y + panelSize + 3), withAttributes: coordAttrs
-        )
-        (colorText as NSString).draw(
-            at: CGPoint(x: origin.x + panelSize - 62, y: origin.y + panelSize + 3), withAttributes: colorAttrs
+            at: CGPoint(x: origin.x + 8, y: origin.y + panelSize + 23),
+            withAttributes: coordAttrs
         )
     }
 }
