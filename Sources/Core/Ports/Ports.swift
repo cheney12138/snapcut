@@ -124,6 +124,23 @@ public protocol PinningPresenting {
     func pin(_ image: CGImage, atGlobalRect rect: CGRect)
 }
 
+// MARK: - 自动更新
+
+/// 应用更新端口。适配器：`SparkleUpdater`（Sparkle 2 + EdDSA 签名的 appcast）
+///
+/// 为什么不自写：macOS 上「替换正在运行的 .app」这件事有既定做法（appcast +
+/// EdDSA 签名 + 独立的 Installer 辅助进程），自写必然在「签名校验 / 半途失败 /
+/// 权限提升 / 退场时机」上翻车。
+@MainActor
+public protocol AppUpdating: AnyObject {
+    /// 手动检查一次更新（会自己弹 Sparkle 的进度/结果窗）
+    func checkForUpdates()
+    /// 每日后台自动检查（默认开，落盘在 Sparkle 自己的 UserDefaults 键里）
+    var automaticallyChecksForUpdates: Bool { get set }
+    /// 最近一次检查的时间（nil = 从未）
+    var lastCheckDescription: String? { get }
+}
+
 // MARK: - 依赖容器（合成根用）
 
 /// 依赖集合：只在合成根（`AppCoordinator`）构造一次，向下注入。
@@ -137,6 +154,7 @@ public struct Dependencies {
     public let hotkeys: HotkeyRegistering
     public let permission: ScreenPermissionChecking
     public let pinning: PinningPresenting
+    public let updating: AppUpdating
 
     public init(
         screen: ScreenCapturing,
@@ -145,7 +163,8 @@ public struct Dependencies {
         textRecognizer: TextRecognizing,
         hotkeys: HotkeyRegistering,
         permission: ScreenPermissionChecking,
-        pinning: PinningPresenting
+        pinning: PinningPresenting,
+        updating: AppUpdating
     ) {
         self.screen = screen
         self.clipboard = clipboard
@@ -154,5 +173,6 @@ public struct Dependencies {
         self.hotkeys = hotkeys
         self.permission = permission
         self.pinning = pinning
+        self.updating = updating
     }
 }

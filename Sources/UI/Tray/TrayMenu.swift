@@ -73,6 +73,13 @@ struct TrayMenuContent: View {
 
         Divider()
 
+        Button("检查更新…") {
+            Log.event(.tray, "tray.action", ["item": "checkUpdates"])
+            AppCoordinatorShared.deps?.updating.checkForUpdates()
+        }
+
+        Divider()
+
         Button("退出 Snapcut") {
             Log.event(.tray, "tray.action", ["item": "quit"])
             SnapcutQuitController.quit()

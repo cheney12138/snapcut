@@ -4,11 +4,18 @@ options:
   deploymentTarget:
     macOS: "15.0"
   createIntermediateGroups: true
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.0
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "0.1.0"
+    # 版本号真源：scripts/release.sh 改写这里 → xcodegen generate → Resources/Info.plist
+    # （ChatGPT 教训见 glance 病例：写局部 Info.plist 的 PlistBuddy 失败被 || true 吞掉，
+    #  包永远叫旧版本名。版本只认工程设置这一处。）
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "202611221335"
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "Apple Development: 18600607249@163.com (7KDMYNHX76)"
     DEVELOPMENT_TEAM: ""
@@ -30,14 +37,30 @@ targets:
         # ⚠️ 禁用 debug dylib（诊断 F：壳二进制+dylib 结构疑似导致状态栏窗口不落位）
         SWIFT_ENABLE_DEBUG_DYLIB: "NO"
         ENABLE_DEBUG_DYLIB: "NO"
+    dependencies:
+      - package: Sparkle
+        product: Sparkle
     info:
       path: Resources/Info.plist
       properties:
         CFBundleDisplayName: Snapcut
         CFBundleName: Snapcut
         CFBundleIconFile: AppIcon
-        CFBundleShortVersionString: "0.1.0"
+        CFBundleShortVersionString: "0.2.0"
+        # Sparkle 比大小看的是 CFBundleVersion，不是短版本号。
+        # 不显式绑定就会落到 xcodegen 的默认值 "1" ⇒ 每个包在 Sparkle 眼里都是
+        # 「比已装的更新」⇒ 装完再检查又提示有更新（无限升级循环）。
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSHighResolutionCapable: true
         LSMinimumSystemVersion: "15.0"
         NSHumanReadableCopyright: ""
+        # ── 自动更新（Sparkle 2）─────────────────────────────────────────
+        # appcast 走 GitHub Releases 的 latest 指针：发版只需把那两个资产挂到
+        # 最新 release 上，URL 永远不用改。
+        SUFeedURL: https://github.com/cheney12138/snapcut/releases/latest/download/appcast.xml
+        # 公钥与私钥（钥匙串 account=snapcut）配对；私钥丢了就无法再发布更新
+        # （不是灾难：重新生成一对、发一版手动安装的包即可切轨）。
+        SUPublicEDKey: HPUWkxnBC8OSpRsBmjfnRLPgRrcswiAJvHEzOguw9oQ=
+        # 每日后台自动检查（Sparkle 默认 24h）；手动入口在「关于」页与菜单栏。
+        SUEnableAutomaticChecks: true

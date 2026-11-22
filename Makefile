@@ -5,7 +5,7 @@ SIGN_ID := "Apple Development: 18600607249@163.com (7KDMYNHX76)"
 # 钥匙串里的 Snapcut Local Dev 证书（TCC 授权锚定它，跨构建稳定）
 LOCAL_SIGN_ID := 38E79C988C72B625EFCC85754C65E1F0ED62D0D7
 
-.PHONY: gen dev run tail clean
+.PHONY: gen dev run tail clean release dmg
 
 ## 生成 Xcode 工程（project.yml -> Snapcut.xcodeproj，工程不入 git）
 # 六边形架构守卫（依赖方向只能向内；破坏即失败，防止 Core 被 AppKit 污染）
@@ -37,6 +37,15 @@ run: dev
 ## 实时日志流（unified logging）
 tail:
 	log stream --level debug --predicate 'subsystem == "app.snapcut"'
+
+## 发版：make release VERSION=0.2.0（出包 + EdDSA 签名 + appcast，见 docs/08-release-and-autoupdate.md）
+release:
+	@[ -n "$(VERSION)" ] || { echo "用法：make release VERSION=0.2.0"; exit 1; }
+	@bash scripts/release.sh "$(VERSION)"
+
+## 只出 DMG（不签名、不写 appcast；调试打包布局用）
+dmg:
+	@bash scripts/make-dmg.sh
 
 clean:
 	rm -rf build

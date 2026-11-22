@@ -5,6 +5,18 @@
 
 ---
 
+## [0.2.0] — 2026-11-22（可分发：发版流水线 + 自动更新）
+
+### 新增功能（Added）
+- **自动更新（Sparkle 2 + EdDSA appcast）**：新增 `AppUpdating` 端口与 `SparkleUpdater` 适配器（appcast 走 GitHub Releases 的 `latest` 指针，公钥写死 `SUPublicEDKey`，私钥在本机钥匙串 account `snapcut`），入口三处：菜单栏「检查更新…」、⌥⌘H 光标兜底菜单、设置 ▸ 关于「检查更新 / 每日自动检查」卡。
+  - 后台 App（`LSUIElement`）必须显式声明 gentle reminders，否则 Sparkle 会警告"用户不会注意到更新提示"且后台发现的更新弹不出来 —— `GentleReminderDelegate` 补齐并逐事件落日志（`update.scheduled` / `update.willShow` / `update.sessionFinished`）。
+  - 涉及文件：`Sources/Core/Ports/Ports.swift`、`Sources/Adapters/Update/SparkleUpdater.swift`、`Sources/Adapters/PortConformances.swift`、`Sources/UI/Settings/SettingsWindowController.swift`、`Sources/UI/Tray/TrayMenu.swift`、`Sources/UI/Tray/StatusItemController.swift`、`project.yml`
+- **发版流水线（一条命令出可分发包）**：`scripts/release.sh <版本号>` = 架构守卫 → 写版本号进 `project.yml`（唯一真源）+ 构建号用时间戳 → `xcodegen generate` → Release(arm64) 构建 + 本地证书重签名（含内嵌 Sparkle.framework）→ DMG → `sign_update` EdDSA 签名 → 自写 `appcast.xml`；`scripts/make-dmg.sh` 单独出包并断言版本号/公钥长度/签名有效性；`make release VERSION=x.y.z` 收口。
+  - 不用 Sparkle 的 `generate_appcast`：它会在缺公钥时**静默**生成没有 `edSignature` 的 appcast（更新永远"已是最新"且查不出原因）。
+  - 文档：`docs/08-release-and-autoupdate.md`（发版四步 / 版本号口径 / 两道签名校验 / 密钥管理 / 症状→排查表 / 本地端到端验证）。
+
+---
+
 ## [Unreleased] — 2026-11-20 ~ 2026-11-21（v0.2 体验精修与架构收口）
 
 ### 新增功能（Added）

@@ -92,6 +92,17 @@ final class StatusItemController: NSObject {
         menu.addItem(settingsItem)
 
         menu.addItem(.separator())
+        // 与 SwiftUI 菜单栏版本保持同一语义（两处动作必须一致，否则 ⌥⌘H 兜底菜单
+        // 会少一项功能）
+        let updateItem = NSMenuItem(
+            title: "检查更新…",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updateItem.target = self
+        menu.addItem(updateItem)
+
+        menu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "退出 Snapcut",
             action: #selector(quit(_:)),
@@ -159,6 +170,11 @@ final class StatusItemController: NSObject {
     @objc private func openSettings(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "openSettings"])
         SettingsWindowController.shared.show(store: UserDefaultsSettingsStore())
+    }
+
+    @objc private func checkForUpdates(_ sender: Any?) {
+        Log.event(.tray, "tray.action", ["item": "checkUpdates"])
+        coordinator?.deps.updating.checkForUpdates()
     }
 
     @objc private func quit(_ sender: Any?) {
