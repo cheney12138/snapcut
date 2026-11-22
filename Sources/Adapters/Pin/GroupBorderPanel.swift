@@ -42,6 +42,7 @@ final class GroupBackdropPanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false
+        appearance = NSAppearance(named: .aqua)
         isMovableByWindowBackground = false
         isReleasedWhenClosed = false
         ignoresMouseEvents = false
@@ -87,88 +88,52 @@ final class GroupBackdropPanel: NSPanel {
 private final class GroupBackdropView: NSView {
     weak var panel: GroupBackdropPanel?
 
-    private let shadowAmbient = NSView()
-    private let shadowContact = NSView()
+    private let outerShadowView: OuterShadowView
     private let glassSurface: DesignTokens.Mat.LiquidGlassSurface
-    /// macOS 15 回退时的独立发丝边框层（macOS 26 原生 NSGlassEffectView 自带光学边缘折射，无需手绘边框）
     private let borderOverlay = NSView()
     private var entrancePlayed = false
 
-    override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override init(frame: NSRect) {
-        glassSurface = DesignTokens.Mat.liquidGlass(
-            cornerRadius: GroupBackdropPanel.cornerRadius,
-            style: .clear,
-            fallbackMaterial: .popover
+        // 恒定浅色澄澈磨砂托盘（.aqua .menu .behindWindow + state = .active）：
+        // 避免 macOS 26 NSGlassEffectView 在失焦/退后台时降级成亮白不透明底，
+        // 始终保持通透细腻的磨砂玻璃质感，由 OuterShadowView 镂空双层光学影托起。
+        outerShadowView = OuterShadowView(
+            spec: .spotlight,
+            margin: GroupBackdropPanel.shadowMargin,
+            cornerRadius: GroupBackdropPanel.cornerRadius
         )
-        if !glassSurface.isNativeLiquidGlass {
-            glassSurface.hostView.alphaValue = 0.72
-        }
+        glassSurface = DesignTokens.Mat.fixedLightCrystalBlur(
+            cornerRadius: GroupBackdropPanel.cornerRadius,
+            tintAlpha: 0
+        )
         super.init(frame: frame)
         wantsLayer = true
 
-        if !glassSurface.isNativeLiquidGlass {
-            for (shadow, r, offsetY, alpha) in [
-                (shadowAmbient, CGFloat(18), CGFloat(-7), Float(0.16)),
-                (shadowContact, CGFloat(4), CGFloat(-1), Float(0.08)),
-            ] {
-                shadow.wantsLayer = true
-                shadow.layer?.backgroundColor = NSColor.clear.cgColor
-                shadow.layer?.shadowColor = NSColor.black.cgColor
-                shadow.layer?.shadowOpacity = alpha
-                shadow.layer?.shadowRadius = r
-                shadow.layer?.shadowOffset = CGSize(width: 0, height: offsetY)
-                addSubview(shadow)
-            }
-        }
-
+        addSubview(outerShadowView)
         addSubview(glassSurface.hostView)
 
-        if !glassSurface.isNativeLiquidGlass {
-            borderOverlay.wantsLayer = true
-            borderOverlay.layer?.cornerRadius = GroupBackdropPanel.cornerRadius
-            borderOverlay.layer?.borderWidth = 0.5
-            borderOverlay.layer?.backgroundColor = NSColor.clear.cgColor
-            addSubview(borderOverlay)
-            refreshAppearanceColors()
-        }
+        borderOverlay.wantsLayer = true
+        borderOverlay.layer?.cornerRadius = GroupBackdropPanel.cornerRadius
+        borderOverlay.layer?.cornerCurve = .continuous
+        borderOverlay.layer?.borderWidth = 0.5
+        borderOverlay.layer?.borderColor = NSColor.black.withAlphaComponent(0.11).cgColor
+        borderOverlay.layer?.backgroundColor = NSColor.clear.cgColor
+        addSubview(borderOverlay)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("GroupBackdropView 只走代码创建") }
 
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        if !glassSurface.isNativeLiquidGlass {
-            refreshAppearanceColors()
-        }
-    }
-
-    private func refreshAppearanceColors() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            let isDark = effectiveAppearance.isDark
-            borderOverlay.layer?.borderColor = isDark
-                ? NSColor.white.withAlphaComponent(0.18).cgColor
-                : NSColor.black.withAlphaComponent(0.10).cgColor
-        }
-    }
-
     func layoutMat(shadowMargin m: CGFloat) {
         let matRect = bounds.insetBy(dx: m, dy: m)
         guard matRect.width > 4, matRect.height > 4 else { return }
+        outerShadowView.frame = bounds
+        outerShadowView.refreshGeometry()
         glassSurface.hostView.frame = matRect
-        if !glassSurface.isNativeLiquidGlass {
-            borderOverlay.frame = matRect
-            let r = GroupBackdropPanel.cornerRadius
-            let path = CGPath(roundedRect: NSRect(origin: .zero, size: matRect.size), cornerWidth: r, cornerHeight: r, transform: nil)
-            for shadow in [shadowAmbient, shadowContact] {
-                shadow.frame = matRect
-                shadow.layer?.shadowPath = path
-            }
-        }
+        borderOverlay.frame = matRect
         window?.invalidateCursorRects(for: self)
     }
 
@@ -265,6 +230,7 @@ final class GroupBorderPanel: NSPanel {
         isOpaque = false
         backgroundColor = .clear
         hasShadow = false
+        appearance = NSAppearance(named: .aqua)
         isMovableByWindowBackground = false
         isReleasedWhenClosed = false
         ignoresMouseEvents = false
@@ -334,9 +300,9 @@ final class GroupBorderView: NSView {
     weak var panel: GroupBorderPanel?
     var memberCount: Int = 0
 
-    private let shadowAmbient = NSView()
-    private let shadowContact = NSView()
+    private let outerShadowView: OuterShadowView
     private let pillSurface: DesignTokens.Mat.LiquidGlassSurface
+    private let foregroundHost = NSView()
     private let pillStack = NSStackView()
 
     private let dragIcon = NSImageView()
@@ -349,35 +315,30 @@ final class GroupBorderView: NSView {
 
     private var entrancePlayed = false
 
-    override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override init(frame: NSRect) {
-        pillSurface = DesignTokens.Mat.liquidGlass(
+        // 与 ToolbarPanel / GroupBackdropPanel 同源的恒定浅色高晶玻璃配方，
+        // 避免切出/失焦后磨砂降级或发白跳变，同时由同级 .aqua foregroundHost 锁定图文清晰度。
+        outerShadowView = OuterShadowView(
+            spec: .pill,
+            margin: GroupBorderPanel.shadowMargin,
+            cornerRadius: 10
+        )
+        pillSurface = DesignTokens.Mat.fixedLightCrystalBlur(
             cornerRadius: 10,
-            style: .clear,
-            tintColor: DesignTokens.Mat.floatingGlassTint,
-            fallbackMaterial: DesignTokens.Mat.hud
+            tintAlpha: 0.06
         )
         super.init(frame: frame)
         wantsLayer = true
 
-        if !pillSurface.isNativeLiquidGlass {
-            for (shadow, r, offsetY, alpha) in [
-                (shadowAmbient, CGFloat(14), CGFloat(-5), Float(0.20)),
-                (shadowContact, CGFloat(3), CGFloat(-1), Float(0.12)),
-            ] {
-                shadow.wantsLayer = true
-                shadow.layer?.backgroundColor = NSColor.clear.cgColor
-                shadow.layer?.shadowColor = NSColor.black.cgColor
-                shadow.layer?.shadowOpacity = alpha
-                shadow.layer?.shadowRadius = r
-                shadow.layer?.shadowOffset = CGSize(width: 0, height: offsetY)
-                addSubview(shadow)
-            }
-        }
+        addSubview(outerShadowView)
         addSubview(pillSurface.hostView)
+
+        foregroundHost.wantsLayer = true
+        foregroundHost.appearance = NSAppearance(named: .aqua)
+        addSubview(foregroundHost)
 
         dragIcon.image = TBIcon.symbolImage(named: "square.on.square", pointSize: 11.5, weight: .medium, hierarchical: true)
         dragIcon.contentTintColor = DesignTokens.label2
@@ -414,7 +375,7 @@ final class GroupBorderView: NSView {
         pillStack.addArrangedSubview(quickCopyButton)
         pillStack.addArrangedSubview(ungroupButton)
         pillStack.addArrangedSubview(closeGroupButton)
-        pillSurface.contentContainer.addSubview(pillStack)
+        foregroundHost.addSubview(pillStack)
     }
 
     @available(*, unavailable)
@@ -450,19 +411,11 @@ final class GroupBorderView: NSView {
 
     func layoutPill(width: CGFloat, height: CGFloat, margin: CGFloat) {
         let pillRect = NSRect(x: margin, y: margin, width: width, height: height)
+        outerShadowView.frame = bounds
+        outerShadowView.refreshGeometry()
         pillSurface.hostView.frame = pillRect
+        foregroundHost.frame = pillRect
         pillStack.frame = NSRect(origin: .zero, size: pillRect.size)
-
-        if !pillSurface.isNativeLiquidGlass {
-            let path = CGPath(
-                roundedRect: NSRect(origin: .zero, size: pillRect.size),
-                cornerWidth: height / 2, cornerHeight: height / 2, transform: nil
-            )
-            for shadow in [shadowAmbient, shadowContact] {
-                shadow.frame = pillRect
-                shadow.layer?.shadowPath = path
-            }
-        }
         window?.invalidateCursorRects(for: self)
     }
 
@@ -520,12 +473,11 @@ final class GroupBorderView: NSView {
         let reduce = DesignTokens.Motion.reduceMotion
         alphaValue = 0
         let pillFinal = pillSurface.hostView.frame
+        let shadowFinal = outerShadowView.frame
         if !reduce {
-            pillSurface.hostView.frame = pillFinal.offsetBy(dx: 0, dy: 5)
-            if !pillSurface.isNativeLiquidGlass {
-                shadowAmbient.frame = pillSurface.hostView.frame
-                shadowContact.frame = pillSurface.hostView.frame
-            }
+            pillSurface.hostView.frame = pillFinal.offsetBy(dx: 0, dy: -5)
+            foregroundHost.frame = pillFinal.offsetBy(dx: 0, dy: -5)
+            outerShadowView.frame = shadowFinal.offsetBy(dx: 0, dy: -5)
         }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = DesignTokens.Motion.enterDuration
@@ -533,10 +485,8 @@ final class GroupBorderView: NSView {
             animator().alphaValue = 1
             if !reduce {
                 pillSurface.hostView.animator().setFrameOrigin(pillFinal.origin)
-                if !pillSurface.isNativeLiquidGlass {
-                    shadowAmbient.animator().setFrameOrigin(pillFinal.origin)
-                    shadowContact.animator().setFrameOrigin(pillFinal.origin)
-                }
+                foregroundHost.animator().setFrameOrigin(pillFinal.origin)
+                outerShadowView.animator().setFrameOrigin(shadowFinal.origin)
             }
         }
     }
