@@ -36,6 +36,9 @@ final class OverlayController {
     /// 转后台时 isTerminated 语义不可靠——用户病例 7 次 prevAlive=false vs
     /// 2 次 restored 实锤）。归还时按 pid 从 runningApplications 重查活引用。
     private var previousAppPID: Int?
+    /// 截图开始时设置窗是否开着（用户裁定 2026-11-22：开着就拍进冻结图，
+    /// 可框选截设置面板本身；冻结后让它退场，end() 时按此标记回场）
+    private var settingsWasVisibleAtCaptureBegin = false
     /// 编辑会话（编辑态非空）
     private(set) var editorSession: EditorSession?
     /// 最近一次编辑态导出快照（在 end() 清空 editorSession 前保存，供上层读写可重编矢量层）
@@ -278,13 +281,11 @@ final class OverlayController {
         // 补丁 E（reviewer）：防御性清滚动残留（不依赖 coordinator state 门禁——
         // 缺失边①：任何绕过路径留下的吞键/采样/HUD 状态一律清零）
         teardownScrollSession()
-        // 病例（用户 2026-11-16「截图快捷键把设置面板唤起来」）：设置窗开启
-        // 期间 App 是 .regular，overlay 的 NSApp.activate 会把它的窗全部顶到
-        // 前台——设置窗盖在截图覆盖层上。截图期间设置窗退场（截完不自动回，
-        // 重新从菜单打开——截图时设置窗在场本身就挡内容）
-        if SettingsWindowController.shared.isVisible {
-            SettingsWindowController.shared.orderOutForCapture()
-        }
+        // 用户裁定 2026-11-22：设置窗在冻结期间保持可见——它会被一起拍进冻结图，
+        // 用户可以直接框选截设置面板本身（旧实现 begin 时先退场 ⇒ 永远截不到）。
+        // 冻结完成后、覆盖层上屏前再退场（见下方 Task 内 restoreSettingsAfterCapture），
+        // 避免 live 设置窗浮在覆盖层上挡交互。
+        settingsWasVisibleAtCaptureBegin = SettingsWindowController.shared.isVisible
         previousApp = NSWorkspace.shared.frontmostApplication
         if let prev = previousApp {
             previousAppPID = Int(prev.processIdentifier)
@@ -330,6 +331,11 @@ final class OverlayController {
             // 若用户在冻结几十毫秒内已按 Esc 取消，直接丢弃，绝不迟到弹窗
             guard epoch == self.overlaySessionEpoch else { return }
             self.frozenImages = frames
+            // 冻结已完成：设置窗（若开着）已被拍进冻结图。现在让它退场，
+            // 避免 live 窗口浮在即将上屏的覆盖层上（见 begin 顶部用户裁定）。
+            if SettingsWindowController.shared.isVisible {
+                SettingsWindowController.shared.orderOutForCapture()
+            }
             let freezeMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
             )
@@ -428,6 +434,12 @@ final class OverlayController {
         ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
         ocrCloseObserver = nil
         teardownScrollSession()
+        // 设置窗回场：截图开始时它若开着（被拍进了冻结图），覆盖层上屏前我们
+        // 让它退过场（见 begin 内用户裁定）；会话结束后原样回场，现场不丢
+        if settingsWasVisibleAtCaptureBegin, !SettingsWindowController.shared.isVisible {
+            SettingsWindowController.shared.restoreAfterCapture()
+        }
+        settingsWasVisibleAtCaptureBegin = false
         // 仅当 80ms 后未开启新截图会话时才归还焦点，杜绝快速 Esc→F1 场景旧回调抢走新会话焦点
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             guard let self, self.overlaySessionEpoch == endEpoch, self.windows.isEmpty else { return }
