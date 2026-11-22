@@ -1,28 +1,29 @@
 import AppKit
 
-/// 设置窗口（System Settings 同款玻璃分组卡观感）
+/// 设置窗口（重设计 v2：工具栏同款「恒定浅色高晶玻璃」语言）
 ///
-/// - NSToolbar 三个可选中 tab：「通用」「快捷键」「关于」（toolbarStyle = .preference，
-///   系统偏好同款居中布局）；三个等大小子视图叠在同一容器里切 isHidden，无闪烁。
-/// - 无「确定/取消」按钮：任何控件改动立即 `store.save`，窗口关闭即生效。
-/// - 视觉（延展设计真源 toolbar 的玻璃语言，真源无 settings 场景）：
-///   窗体档 3 全窗磨砂（mat.sidebar，满铺含 titlebar，明暗自适应）+ 磨砂分组卡
-///   radius 10 圆角 + 明暗自适应描边
-///   （暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.09)，对齐真源 --glass-stroke/--glass-edge）；
-///   分组标题 11pt semibold secondary；行式设置左标签右控件，行高 36，8pt 栅格（间距 8/12）；
-///   分隔线 0.5pt 暗色 rgba(255,255,255,.12) / 亮色 rgba(0,0,0,.085)（对齐 --hair）；
-///   品牌色走 controlAccentColor（暗色即 #0A84FF），字体 SF Pro 体系。
-/// - 六边形纪律：只依赖端口 `SettingsStoring`，适配器由合成根注入（主会话接线）。
+/// 设计决策（对齐 ToolbarPanel 已实锤稳定的配方，真源 tokens.md §2/§9）：
+/// - 窗体钉 `.aqua` 浅色 + 全窗 `.menu` 澄澈磨砂铺底（含 titlebar），
+///   分组卡 = `CrystalGlassContainer`（晶透玻璃 + OuterShadowView 双层光学影）
+///   ——与工具栏同一条玻璃曲线，深色桌面背景下不再是一坨灰泥
+/// - 四 tab 不用系统 NSToolbar（icon+label 的 system chrome 与本套玻璃语言不搭）：
+///   窗顶居中玻璃槽段选器（GlassSegmentedControl，选中胶囊 CASpring 420/28/0.85
+///   滑移，与工具栏选中指示层同物理）；窗口高度随 tab 内容动画收放
+/// - 控件全套玻璃化（SettingsGlassControls.swift）：
+///   NSSwitch→GlassSwitch（玻璃轨道+晶透旋钮）、NSPopUpButton→GlassPopUpButton、
+///   NSSegmentedControl→GlassSegmentedControl、按钮→GlassMiniButton/GlassIconButton、
+///   热键录制器→GlassHotkeyRecorderView（录制态 accent 环+呼吸点，逻辑不变）
+/// - 信息架构重排（旧版通用页 6 卡一坨滚动表单）：
+///   「通用」= 启动/截图/历史/通知（4 卡 8 行，一屏放下不滚动）
+///   「工具栏」= 大小档位 + 排序（独立 tab，排序不再挤通用页）
+///   「快捷键」= 全局 3 + 视觉记忆 4 + 编辑器 9（编辑器热键双列网格，行数 9→5）
+///   「关于」= 图标/版本/权限状态卡
+/// - 无「确定/取消」：任何控件改动立即 store.save，窗口关闭即生效（沿用旧语义）
+/// - 六边形纪律：只依赖端口 `SettingsStoring`，适配器由合成根注入（主会话接线）
 @MainActor
-final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSToolbarDelegate, NSControlTextEditingDelegate {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSControlTextEditingDelegate {
 
     static let shared = SettingsWindowController()
-
-    // MARK: - Tab 标识
-
-    private static let tabGeneral = NSToolbarItem.Identifier("snapcut.settings.tab.general")
-    private static let tabHotkeys = NSToolbarItem.Identifier("snapcut.settings.tab.hotkeys")
-    private static let tabAbout = NSToolbarItem.Identifier("snapcut.settings.tab.about")
 
     // MARK: - 状态
 
@@ -32,37 +33,41 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private var windowBuilt = false
     private var panesBuilt = false
 
+    private var tabRail: GlassTabRail!
     private let generalPane = NSView()
+    private let toolbarPane = NSView()
     private let hotkeyPane = NSView()
     private let aboutPane = NSView()
     private var permStatusDot: NSView?
-    private var permButtonRef: NSButton?
+    private var permButtonRef: GlassMiniButton?
     private var permHintRef: NSTextField?
     private var permStatusLabel: NSTextField?
 
     // 通用 tab 控件
-    private var launchAtLoginSwitch: NSSwitch!
+    private var launchAtLoginSwitch: GlassSwitch!
     private var launchAtLoginHintRow: NSView!
     private var launchAtLoginHintLabel: NSTextField!
-    private var launchAtLoginOpenBtn: NSButton!
-    private var toolbarSizeSegment: NSSegmentedControl!
-    private var afterCapturePopup: NSPopUpButton!
+    private var launchAtLoginOpenBtn: GlassMiniButton!
+    private var afterCapturePopup: GlassPopUpButton!
     private var pathField: NSTextField!
-    private var filenamePopup: NSPopUpButton!
+    private var filenamePopup: GlassPopUpButton!
     private var historyField: NSTextField!
     private var historyStepper: NSStepper!
-    private var autoIndexOCRSwitch: NSSwitch!
-    private var notifySwitch: NSSwitch!
-    private var soundSwitch: NSSwitch!
+    private var autoIndexOCRSwitch: GlassSwitch!
+    private var notifySwitch: GlassSwitch!
+    private var soundSwitch: GlassSwitch!
+
+    // 工具栏 tab 控件
+    private var toolbarSizeSegment: GlassSegmentedControl!
 
     // 快捷键 tab 控件
-    private var regionRecorder: HotkeyRecorderView!
-    private var fullScreenRecorder: HotkeyRecorderView!
-    private var historySpotlightRecorder: HotkeyRecorderView!
-    /// 编辑器热键（工具栏后半段 8 动作）录制器，key = action key
-    private var editorRecorders: [String: HotkeyRecorderView] = [:]
+    private var regionRecorder: GlassHotkeyRecorderView!
+    private var fullScreenRecorder: GlassHotkeyRecorderView!
+    private var historySpotlightRecorder: GlassHotkeyRecorderView!
+    /// 编辑器热键（工具栏后半段 9 动作）录制器，key = action key
+    private var editorRecorders: [String: GlassHotkeyRecorderView] = [:]
     /// 视觉记忆面板操作热键录制器，key = action key
-    private var spotlightRecorders: [String: HotkeyRecorderView] = [:]
+    private var spotlightRecorders: [String: GlassHotkeyRecorderView] = [:]
     private var hotkeyHint: NSTextField!
 
     private init() {
@@ -83,6 +88,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         Log.event(.app, "settings.window.orderOutForCapture")
     }
 
+    /// 截图会话结束回场（OverlayController.end 调用；仅恢复可见性，不重建）
+    func restoreAfterCapture() {
+        guard let window else { return }
+        NSApp.setActivationPolicy(.regular)
+        window.orderFront(nil)
+        Log.event(.app, "settings.window.restoreAfterCapture")
+    }
+
     func show(store: SettingsStoring) {
         self.store = store
         settings = store.load()
@@ -92,12 +105,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         // 授权再开窗口仍显示「未授权」旧文案——每次 open 都要重刷
         refreshPermissionStatus()
         // LSUIElement（.accessory 策略）下，系统协作激活不会真正把 App 切到前台：
-        // 设置窗看起来在前，但用户一点面板，焦点就被让回之前的 App（窗「退后台」
-        // + toolbar tab 点不动）。设置窗打开期间临时切 .regular，关闭时还原。
+        // 设置窗看起来在前，但用户一点面板，焦点就被让回之前的 App（窗「退后台」）。
+        // 设置窗打开期间临时切 .regular，关闭时还原。
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        // mat.window / mat.card：窗口类界面跟随系统外观（迁移差异 §10-6，
-        // token 表给了暗/亮双值；不再钉 darkAqua）；唤起时居中于光标所在屏幕
         if let window {
             let origin = DisplayRegistry.centerOrigin(for: window.frame.size)
             window.setFrameOrigin(origin)
@@ -108,6 +119,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
 
     // MARK: - 窗口构建
 
+    /// 布局：左导航栏（196pt）+ 右内容区（行宽 448）。
+    /// 窗高随 tab 内容收放；pane 高按内容实测量身定制
+    /// （通用 4 卡 8 行 ~585 / 工具栏 2 卡 ~450 / 快捷键 3 卡 ~700 / 关于 ~320）
+    private static let sidebarWidth: CGFloat = 196
+    private static let contentWidth: CGFloat = 560
+    private static let paneHeights: [CGFloat] = [600, 470, 710, 380]
+    /// 内容区上下边距
+    private static let contentInsetV: CGFloat = 24
+
     private func ensureWindow() {
         if !panesBuilt {
             panesBuilt = true
@@ -116,35 +136,41 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         guard !windowBuilt else { return }
         windowBuilt = true
 
+        let totalWidth = Self.sidebarWidth + Self.contentWidth
+        let initialSize = CGSize(
+            width: totalWidth,
+            height: Self.paneHeights[0] + Self.contentInsetV * 2
+        )
         let win = NSWindow(
-            contentRect: NSRect(origin: .zero, size: DesignTokens.Settings.windowSize),
+            contentRect: NSRect(origin: .zero, size: initialSize),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         win.title = "Snapcut 设置"
         win.isReleasedWhenClosed = false
-        win.toolbarStyle = .preference
-        // 档 3 三件套：全窗磨砂必须满铺含 titlebar 区域，否则 titlebar 透明带
-        // 直接穿底（系统 fallback 到透）。
-        //   ① .fullSizeContentView：contentView 延伸到 titlebar 下，磨砂视图才
-        //      能满铺；内容顶部用 safeAreaLayoutGuide 避开 toolbar（见 pinStack）
-        //   ② isOpaque = false + backgroundColor = .clear：让窗底透出磨砂视图
+        // 恒定浅色高晶玻璃（工具栏同配方）：钉 .aqua 让前景控件解析亮外观动态色；
+        // titlebar 透明 + fullSizeContentView 让磨砂满铺含 titlebar；
+        // title 只留给 WindowServer/AX（e2e 靠它定位），视觉隐藏由自定义侧栏接管
+        win.appearance = NSAppearance(named: .aqua)
         win.titlebarAppearsTransparent = true
         win.isOpaque = false
         win.backgroundColor = .clear
+        win.titleVisibility = .hidden
+        win.isMovableByWindowBackground = true
+        win.delegate = self
 
-        let toolbar = NSToolbar(identifier: "snapcut.settings.toolbar")
-        toolbar.delegate = self
-        toolbar.displayMode = .iconAndLabel
-        toolbar.allowsUserCustomization = false
-        win.toolbar = toolbar
-        win.delegate = self  // 需要 NSWindowDelegate（windowWillClose）
+        let container = NSView(frame: NSRect(origin: .zero, size: initialSize))
+        container.wantsLayer = true
 
-        let container = NSView(frame: NSRect(origin: .zero, size: DesignTokens.Settings.windowSize))
-        // 档 3 窗底：全窗磨砂铺底（内容三层之下，含 titlebar 区域）
-        let windowGlass = NSVisualEffectView()
-        windowGlass.material = DesignTokens.Mat.window
+        // 档 3 窗底：全窗澄澈磨砂铺底（含 titlebar 区域）——`.aqua` 下 .menu 高通透
+        let windowGlass = AdaptiveGlassView(
+            cornerRadius: 0,
+            strokeWidth: 0,
+            dynamicStrokeColor: .clear
+        )
+        windowGlass.appearance = NSAppearance(named: .aqua)
+        windowGlass.material = .menu
         windowGlass.blendingMode = .behindWindow
         windowGlass.state = .active
         windowGlass.translatesAutoresizingMaskIntoConstraints = false
@@ -155,109 +181,135 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             windowGlass.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             windowGlass.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
-        for pane in [generalPane, hotkeyPane, aboutPane] {
+
+        // 左侧栏：窗口标题（顶部，红绿灯同高呼吸）+ 竖向 tab 栏（选中胶囊弹簧滑移）
+        let sidebar = NSView()
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(sidebar)
+        NSLayoutConstraint.activate([
+            sidebar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            sidebar.topAnchor.constraint(equalTo: container.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: Self.sidebarWidth),
+        ])
+
+        let titleLabel = NSTextField(labelWithString: "设置")
+        titleLabel.font = .systemFont(ofSize: 22, weight: .bold)
+        titleLabel.textColor = DesignTokens.label1
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(titleLabel)
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 24),
+            titleLabel.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 52),
+        ])
+
+        tabRail = GlassTabRail(items: [
+            .init(title: "通用", symbol: "gearshape"),
+            .init(title: "工具栏", symbol: "menubar.rectangle"),
+            .init(title: "快捷键", symbol: "command"),
+            .init(title: "关于", symbol: "info.circle"),
+        ])
+        tabRail.onSelect = { [weak self] index in self?.selectTab(index) }
+        tabRail.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(tabRail)
+        NSLayoutConstraint.activate([
+            tabRail.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            tabRail.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            tabRail.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 20),
+        ])
+
+        // 侧栏与内容区间的 0.5pt hairline（token hair，满高）
+        let divider = SettingsHairlineView()
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(divider)
+        NSLayoutConstraint.activate([
+            divider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            divider.topAnchor.constraint(equalTo: container.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 0.5),
+        ])
+
+        // 内容区四个 pane（等大小叠放切 isHidden，无闪烁）
+        for pane in [generalPane, toolbarPane, hotkeyPane, aboutPane] {
             container.addSubview(pane)
             pane.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
+                pane.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
+                pane.trailingAnchor.constraint(equalTo: container.trailingAnchor),
                 pane.topAnchor.constraint(equalTo: container.topAnchor),
                 pane.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-                pane.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-                pane.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             ])
         }
         win.contentView = container
         window = win
-        selectTab(0)
+        selectTab(0, animated: false)
     }
 
-    // MARK: - Tab 切换（motion.crossfade：0.15s fade + 新 pane rise 4pt，不再瞬切）
+    // MARK: - Tab 切换（motion.crossfade：0.15s fade + 新 pane rise 4pt；窗口高度顺滑跟随）
 
-    private func selectTab(_ index: Int) {
-        let panes = [generalPane, hotkeyPane, aboutPane]
+    private func selectTab(_ index: Int, animated: Bool = true) {
+        let panes = [generalPane, toolbarPane, hotkeyPane, aboutPane]
         guard panes.indices.contains(index) else { return }
+        tabRail?.setSelectedIndex(index, animated: animated)
         let incoming = panes[index]
         let wasHidden = incoming.isHidden
         for (i, pane) in panes.enumerated() where i != index {
             pane.isHidden = true
         }
-        if wasHidden {
-            incoming.isHidden = false
-            incoming.alphaValue = 0
-            incoming.wantsLayer = true
-            if let layer = incoming.layer {
-                // rise 4pt 起步（layer 未翻转 y-up：-4 = 视觉在下方）
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                layer.transform = CATransform3DMakeTranslation(0, -4, 0)
-                CATransaction.commit()
-            }
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = DesignTokens.Motion.crossfadeDuration
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                incoming.animator().alphaValue = 1
-            }
-            if let layer = incoming.layer {
-                CATransaction.begin()
-                CATransaction.setAnimationDuration(DesignTokens.Motion.crossfadeDuration)
-                CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
-                layer.transform = CATransform3DIdentity
-                CATransaction.commit()
+        // 窗口高度跟随 tab 内容（宽度恒定，顶缘锚定，底部收放；出屏夹回）
+        if let window, Self.paneHeights.indices.contains(index) {
+            let targetHeight = Self.paneHeights[index] + Self.contentInsetV * 2
+            if abs(window.frame.height - targetHeight) > 0.5 {
+                var frame = window.frame
+                frame.origin.y += frame.height - targetHeight
+                frame.size.height = targetHeight
+                // 出屏夹回：变高后底缘低于可见区时整体上移；顶缘越界再压回
+                if let screen = window.screen ?? NSScreen.main {
+                    let visible = screen.visibleFrame
+                    if frame.minY < visible.minY + 12 {
+                        frame.origin.y = visible.minY + 12
+                    }
+                    if frame.maxY > visible.maxY - 8 {
+                        frame.origin.y = min(frame.origin.y, visible.maxY - 8 - frame.height)
+                    }
+                }
+                if animated {
+                    NSAnimationContext.runAnimationGroup { ctx in
+                        ctx.duration = DesignTokens.Motion.crossfadeDuration
+                        ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                        window.animator().setFrame(frame, display: true)
+                    }
+                } else {
+                    window.setFrame(frame, display: false)
+                }
             }
         }
-        let id: NSToolbarItem.Identifier = index == 0
-            ? Self.tabGeneral : (index == 1 ? Self.tabHotkeys : Self.tabAbout)
-        window?.toolbar?.selectedItemIdentifier = id
-    }
-
-    @objc private func toolbarItemClicked(_ sender: NSToolbarItem) {
-        switch sender.itemIdentifier {
-        case Self.tabGeneral: selectTab(0)
-        case Self.tabHotkeys: selectTab(1)
-        case Self.tabAbout: selectTab(2)
-        default: break
+        guard wasHidden else { return }
+        incoming.isHidden = false
+        guard animated else {
+            incoming.alphaValue = 1
+            return
         }
-    }
-
-    // MARK: NSToolbarDelegate
-
-    private var tabIdentifiers: [NSToolbarItem.Identifier] {
-        [Self.tabGeneral, Self.tabHotkeys, Self.tabAbout]
-    }
-
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        tabIdentifiers
-    }
-
-    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        tabIdentifiers
-    }
-
-    func toolbarSelectableItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        tabIdentifiers
-    }
-
-    func toolbar(
-        _ toolbar: NSToolbar,
-        itemForItemIdentifier id: NSToolbarItem.Identifier,
-        willBeInsertedIntoToolbar flag: Bool
-    ) -> NSToolbarItem? {
-        let item = NSToolbarItem(itemIdentifier: id)
-        switch id {
-        case Self.tabGeneral:
-            item.label = "通用"
-            item.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "通用")
-        case Self.tabHotkeys:
-            item.label = "快捷键"
-            item.image = NSImage(systemSymbolName: "command", accessibilityDescription: "快捷键")
-        case Self.tabAbout:
-            item.label = "关于"
-            item.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "关于")
-        default:
-            return nil
+        incoming.alphaValue = 0
+        incoming.wantsLayer = true
+        if let layer = incoming.layer {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.transform = CATransform3DMakeTranslation(0, -4, 0)
+            CATransaction.commit()
         }
-        item.target = self
-        item.action = #selector(toolbarItemClicked(_:))
-        return item
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = DesignTokens.Motion.crossfadeDuration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            incoming.animator().alphaValue = 1
+        }
+        if let layer = incoming.layer {
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(DesignTokens.Motion.crossfadeDuration)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+            layer.transform = CATransform3DIdentity
+            CATransaction.commit()
+        }
     }
 
     // MARK: - 窗口关闭：退出录制态（设置本身已即时保存，无需收尾）
@@ -272,36 +324,37 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         fullScreenRecorder?.endRecordingIfNeeded()
         historySpotlightRecorder?.endRecordingIfNeeded()
         for r in editorRecorders.values { r.endRecordingIfNeeded() }
-        // 设置窗关闭：还原 LSUIElement 形态（show() 里临时切的 .regular）。
-        // 策略还原即自动让出前台，焦点回之前的 App。
+        // 设置窗关闭：还原 LSUIElement 形态（show() 里临时切的 .regular）
         NSApp.setActivationPolicy(.accessory)
         Log.event(.app, "settings.window.close")
     }
 
-    // MARK: - 通用 tab
+    // MARK: - Panes 构建
 
     private func buildPanes() {
         buildGeneralPane()
+        buildToolbarPane()
         buildHotkeyPane()
         buildAboutPane()
     }
 
+    // MARK: - 通用 tab（启动 / 截图 / 历史 / 通知，4 卡 8 行一屏放下）
+
     private func buildGeneralPane() {
         // 登录时自动启动（SMAppService.mainApp 原生登录项）
-        launchAtLoginSwitch = NSSwitch()
+        launchAtLoginSwitch = GlassSwitch()
         launchAtLoginSwitch.target = self
         launchAtLoginSwitch.action = #selector(launchAtLoginToggled(_:))
 
         launchAtLoginHintLabel = NSTextField(labelWithString: "")
-        launchAtLoginHintLabel.font = .systemFont(ofSize: 11)
+        launchAtLoginHintLabel.font = DesignTokens.Font.note
         launchAtLoginHintLabel.textColor = .secondaryLabelColor
         launchAtLoginHintLabel.lineBreakMode = .byWordWrapping
         launchAtLoginHintLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        launchAtLoginOpenBtn = NSButton(title: "打开登录项…", target: self, action: #selector(openLoginItemsSettings))
-        launchAtLoginOpenBtn.bezelStyle = .rounded
-        launchAtLoginOpenBtn.controlSize = .small
-        launchAtLoginOpenBtn.font = .systemFont(ofSize: 11, weight: .medium)
+        launchAtLoginOpenBtn = GlassMiniButton(title: "打开登录项…")
+        launchAtLoginOpenBtn.target = self
+        launchAtLoginOpenBtn.action = #selector(openLoginItemsSettings)
 
         let hintSpacer = NSView()
         hintSpacer.translatesAutoresizingMaskIntoConstraints = false
@@ -327,47 +380,52 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         let startupCard = makeGroupCard(title: "启动", rows: [startupRowStack])
 
         // 截图完成后
-        afterCapturePopup = NSPopUpButton()
+        afterCapturePopup = GlassPopUpButton()
         afterCapturePopup.translatesAutoresizingMaskIntoConstraints = false
         afterCapturePopup.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        for action in AppSettings.AfterCaptureAction.allCases {
-            let item = NSMenuItem(title: Self.afterCaptureLabel(action), action: nil, keyEquivalent: "")
-            item.representedObject = action.rawValue
-            afterCapturePopup.menu?.addItem(item)
+        afterCapturePopup.configure(
+            items: AppSettings.AfterCaptureAction.allCases.map { (Self.afterCaptureLabel($0), $0.rawValue) },
+            selectedRawValue: settings.afterCapture.rawValue
+        )
+        afterCapturePopup.onSelect = { [weak self] raw in
+            self?.afterCaptureChanged(raw)
         }
-        afterCapturePopup.target = self
-        afterCapturePopup.action = #selector(afterCaptureChanged(_:))
 
         // 保存目录（只读展示 + 选择…）
         pathField = NSTextField(string: "~/Pictures/Snapcut")
         pathField.isEditable = false
-        pathField.font = .systemFont(ofSize: 12)
+        pathField.isBordered = false
+        pathField.drawsBackground = false
+        pathField.font = DesignTokens.Font.note
+        pathField.textColor = DesignTokens.label2
         pathField.lineBreakMode = .byTruncatingMiddle
         pathField.translatesAutoresizingMaskIntoConstraints = false
-        pathField.widthAnchor.constraint(equalToConstant: 220).isActive = true
+        pathField.widthAnchor.constraint(equalToConstant: 200).isActive = true
 
-        let chooseButton = NSButton(title: "选择…", target: self, action: #selector(chooseDirectory(_:)))
-        chooseButton.bezelStyle = .rounded
-        chooseButton.controlSize = .small
+        let chooseButton = GlassMiniButton(title: "选择…")
+        chooseButton.target = self
+        chooseButton.action = #selector(chooseDirectory(_:))
 
         // 文件名
-        filenamePopup = NSPopUpButton()
+        filenamePopup = GlassPopUpButton()
         filenamePopup.translatesAutoresizingMaskIntoConstraints = false
         filenamePopup.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        for style in AppSettings.FilenameStyle.allCases {
-            let item = NSMenuItem(title: Self.filenameLabel(style), action: nil, keyEquivalent: "")
-            item.representedObject = style.rawValue
-            filenamePopup.menu?.addItem(item)
+        filenamePopup.configure(
+            items: AppSettings.FilenameStyle.allCases.map { (Self.filenameLabel($0), $0.rawValue) },
+            selectedRawValue: settings.filenameStyle.rawValue
+        )
+        filenamePopup.onSelect = { [weak self] raw in
+            self?.filenameChanged(raw)
         }
-        filenamePopup.target = self
-        filenamePopup.action = #selector(filenameChanged(_:))
 
-        // 历史保留：NSTextField + NSStepper 联动（1–200）
+        // 历史保留：输入框 + NSStepper 联动（1–200）
         historyField = NSTextField(string: "30")
-        historyField.alignment = .right
-        historyField.font = .systemFont(ofSize: 12)
+        historyField.alignment = .center
+        historyField.font = DesignTokens.Font.monoDigit(12)
+        historyField.isBezeled = true
+        historyField.bezelStyle = .roundedBezel
         historyField.translatesAutoresizingMaskIntoConstraints = false
-        historyField.widthAnchor.constraint(equalToConstant: 48).isActive = true
+        historyField.widthAnchor.constraint(equalToConstant: 56).isActive = true
         historyField.target = self
         historyField.action = #selector(historyFieldSubmitted(_:))
 
@@ -379,44 +437,29 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         historyStepper.target = self
         historyStepper.action = #selector(historyStepperChanged(_:))
 
-        let unitLabel = NSTextField(labelWithString: "条（1–200）")
-        unitLabel.font = .systemFont(ofSize: 12)
-        unitLabel.textColor = .secondaryLabelColor
+        let unitLabel = NSTextField(labelWithString: "条")
+        unitLabel.font = DesignTokens.Font.note
+        unitLabel.textColor = DesignTokens.label2
 
-        // 开关（NSSwitch：System Settings 同款，行式左标签右开关）
-        autoIndexOCRSwitch = NSSwitch()
+        // 开关
+        autoIndexOCRSwitch = GlassSwitch()
         autoIndexOCRSwitch.target = self
         autoIndexOCRSwitch.action = #selector(autoIndexOCRToggled(_:))
-        notifySwitch = NSSwitch()
+        notifySwitch = GlassSwitch()
         notifySwitch.target = self
         notifySwitch.action = #selector(notifyToggled(_:))
-        soundSwitch = NSSwitch()
+        soundSwitch = GlassSwitch()
         soundSwitch.target = self
         soundSwitch.action = #selector(soundToggled(_:))
 
-        // 工具栏大小档位（紧凑 / 标准 / 大号，即时生效）
-        toolbarSizeSegment = NSSegmentedControl(
-            labels: ["紧凑", "标准", "大号"],
-            trackingMode: .selectOne,
-            target: self,
-            action: #selector(toolbarSizeChanged(_:))
-        )
-        toolbarSizeSegment.segmentStyle = .rounded
-        toolbarSizeSegment.controlSize = .regular
-        toolbarSizeSegment.translatesAutoresizingMaskIntoConstraints = false
-        toolbarSizeSegment.widthAnchor.constraint(equalToConstant: 180).isActive = true
-
-        // 四张磨砂分组卡（8pt 栅格：卡间距 12，卡内边距 12/16）
+        // 四张晶透分组卡（8pt 栅格：卡间距 14，卡内边距 16）
         let captureCard = makeGroupCard(title: "截图", rows: [
-            row("工具栏大小", trailing: [toolbarSizeSegment]),
             row("截图完成后", trailing: [afterCapturePopup]),
             row("保存目录", trailing: [pathField, chooseButton]),
-        ])
-        let fileCard = makeGroupCard(title: "文件", rows: [
             row("文件名", trailing: [filenamePopup]),
         ])
         let historyCard = makeGroupCard(title: "历史", rows: [
-            row("历史保留", trailing: [historyField, historyStepper, unitLabel]),
+            row("历史保留", trailing: [historyField, unitLabel, historyStepper]),
             row("后台自动识别历史文字", trailing: [autoIndexOCRSwitch]),
         ])
         let notifyCard = makeGroupCard(title: "通知", rows: [
@@ -424,39 +467,80 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             row("截图音效", trailing: [soundSwitch]),
         ])
 
-        // 工具栏排序（用户裁定 2026-11-17）：行序 = toolbarOrder；▲▼ 调序即时生效
-        let orderCard = makeGroupCard(title: "工具栏排序", rows: buildToolbarOrderRows())
-
-        let outer = NSStackView(views: [startupCard, captureCard, orderCard, fileCard, historyCard, notifyCard])
+        let outer = NSStackView(views: [startupCard, captureCard, historyCard, notifyCard])
         outer.orientation = .vertical
         outer.alignment = .leading
-        outer.spacing = 12
-        outer.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
+        outer.spacing = 14
+        outer.edgeInsets = NSEdgeInsets(top: Self.contentInsetV, left: 24, bottom: Self.contentInsetV, right: 24)
         pinStack(outer, to: generalPane)
     }
 
-    /// 工具栏排序行（▲▼ 调序；改动即 persist + 工具栏重建在下次会话生效）
+    // MARK: - 工具栏 tab（大小档位 + 排序）
+
+    private func buildToolbarPane() {
+        // 工具栏大小档位（玻璃段选器，弹簧滑动选中胶囊，即时生效）
+        toolbarSizeSegment = GlassSegmentedControl(titles: ["紧凑", "标准", "大号"])
+        toolbarSizeSegment.onSelect = { [weak self] index in
+            self?.toolbarSizeChanged(index)
+        }
+
+        let appearanceCard = makeGroupCard(title: "外观", rows: [
+            row("工具栏大小", trailing: [toolbarSizeSegment]),
+        ])
+
+        // 工具栏排序（行序 = toolbarOrder；chevron 玻璃图标按钮调序即时生效）
+        let orderCard = makeGroupCard(title: "排序", rows: buildToolbarOrderRows())
+
+        let outer = NSStackView(views: [appearanceCard, orderCard])
+        outer.orientation = .vertical
+        outer.alignment = .leading
+        outer.spacing = 14
+        outer.edgeInsets = NSEdgeInsets(top: Self.contentInsetV, left: 24, bottom: Self.contentInsetV, right: 24)
+        pinStack(outer, to: toolbarPane)
+    }
+
+    /// 工具栏排序行（chevron 玻璃图标按钮调序；改动即 persist + 工具栏重建在下次会话生效）
     private func buildToolbarOrderRows() -> [NSView] {
         var rows: [NSView] = []
         let order = settings.toolbarOrderSafe()
         for (idx, raw) in order.enumerated() {
             let name = EditorSession.Tool(rawValue: raw)?.label ?? "未知(\(raw))"
-            let label = NSTextField(labelWithString: "\(idx + 1). \(name)")
-            label.font = .systemFont(ofSize: 12)
 
-            let up = NSButton(title: "▲", target: self, action: #selector(toolbarOrderTapped(_:)))
-            up.bezelStyle = .inline
-            up.controlSize = .small
+            let indexLabel = NSTextField(labelWithString: "\(idx + 1)")
+            indexLabel.font = DesignTokens.Font.monoDigit(11)
+            indexLabel.textColor = DesignTokens.label3
+            indexLabel.alignment = .right
+            indexLabel.translatesAutoresizingMaskIntoConstraints = false
+            indexLabel.widthAnchor.constraint(equalToConstant: 16).isActive = true
+
+            let nameLabel = NSTextField(labelWithString: name)
+            nameLabel.font = DesignTokens.Font.body
+            nameLabel.textColor = DesignTokens.label1
+
+            let up = GlassIconButton(symbolName: "chevron.up")
+            up.target = self
+            up.action = #selector(toolbarOrderTapped(_:))
             up.isEnabled = idx > 0
             up.tag = raw * 10 + 0   // delta=-1 编码为末位 0
 
-            let down = NSButton(title: "▼", target: self, action: #selector(toolbarOrderTapped(_:)))
-            down.bezelStyle = .inline
-            down.controlSize = .small
+            let down = GlassIconButton(symbolName: "chevron.down")
+            down.target = self
+            down.action = #selector(toolbarOrderTapped(_:))
             down.isEnabled = idx < order.count - 1
             down.tag = raw * 10 + 2   // delta=+1 编码为末位 2
 
-            rows.append(row(label.stringValue, trailing: [up, down]))
+            let spacer = NSView()
+            spacer.translatesAutoresizingMaskIntoConstraints = false
+            spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+
+            let stack = NSStackView(views: [indexLabel, nameLabel, spacer, up, down])
+            stack.orientation = .horizontal
+            stack.alignment = .centerY
+            stack.spacing = 8
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            stack.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+            stack.heightAnchor.constraint(equalToConstant: DesignTokens.Settings.rowHeight).isActive = true
+            rows.append(stack)
         }
         return rows
     }
@@ -477,19 +561,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         settings.toolbarOrder = normalized
         Log.event(.app, "settings.toolbarOrder", ["moved": "\(raw)", "to": "\(target)"])
         persist()
-        rebuildOrderCard()
+        rebuildToolbarPane()
     }
 
-    /// 排序卡整卡重建（行序即时反映）：通用页清空重 build + 切回显示
-    private func rebuildOrderCard() {
-        generalPane.subviews.forEach { $0.removeFromSuperview() }
-        buildGeneralPane()
+    /// 排序卡整页重建（行序即时反映）：工具栏页清空重 build + 切回显示
+    private func rebuildToolbarPane() {
+        toolbarPane.subviews.forEach { $0.removeFromSuperview() }
+        buildToolbarPane()
         refreshControls()
-        selectTab(0)
+        selectTab(1, animated: false)
     }
 
-    @objc private func launchAtLoginToggled(_ sender: NSSwitch) {
-        let wantEnable = sender.state == .on
+    // MARK: - 通用 tab 动作
+
+    @objc private func launchAtLoginToggled(_ sender: GlassSwitch) {
+        let wantEnable = sender.isOn
         switch LaunchAtLoginManager.setEnabled(wantEnable) {
         case .success(let status):
             applyLaunchAtLoginStatus(status, errorMessage: nil)
@@ -508,7 +594,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 
     private func applyLaunchAtLoginStatus(_ status: LaunchAtLoginStatus, errorMessage: String?) {
-        launchAtLoginSwitch.state = (status == .enabled || status == .requiresApproval) ? .on : .off
+        launchAtLoginSwitch.setOn(status == .enabled || status == .requiresApproval, animated: false)
         if let errorMessage {
             launchAtLoginHintLabel.stringValue = errorMessage
             launchAtLoginHintLabel.textColor = DesignTokens.statusError
@@ -516,7 +602,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             launchAtLoginHintRow.isHidden = false
         } else if status == .requiresApproval {
             launchAtLoginHintLabel.stringValue = "需在「系统设置 → 通用 → 登录项」中允许 Snapcut"
-            launchAtLoginHintLabel.textColor = .systemOrange
+            launchAtLoginHintLabel.textColor = DesignTokens.statusWarn
             launchAtLoginOpenBtn.isHidden = false
             launchAtLoginHintRow.isHidden = false
         } else {
@@ -524,26 +610,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
-    @objc private func toolbarSizeChanged(_ sender: NSSegmentedControl) {
+    private func toolbarSizeChanged(_ index: Int) {
         let all = AppSettings.ToolbarSize.allCases
-        guard all.indices.contains(sender.selectedSegment) else { return }
-        let chosen = all[sender.selectedSegment]
+        guard all.indices.contains(index) else { return }
+        let chosen = all[index]
         guard settings.toolbarSize != chosen else { return }
         settings.toolbarSize = chosen
         Log.event(.app, "settings.toolbarSize", ["size": chosen.rawValue])
         persist()
     }
 
-    @objc private func afterCaptureChanged(_ sender: NSPopUpButton) {
-        guard let raw = sender.selectedItem?.representedObject as? String,
-              let action = AppSettings.AfterCaptureAction(rawValue: raw) else { return }
+    private func afterCaptureChanged(_ raw: String) {
+        guard let action = AppSettings.AfterCaptureAction(rawValue: raw) else { return }
         settings.afterCapture = action
         persist()
     }
 
-    @objc private func filenameChanged(_ sender: NSPopUpButton) {
-        guard let raw = sender.selectedItem?.representedObject as? String,
-              let style = AppSettings.FilenameStyle(rawValue: raw) else { return }
+    private func filenameChanged(_ raw: String) {
+        guard let style = AppSettings.FilenameStyle(rawValue: raw) else { return }
         settings.filenameStyle = style
         persist()
     }
@@ -579,7 +663,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
-    // NSTextField 输入联动（controlTextDidChange，识别 control 用 tag 区分）
+    // NSTextField 输入联动（controlTextDidChange，识别 control 用引用比对）
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSTextField, field === historyField else { return }
         syncHistoryField()
@@ -598,19 +682,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
-    @objc private func autoIndexOCRToggled(_ sender: NSSwitch) {
-        settings.autoIndexHistoryOCR = sender.state == .on
+    @objc private func autoIndexOCRToggled(_ sender: GlassSwitch) {
+        settings.autoIndexHistoryOCR = sender.isOn
         Log.event(.app, "settings.autoIndexOCR", ["enabled": "\(settings.autoIndexHistoryOCR)"])
         persist()
     }
 
-    @objc private func notifyToggled(_ sender: NSSwitch) {
-        settings.showCopyNotification = sender.state == .on
+    @objc private func notifyToggled(_ sender: GlassSwitch) {
+        settings.showCopyNotification = sender.isOn
         persist()
     }
 
-    @objc private func soundToggled(_ sender: NSSwitch) {
-        settings.playCaptureSound = sender.state == .on
+    @objc private func soundToggled(_ sender: GlassSwitch) {
+        settings.playCaptureSound = sender.isOn
         persist()
         if settings.playCaptureSound {
             CaptureSoundPlayer.play(force: true)
@@ -641,20 +725,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     ]
 
     private func buildHotkeyPane() {
-        regionRecorder = HotkeyRecorderView()
-        fullScreenRecorder = HotkeyRecorderView()
-        historySpotlightRecorder = HotkeyRecorderView()
+        regionRecorder = GlassHotkeyRecorderView()
+        fullScreenRecorder = GlassHotkeyRecorderView()
+        historySpotlightRecorder = GlassHotkeyRecorderView()
 
         hotkeyHint = NSTextField(labelWithString: "")
-        hotkeyHint.font = .systemFont(ofSize: 11)
-        hotkeyHint.textColor = .systemRed
+        hotkeyHint.font = DesignTokens.Font.note
+        hotkeyHint.textColor = DesignTokens.statusError
         hotkeyHint.isHidden = true
 
         wireGlobalRecorder(regionRecorder)
         wireGlobalRecorder(fullScreenRecorder)
         wireGlobalRecorder(historySpotlightRecorder)
 
-        // 磨砂分组卡（与通用页同一玻璃语言）：三行全局录制行
+        // 全局热键三行
         let card = makeGroupCard(title: "全局热键", rows: [
             row("区域截图", trailing: [regionRecorder]),
             row("全屏截图", trailing: [fullScreenRecorder]),
@@ -664,7 +748,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         // 视觉记忆搜索浮窗内快捷键
         var spotlightRows: [NSView] = []
         for (actionKey, label) in Self.spotlightHotkeyRows {
-            let rec = HotkeyRecorderView()
+            let rec = GlassHotkeyRecorderView()
             rec.allowReturnKey = true
             rec.setCombo(settings.spotlightHotkey(for: actionKey))
             wireSpotlightRecorder(rec, actionKey: actionKey)
@@ -673,22 +757,30 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
         let spotlightCard = makeGroupCard(title: "视觉记忆面板（搜索浮窗内生效）", rows: spotlightRows)
 
-        // 编辑器操作热键（工具栏后半段，仅截图编辑时生效）
+        // 编辑器操作热键（双列网格：9 项 → 5 行，行高一致、录制器对齐）
         var editorRows: [NSView] = []
+        var pendingUnits: [NSView] = []
         for (actionKey, label) in Self.editorHotkeyRows {
-            let rec = HotkeyRecorderView()
+            let rec = GlassHotkeyRecorderView(width: Self.editorRecorderWidth)
             rec.allowBare = true
             rec.setCombo(settings.editorHotkey(for: actionKey))
             wireEditorRecorder(rec, actionKey: actionKey)
             editorRecorders[actionKey] = rec
-            editorRows.append(row(label, trailing: [rec]))
+            pendingUnits.append(hotkeyGridUnit(label: label, recorder: rec))
+            if pendingUnits.count == 2 {
+                editorRows.append(hotkeyGridRow(units: pendingUnits))
+                pendingUnits = []
+            }
+        }
+        if !pendingUnits.isEmpty {
+            editorRows.append(hotkeyGridRow(units: pendingUnits))
         }
         let editorCard = makeGroupCard(title: "编辑器操作（截图编辑时生效）", rows: editorRows)
 
-        // 提示容器：左缘对齐卡内行（窗边 20 + 卡内 16），避免直接挂栈顶产生 16pt 错位
+        // 提示容器：左缘对齐卡内行
         let hintWrap = NSView()
         hintWrap.translatesAutoresizingMaskIntoConstraints = false
-        hintWrap.widthAnchor.constraint(equalToConstant: 520).isActive = true
+        hintWrap.widthAnchor.constraint(equalToConstant: Self.rowWidth + 32).isActive = true
         hintWrap.addSubview(hotkeyHint)
         hotkeyHint.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -701,14 +793,45 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         outer.orientation = .vertical
         outer.alignment = .leading
         outer.spacing = 0
-        outer.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
-        outer.setCustomSpacing(8, after: card)
-        outer.setCustomSpacing(8, after: spotlightCard)
-        outer.setCustomSpacing(8, after: editorCard)
+        outer.edgeInsets = NSEdgeInsets(top: Self.contentInsetV, left: 24, bottom: Self.contentInsetV, right: 24)
+        outer.setCustomSpacing(14, after: card)
+        outer.setCustomSpacing(14, after: spotlightCard)
+        outer.setCustomSpacing(10, after: editorCard)
         pinStack(outer, to: hotkeyPane)
     }
 
-    private func stopOtherRecorders(except current: HotkeyRecorderView) {
+    /// 双列热键网格单元：label(固定宽) + 录制器，单元等宽让两列录制器严格对齐
+    private static let editorRecorderWidth: CGFloat = 132
+
+    private func hotkeyGridUnit(label text: String, recorder: GlassHotkeyRecorderView) -> NSView {
+        let label = NSTextField(labelWithString: text)
+        label.font = DesignTokens.Font.body
+        label.textColor = DesignTokens.label1
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [label, recorder])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.widthAnchor.constraint(equalToConstant: Self.editorGridUnitWidth).isActive = true
+        return stack
+    }
+
+    /// (448 − 列间距 16) / 2 = 216
+    private static let editorGridUnitWidth: CGFloat = 216
+
+    private func hotkeyGridRow(units: [NSView]) -> NSView {
+        let stack = NSStackView(views: units)
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 16
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.heightAnchor.constraint(equalToConstant: DesignTokens.Settings.rowHeight).isActive = true
+        return stack
+    }
+
+    private func stopOtherRecorders(except current: GlassHotkeyRecorderView) {
         for other in [regionRecorder, fullScreenRecorder, historySpotlightRecorder] {
             if let other, other !== current {
                 other.endRecordingIfNeeded()
@@ -723,7 +846,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         hotkeyHint.isHidden = true
     }
 
-    private func wireSpotlightRecorder(_ recorder: HotkeyRecorderView, actionKey: String) {
+    private func wireSpotlightRecorder(_ recorder: GlassHotkeyRecorderView, actionKey: String) {
         recorder.onStart = { [weak self, weak recorder] in
             guard let self, let recorder else { return }
             self.stopOtherRecorders(except: recorder)
@@ -734,7 +857,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
-    private func handleSpotlightCombo(from recorder: HotkeyRecorderView, actionKey: String, combo: String?) {
+    private func handleSpotlightCombo(from recorder: GlassHotkeyRecorderView, actionKey: String, combo: String?) {
         guard let combo else {
             hotkeyHint.stringValue = "组合无效：需含修饰键（如 ⌘E）、F 功能键或 Return"
             hotkeyHint.isHidden = false
@@ -768,7 +891,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 
     /// 编辑器热键录制：进入录制时停掉所有其他录制器
-    private func wireEditorRecorder(_ recorder: HotkeyRecorderView, actionKey: String) {
+    private func wireEditorRecorder(_ recorder: GlassHotkeyRecorderView, actionKey: String) {
         recorder.onStart = { [weak self, weak recorder] in
             guard let self, let recorder else { return }
             self.stopOtherRecorders(except: recorder)
@@ -779,13 +902,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
-    private func handleEditorCombo(from recorder: HotkeyRecorderView, actionKey: String, combo: String?) {
+    private func handleEditorCombo(from recorder: GlassHotkeyRecorderView, actionKey: String, combo: String?) {
         guard let combo else {
             hotkeyHint.stringValue = "组合无效：需含修饰键，或单个字母/数字键"
             hotkeyHint.isHidden = false
             return
         }
-        // 冲突检查：其他编辑器动作 + 全局热键 + 内置保留键（S=滚动 / C=取色 / 空格=移动 / 1-6=工具 / ⌘⌥S=快存）
+        // 冲突检查：其他编辑器动作 + 全局热键 + 内置保留键（C=取色 / 空格=移动 / ⌘⌥S=快存）
         for rowDef in Self.editorHotkeyRows where rowDef.key != actionKey {
             if combosConflict(combo, settings.editorHotkey(for: rowDef.key)) {
                 hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「\(rowDef.label)」占用"
@@ -804,7 +927,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             return
         }
         let reserved: [String: String] = ["c": "取色", "space": "移动贴图", "cmd+opt+s": "快速保存"]
-        // （s 不再内置保留：滚动截图已可自定义，同组冲突检查会指到「滚动截图」行）
         if let name = reserved.first(where: { combosConflict(combo, $0.key) })?.value {
             hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」是内置功能「\(name)」的按键，请换一个"
             hotkeyHint.isHidden = false
@@ -820,7 +942,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         persist()
     }
 
-    private func wireGlobalRecorder(_ recorder: HotkeyRecorderView) {
+    private func wireGlobalRecorder(_ recorder: GlassHotkeyRecorderView) {
         recorder.onStart = { [weak self, weak recorder] in
             guard let self, let recorder else { return }
             self.stopOtherRecorders(except: recorder)
@@ -832,7 +954,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 
     /// 录制结果落设置：nil = 非法（缺修饰键）→ 红字提示不崩；占用 → 红字提示
-    private func handleCombo(from recorder: HotkeyRecorderView, _ combo: String?) {
+    private func handleCombo(from recorder: GlassHotkeyRecorderView, _ combo: String?) {
         guard let combo else {
             hotkeyHint.stringValue = "组合无效：必须包含至少一个修饰键（⌘ / ⇧ / ⌥ / ⌃）"
             hotkeyHint.isHidden = false
@@ -905,25 +1027,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         iconView.image = NSApp.applicationIconImage
         iconView.imageScaling = .scaleProportionallyUpOrDown
         iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.widthAnchor.constraint(equalToConstant: 64).isActive = true
-        iconView.heightAnchor.constraint(equalToConstant: 64).isActive = true
+        iconView.widthAnchor.constraint(equalToConstant: 72).isActive = true
+        iconView.heightAnchor.constraint(equalToConstant: 72).isActive = true
 
         let nameLabel = NSTextField(labelWithString: "Snapcut")
-        nameLabel.font = .systemFont(ofSize: 18, weight: .semibold)
+        nameLabel.font = .systemFont(ofSize: 20, weight: .semibold)
+        nameLabel.textColor = DesignTokens.label1
 
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "?"
         let versionLabel = NSTextField(labelWithString: "版本 \(version)")
-        versionLabel.font = .systemFont(ofSize: 12)
-        versionLabel.textColor = .secondaryLabelColor
+        versionLabel.font = DesignTokens.Font.body
+        versionLabel.textColor = DesignTokens.label2
 
         let tagline = NSTextField(labelWithString: "本地运行 · 无账户 · 不联网")
-        tagline.font = .systemFont(ofSize: 12)
-        tagline.textColor = .secondaryLabelColor
+        tagline.font = DesignTokens.Font.note
+        tagline.textColor = DesignTokens.label3
 
-        // 权限状态（用户裁定：权限情况放这里，不放托盘菜单）
-        // 病例（用户实报「字都对不齐」）：旧实现 icon 栈 centerY 居中 + NSBox
-        // 挂在栈底，box 高度不受约束 ⇒ 渲染重叠。重写为单一垂直栈，全部内容
-        // 一起居中，行内用 leading/centerY 对齐，不再有第二套坐标系。
+        // 权限状态行（状态点 + 文案 + 玻璃按钮，整体居中于卡内）
         let statusDot = NSView()
         statusDot.translatesAutoresizingMaskIntoConstraints = false
         statusDot.wantsLayer = true
@@ -933,45 +1053,49 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         permStatusDot = statusDot
 
         let statusLabel = NSTextField(labelWithString: "检查中…")
-        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.font = DesignTokens.Font.body
+        statusLabel.textColor = DesignTokens.label1
         permStatusLabel = statusLabel
 
-        let spacer = NSView()
-        spacer.translatesAutoresizingMaskIntoConstraints = false
-        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-
-        let permButton = NSButton(title: "去授权…", target: self, action: #selector(openPermissionSettings))
-        permButton.bezelStyle = .rounded
-        permButton.controlSize = .small
-        permButton.font = .systemFont(ofSize: 11, weight: .medium)
+        let permButton = GlassMiniButton(title: "去授权…")
+        permButton.target = self
+        permButton.action = #selector(openPermissionSettings)
         permButtonRef = permButton
 
-        let permRow = NSStackView(views: [statusDot, statusLabel, spacer, permButton])
+        let leftSpring = NSView()
+        leftSpring.translatesAutoresizingMaskIntoConstraints = false
+        leftSpring.setContentHuggingPriority(.init(1), for: .horizontal)
+        let rightSpring = NSView()
+        rightSpring.translatesAutoresizingMaskIntoConstraints = false
+        rightSpring.setContentHuggingPriority(.init(1), for: .horizontal)
+
+        let permRow = NSStackView(views: [leftSpring, statusDot, statusLabel, permButton, rightSpring])
         permRow.orientation = .horizontal
         permRow.alignment = .centerY
         permRow.spacing = 8
         permRow.translatesAutoresizingMaskIntoConstraints = false
-        permRow.widthAnchor.constraint(equalToConstant: 292).isActive = true
 
         let permHint = NSTextField(labelWithString: "")
-        permHint.font = .systemFont(ofSize: 11)
-        permHint.textColor = .secondaryLabelColor
+        permHint.font = DesignTokens.Font.note
+        permHint.textColor = DesignTokens.label2
+        permHint.alignment = .center
         permHintRef = permHint
 
-        // 权限状态卡：与通用/快捷键页同一磨砂卡（玻璃语言统一，不再用 NSBox/分离 hairline）
-        let permCard = makeGlassCard()
+        // 权限状态卡：与通用/快捷键页同一晶透玻璃卡（宽度贴合内容，居中）
+        let permCard = CrystalGlassContainer(cornerRadius: 12, tintAlpha: 0.08, shadowMargin: 10)
         let permStack = NSStackView(views: [permRow, permHint])
         permStack.orientation = .vertical
-        permStack.alignment = .leading
-        permStack.spacing = 8
-        permStack.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
+        permStack.alignment = .centerX
+        permStack.spacing = 6
+        permStack.edgeInsets = NSEdgeInsets(top: 14, left: 20, bottom: 14, right: 20)
         permStack.translatesAutoresizingMaskIntoConstraints = false
-        permCard.addSubview(permStack)
+        permCard.contentContainer.addSubview(permStack)
         NSLayoutConstraint.activate([
-            permStack.topAnchor.constraint(equalTo: permCard.topAnchor),
-            permStack.bottomAnchor.constraint(equalTo: permCard.bottomAnchor),
-            permStack.leadingAnchor.constraint(equalTo: permCard.leadingAnchor),
-            permStack.trailingAnchor.constraint(equalTo: permCard.trailingAnchor),
+            permStack.topAnchor.constraint(equalTo: permCard.contentContainer.topAnchor),
+            permStack.bottomAnchor.constraint(equalTo: permCard.contentContainer.bottomAnchor),
+            permStack.leadingAnchor.constraint(equalTo: permCard.contentContainer.leadingAnchor),
+            permStack.trailingAnchor.constraint(equalTo: permCard.contentContainer.trailingAnchor),
+            permStack.widthAnchor.constraint(equalToConstant: 320),
         ])
 
         let stack = NSStackView(views: [
@@ -982,13 +1106,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         stack.alignment = .centerX
         stack.spacing = 8
         stack.setCustomSpacing(4, after: versionLabel)
-        stack.setCustomSpacing(24, after: tagline)
+        stack.setCustomSpacing(28, after: tagline)
         stack.translatesAutoresizingMaskIntoConstraints = false
         aboutPane.addSubview(stack)
-        // fullSizeContentView 下用 safeArea 居中，避免被 toolbar 高度带偏
+        // 关于页内容垂直居中于 pane（sidebar 布局下 top 锚定会显秃）
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: aboutPane.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: aboutPane.safeAreaLayoutGuide.centerYAnchor),
+            stack.centerYAnchor.constraint(equalTo: aboutPane.centerYAnchor, constant: -10),
         ])
         refreshPermissionStatus()
     }
@@ -998,13 +1122,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private func refreshPermissionStatus() {
         let granted = AppCoordinatorShared.deps?.permission.isGranted() ?? false
         if granted {
-            permStatusDot?.layer?.backgroundColor = NSColor.systemGreen.cgColor
+            permStatusDot?.layer?.backgroundColor = DesignTokens.statusOK.cgColor
             permStatusLabel?.stringValue = "已授权"
             permButtonRef?.isHidden = true
-            permHintRef?.stringValue = "权限正常，⌘⇧A 随时可用"
+            permHintRef?.stringValue = "权限正常，全局热键随时可用"
             Log.event(.app, "settings.permission", ["state": "granted"])
         } else {
-            permStatusDot?.layer?.backgroundColor = NSColor.systemOrange.cgColor
+            permStatusDot?.layer?.backgroundColor = DesignTokens.statusWarn.cgColor
             permStatusLabel?.stringValue = "未授权（截屏不可用）"
             permButtonRef?.isHidden = false
             permHintRef?.stringValue = "未授权时无法截屏；授权后需重启 Snapcut"
@@ -1021,19 +1145,19 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private func refreshControls() {
         refreshLaunchAtLoginStatus()
         if let idx = AppSettings.ToolbarSize.allCases.firstIndex(of: settings.toolbarSize) {
-            toolbarSizeSegment?.selectedSegment = idx
+            toolbarSizeSegment?.setSelectedIndex(idx, animated: false)
         }
-        selectPopup(afterCapturePopup, rawValue: settings.afterCapture.rawValue)
-        selectPopup(filenamePopup, rawValue: settings.filenameStyle.rawValue)
+        afterCapturePopup?.select(rawValue: settings.afterCapture.rawValue)
+        filenamePopup?.select(rawValue: settings.filenameStyle.rawValue)
         pathField.stringValue = settings.saveDirectoryPath
         historyField.stringValue = "\(settings.historyLimit)"
         historyStepper.doubleValue = Double(
             min(max(settings.historyLimit, AppSettings.historyLimitRange.lowerBound),
                 AppSettings.historyLimitRange.upperBound)
         )
-        autoIndexOCRSwitch?.state = settings.autoIndexHistoryOCR ? .on : .off
-        notifySwitch.state = settings.showCopyNotification ? .on : .off
-        soundSwitch.state = settings.playCaptureSound ? .on : .off
+        autoIndexOCRSwitch?.setOn(settings.autoIndexHistoryOCR, animated: false)
+        notifySwitch.setOn(settings.showCopyNotification, animated: false)
+        soundSwitch.setOn(settings.playCaptureSound, animated: false)
         regionRecorder?.setCombo(settings.hotkeyRegion)
         fullScreenRecorder?.setCombo(settings.hotkeyFullScreen)
         historySpotlightRecorder?.setCombo(settings.hotkeyHistorySpotlight)
@@ -1046,13 +1170,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         hotkeyHint?.isHidden = true
     }
 
-    private func selectPopup(_ popup: NSPopUpButton?, rawValue: String) {
-        guard let popup,
-              let index = popup.itemArray.firstIndex(where: { ($0.representedObject as? String) == rawValue })
-        else { return }
-        popup.selectItem(at: index)
-    }
-
     private func persist() {
         guard let store else { return }
         store.save(settings)  // 适配器内打 settings.save 日志
@@ -1063,24 +1180,23 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         AppCoordinatorShared.coordinator?.invalidateToolbar()
     }
 
-    // MARK: - 布局助手（磨砂分组卡 / 行高 36 / 8pt 栅格）
+    // MARK: - 布局助手（晶透分组卡 / 行高 38 / 8pt 栅格）
 
-    /// 磨砂分组卡基元：分组卡不再自带材质（窗底已档 3 磨砂），改为
-    /// radius 10 + fillCard 底（白 .045/黑 .04）+ 0.5pt stroke + 顶缘 inset.hi
-    private func makeGlassCard() -> GlassCardView {
-        let card = GlassCardView()
+    /// 晶透玻璃分组卡基元：radius 12 连续圆角 + 晶透提亮 0.08 + 双层光学影
+    private func makeGlassCard() -> CrystalGlassContainer {
+        let card = CrystalGlassContainer(cornerRadius: 12, tintAlpha: 0.08, shadowMargin: 8)
         card.translatesAutoresizingMaskIntoConstraints = false
         return card
     }
 
-    /// 分组卡：11pt 灰字分组标题 + 行式设置行，行间 0.5pt 自适应分隔线
-    private func makeGroupCard(title: String, rows: [NSView]) -> GlassCardView {
+    /// 分组卡：11pt 灰字分组标题 + 行式设置行，行间 0.5pt hairline
+    private func makeGroupCard(title: String, rows: [NSView]) -> CrystalGlassContainer {
         let card = makeGlassCard()
 
         var content: [NSView] = [groupHeader(title)]
         for (i, rowView) in rows.enumerated() {
             if i > 0 {
-                let hair = HairlineView()
+                let hair = SettingsHairlineView()
                 hair.translatesAutoresizingMaskIntoConstraints = false
                 hair.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
                 hair.heightAnchor.constraint(equalToConstant: 0.5).isActive = true
@@ -1092,22 +1208,24 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
-        // 分组卡内距：4/16/6（tokens §9 设置窗规格）；标题自身承载上呼吸
-        stack.edgeInsets = NSEdgeInsets(top: 4, left: DesignTokens.Settings.cardPaddingH,
-                                        bottom: DesignTokens.Settings.cardPaddingBottom,
-                                        right: DesignTokens.Settings.cardPaddingH)
+        stack.edgeInsets = NSEdgeInsets(
+            top: DesignTokens.Settings.cardPaddingTop,
+            left: DesignTokens.Settings.cardPaddingH,
+            bottom: DesignTokens.Settings.cardPaddingBottom,
+            right: DesignTokens.Settings.cardPaddingH
+        )
         stack.setCustomSpacing(8, after: content[0])   // 标题 → 首行
-        for (i, sub) in content.enumerated() where sub is HairlineView {
+        for (i, sub) in content.enumerated() where sub is SettingsHairlineView {
             stack.setCustomSpacing(0, after: sub)
             if i > 0 { stack.setCustomSpacing(0, after: content[i - 1]) }
         }
         stack.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(stack)
+        card.contentContainer.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: card.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: card.contentContainer.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: card.contentContainer.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: card.contentContainer.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: card.contentContainer.trailingAnchor),
         ])
         return card
     }
@@ -1116,7 +1234,6 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         let label = NSTextField(labelWithString: text)
         label.font = DesignTokens.Font.noteSemibold
         label.textColor = DesignTokens.label2
-        // gcard-title：padding 12 0 6（上呼吸由标题自己承载）
         let box = NSView()
         box.translatesAutoresizingMaskIntoConstraints = false
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -1130,7 +1247,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         return box
     }
 
-    /// 行式设置：左标签（左对齐 13pt）+ 弹性空隙 + 右侧控件（8pt 栅格，行高 38）
+    /// 行式设置：左标签（13pt）+ 弹性空隙 + 右侧控件（8pt 栅格，行高 38）
     private func row(_ labelText: String, trailing: [NSView]) -> NSStackView {
         let label = NSTextField(labelWithString: labelText)
         label.font = DesignTokens.Font.body
@@ -1153,7 +1270,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         return stack
     }
 
-    private static let rowWidth: CGFloat = 488   // 560 − 窗边 20×2 − 卡内边距 16×2
+    /// 448 = 560 − 内容边距 24×2 − 卡投影留白 8×2 − 卡内边距 16×2
+    private static let rowWidth: CGFloat = 448
 
     private func pinStack(_ stack: NSStackView, to pane: NSView) {
         let scroll = NSScrollView()
@@ -1174,8 +1292,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         pane.addSubview(scroll)
 
         NSLayoutConstraint.activate([
-            // fullSizeContentView：顶部用 safeArea（避开 toolbar/titlebar 区）
-            scroll.topAnchor.constraint(equalTo: pane.safeAreaLayoutGuide.topAnchor),
+            scroll.topAnchor.constraint(equalTo: pane.topAnchor),
             scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
@@ -1210,48 +1327,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 }
 
-// MARK: - 玻璃基元（分组卡 / 分隔线；token：fillCard / stroke / hair，明暗双值）
-
-/// 分组卡：radius 10 + fillCard 底（暗 白.045 / 亮 黑.04）+ 0.5pt 卡专属描边（暗 白.10 / 亮 黑.08）
-/// （窗底已是档 3 磨砂，卡自身不再叠材质；跟随系统外观。
-///  轻盈感审查：描边 白.14 → 白.10 ——卡是区域不是盒子；inset.hi 顶缘高光删除——
-///  α.045 层级差上的高光是装饰不是信息，玻璃三档的卡容器才需要）
-@MainActor
-private final class GlassCardView: NSView {
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("unsupported") }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyChrome()
-    }
-
-    override func layout() {
-        super.layout()
-        applyChrome()
-    }
-
-    private func applyChrome() {
-        layer?.cornerRadius = DesignTokens.Radius.lg
-        layer?.masksToBounds = true
-        layer?.borderWidth = 0.5
-        layer?.borderColor = DesignTokens.Settings.cardStroke.cgColor
-        layer?.backgroundColor = DesignTokens.fillCard.cgColor
-    }
-
-    static var isDarkAppearance: Bool {
-        NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-    }
-}
+// MARK: - 玻璃基元（分隔线；token hair 明暗双值）
 
 /// 0.5pt 分隔线：暗 白.12 / 亮 黑.10（token hair），随明暗模式刷新
 @MainActor
-private final class HairlineView: NSView {
+private final class SettingsHairlineView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1270,228 +1350,6 @@ private final class HairlineView: NSView {
     private func applyColor() {
         layer?.backgroundColor = DesignTokens.hair.cgColor
     }
-}
-
-// MARK: - 热键录制控件（点击进入录制态，keyDown 捕获组合，Esc 取消）
-
-@MainActor
-private final class HotkeyRecorderView: NSButton {
-
-    /// 录到合法组合回调；nil = 非法组合。
-    /// allowBare = true（编辑器热键）：裸字母/数字合法（"o"），带修饰键的
-    /// 命名键合法（"cmd+return"）；裸命名键仍非法（return/esc 与录制控件
-    /// 自身的确认/取消语义冲突）。
-    var allowBare = false
-    /// 视觉记忆面板等支持无修饰 Return 键的场景（裸字母仍禁止，避免抢搜索输入）
-    var allowReturnKey = false
-    var onCombo: (String?) -> Void = { _ in }
-    /// 进入录制态回调（取消另一个录制器、隐藏红字提示）
-    var onStart: () -> Void = {}
-
-    private(set) var isRecording = false
-    private var combo: String
-
-    init() {
-        self.combo = ""
-        super.init(frame: .zero)
-        isBordered = false
-        wantsLayer = true
-        layer?.cornerRadius = DesignTokens.Radius.sm
-        translatesAutoresizingMaskIntoConstraints = false
-        widthAnchor.constraint(equalToConstant: 160).isActive = true
-        heightAnchor.constraint(equalToConstant: DesignTokens.Control.recorderHeight).isActive = true
-        installRecordingDot()
-        updateDisplay()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) { fatalError("unsupported") }
-
-    /// 录制态呼吸点（7pt accent，1s blink；tokens §7 热键录制器）
-    private var recordingDot: NSView?
-
-    private func installRecordingDot() {
-        let dot = NSView()
-        dot.wantsLayer = true
-        dot.layer?.backgroundColor = DesignTokens.accent.cgColor
-        dot.layer?.cornerRadius = 3.5
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        dot.widthAnchor.constraint(equalToConstant: 7).isActive = true
-        dot.heightAnchor.constraint(equalToConstant: 7).isActive = true
-        dot.isHidden = true
-        addSubview(dot)
-        recordingDot = dot
-        // 点在文字左侧：布局用 leading 约束，updateDisplay 时启用/停用
-        dotLeadingConstraint = dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10)
-        dotLeadingConstraint?.isActive = true
-        NSLayoutConstraint.activate([
-            dot.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
-        let anim = CABasicAnimation(keyPath: "opacity")
-        anim.fromValue = 1.0
-        anim.toValue = 0.25
-        anim.duration = 1.0
-        anim.autoreverses = true
-        anim.repeatCount = .infinity
-        anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        dot.layer?.add(anim, forKey: "rec.blink")
-    }
-
-    private var dotLeadingConstraint: NSLayoutConstraint?
-    func setCombo(_ combo: String) {
-        self.combo = combo
-        updateDisplay()
-    }
-
-    override var acceptsFirstResponder: Bool { true }
-
-    // MARK: 录制态
-
-    private func beginRecording() {
-        guard !isRecording else { return }
-        isRecording = true
-        onStart()
-        updateDisplay()
-        window?.makeFirstResponder(self)
-    }
-
-    func endRecordingIfNeeded() {
-        guard isRecording else { return }
-        isRecording = false
-        updateDisplay()
-        window?.makeFirstResponder(nil)
-    }
-
-    /// 录制成功确认（用户病例 2026-11-16 二报「输入完回车了还有蓝框，丑」：
-    /// accent 底/边做确认脉冲会被误读成「还在录制态」且恢复链偶发不回）。
-    /// 改用与录制态零歧义的反馈：文案「✓ 新组合」短暂显示（0.8s 后回正常值）
-    /// + 整体透明度轻脉冲——状态色完全不参与，不可能残留蓝框
-    private func flashConfirmed() {
-        guard !isRecording else { return }
-        attributedTitle = NSAttributedString(string: "✓ " + Self.symbolString(for: combo), attributes: [
-            .font: DesignTokens.Font.kbd,
-            .foregroundColor: DesignTokens.label1,
-        ])
-        let pulse = CABasicAnimation(keyPath: "opacity")
-        pulse.fromValue = 0.35
-        pulse.toValue = 1.0
-        pulse.duration = 0.28
-        pulse.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        layer?.add(pulse, forKey: "confirmPulse")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self, !self.isRecording else { return }
-            self.updateDisplay()
-        }
-    }
-
-    private func updateDisplay() {
-        let text = isRecording ? "按下新组合…" : Self.symbolString(for: combo)
-        // t.kbd（11/medium）；录制态文字 label.1、常态 label.1（设计 .hk/.kk 同色）
-        attributedTitle = NSAttributedString(string: text, attributes: [
-            .font: DesignTokens.Font.kbd,
-            .foregroundColor: isRecording ? DesignTokens.label1 : DesignTokens.label2,
-        ])
-        // 录制态：accent.ring 1.5pt 外环（审查：2.5pt 占 22pt 控件高 11% 比例失真，
-        // 降到 1.5 阶内 + α.55 补偿）；常态透明 + 0.5pt stroke（审查：22pt 控件加底
-        // 色显「块」，系统热键录制是空框语气）。描边变化 0.18s ease-out 过渡
-        if let layer {
-            CATransaction.begin()
-            CATransaction.setAnimationDuration(0.18)
-            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
-            layer.backgroundColor = NSColor.clear.cgColor
-            layer.borderWidth = isRecording ? 1.5 : 0.5
-            layer.borderColor = (isRecording ? DesignTokens.accentRing : DesignTokens.stroke).cgColor
-            CATransaction.commit()
-        }
-        recordingDot?.isHidden = !isRecording
-    }
-
-    // 覆盖按钮默认点击（不 sendAction，仅进录制态）
-    override func mouseDown(with event: NSEvent) {
-        beginRecording()
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        // 吞掉按钮默认行为
-    }
-
-    // MARK: keyDown 捕获
-
-    override func keyDown(with event: NSEvent) {
-        Log.event(.app, "recorder.keyDown", [
-            "code": "\(event.keyCode)",
-            "chars": "\(event.charactersIgnoringModifiers ?? "?")",
-            "recording": "\(isRecording)",
-        ])
-        guard isRecording else { return }
-        if event.keyCode == 53 {  // Esc 取消录制
-            endRecordingIfNeeded()
-            return
-        }
-        var mods: [String] = []
-        if event.modifierFlags.contains(.command) { mods.append("cmd") }
-        if event.modifierFlags.contains(.shift) { mods.append("shift") }
-        if event.modifierFlags.contains(.option) { mods.append("opt") }
-        if event.modifierFlags.contains(.control) { mods.append("ctrl") }
-        let key = Self.keyName(for: event)
-        if mods.isEmpty {
-            // 编辑器热键：裸字母/数字合法（原 O/P/H 语义）；裸命名键非法
-            // 裸键白名单：字母/数字 + F 键（用户病例「f1 录不进去」——录制侧
-            // 的裸键判定只认单字符，F1-F12 两字符被拒）
-            // F 键白名单对两类录制器都放行（用户裁定 2026-11-17 终报「改不了
-            // 我再给你最后一次机会」——全局热键行录 F1 也被「需含修饰键」拒）。
-            // F 键无打字冲突，裸用作全局热键也安全
-            let isBareFKey = key.hasPrefix("f") && key.count >= 2 && key.dropFirst().allSatisfy(\.isNumber)
-            if isBareFKey || (allowReturnKey && key == "return") {
-                onCombo(key)
-                isRecording = false
-                updateDisplay()
-                window?.makeFirstResponder(nil)
-                flashConfirmed()
-                return
-            }
-            if allowBare, (key.count == 1 && (key.first?.isLetter == true || key.first?.isNumber == true)) {
-                onCombo(key)
-                isRecording = false
-                updateDisplay()
-                // 录完立即交还焦点（病例三报「还有蓝框」：录完按钮仍是 first
-                // responder——系统 keyboard focus ring 蓝框围着它，与 layer
-                // border 无关，resign 才消）
-                window?.makeFirstResponder(nil)
-                flashConfirmed()
-                return
-            }
-            onCombo(nil)
-            return
-        }
-        onCombo((mods + [key]).joined(separator: "+"))
-        isRecording = false
-        updateDisplay()
-        window?.makeFirstResponder(nil)
-        flashConfirmed()
-    }
-
-    // MARK: 字符串 ⇄ 显示符号（"cmd+shift+a" ⇄ "⌘⇧A"）
-
-    private static func keyName(for event: NSEvent) -> String {
-        if let named = specialKeys[event.keyCode] { return named }
-        if let chars = event.charactersIgnoringModifiers?.lowercased(), chars.count == 1 {
-            return chars
-        }
-        return "key\(event.keyCode)"
-    }
-
-    static func symbolString(for combo: String) -> String {
-        HotkeySpec.compactDisplay(combo)
-    }
-
-    private static let specialKeys: [UInt16: String] = [
-        36: "return", 48: "tab", 49: "space", 51: "delete", 53: "esc",
-        115: "home", 116: "pageup", 117: "forwarddelete", 119: "end", 121: "pagedown",
-        122: "f1", 120: "f2", 99: "f3", 118: "f4", 96: "f5", 97: "f6",
-        98: "f7", 100: "f8", 101: "f9", 109: "f10", 103: "f11", 111: "f12",
-        123: "left", 124: "right", 125: "down", 126: "up",
-    ]
 }
 
 /// 顶部对齐的滚动文档视图（确保设置页卡片从顶部向下自然滚动，不倒挂底部）
