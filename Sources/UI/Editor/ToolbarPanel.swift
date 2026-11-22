@@ -88,30 +88,37 @@ final class ToolbarPanel: NSPanel {
         case undo, redo, toggleVisibility, done, save, cancel, ocr, pin, scroll, autoRedact, toggleBackdrop
     }
 
+    struct Capabilities {
+        var supportsScroll: Bool
+
+        static let screenshot = Capabilities(supportsScroll: true)
+        static let collage = Capabilities(supportsScroll: false)
+    }
+
     // 视图
     private var rootStack: NSStackView!
     /// 面板本体视图（玻璃圆角矩形，不含投影留白）
     private var panelRoot: NSView?
     private var outerShadowView: OuterShadowView?
     private var toolButtons: [EditorSession.Tool: TBToolButton] = [:]
-    private var colorButtons: [TBColorButton] = []
-    private var strokeSlider: TBStrokeSlider!
     private var undoButton: TBIconButton!
     private var redoButton: TBIconButton!
-    private var backdropButton: TBIconButton?
-    private var eyeButton: TBIconButton?
+    private var scrollButton: TBIconButton!
+    private var moreButton: TBIconButton!
     private var tooltip: ToolbarTooltipWindow?
-    /// 马赛克工具上下文悬浮胶囊（仅选中马赛克时在图标上方轻浮出现「✦ 智能打码 ⇧M」，不增加主栏视觉负担）
-    private var smartRedactPill: SmartRedactPillPanel?
+    /// 工具上下文属性胶囊（选中任意标注工具时在主栏上方/下方自动展开对应属性）
+    private var smartAttributePill: SmartToolAttributePillPanel?
     /// 画框美化上下文微调胶囊（仅 `backdropStyle.enabled == true` 且工具栏可见时轻浮展开）
     private var smartBackdropPill: SmartBackdropPillPanel?
+    /// `•••` 更多扩展灵动岛浮层（从按钮下方顺滑展开，不遮挡主工具栏）
+    private var smartMorePanel: SmartMoreMenuPanel?
+    private var capabilities: Capabilities = .screenshot
     private var backdropStyle = BackdropStyle()
     /// `place(...)` 入场动画期间的目标栏主体全局矩形，确保附属胶囊直接锚定终态位置而不跳动
     private var plannedBarFrameGlobal: CGRect?
-    /// 共享滑动选中指示层（工具蓝胶囊 / 颜色选环）：切换选项时物理弹簧滑移
+    /// 共享滑动选中指示层（工具蓝胶囊）：切换工具时物理弹簧滑移
     private var indicatorView: TBSelectionIndicatorView?
     private var lastSelectedTool: EditorSession.Tool = .none
-    private var lastSelectedColor: Int = -1
     /// 复用面板的退场代际守卫：旧 dismiss 动画回调不得把新一次 place 出来的面板隐藏
     private var dismissEpoch = 0
     private var usesNativeLiquidGlass = false
@@ -141,15 +148,28 @@ final class ToolbarPanel: NSPanel {
         buildUI()
     }
 
-    func configure(session: EditorSession, onToolChange: @escaping () -> Void, onAction: @escaping (Action) -> Void) {
+    func configure(
+        session: EditorSession,
+        capabilities: Capabilities = .screenshot,
+        onToolChange: @escaping () -> Void,
+        onAction: @escaping (Action) -> Void
+    ) {
         self.session = session
+        self.capabilities = capabilities
         self.onToolChange = onToolChange
         self.onAction = onAction
         lastSelectedTool = session.currentTool
-        lastSelectedColor = session.colorIndex
         backdropStyle = BackdropStyle()
-        backdropButton?.setSelected(false)
+        scrollButton?.isHidden = !capabilities.supportsScroll
+        moreButton?.setSelected(false)
+        smartAttributePill?.hide(immediate: true)
         smartBackdropPill?.hide(immediate: true)
+        if let root = panelRoot {
+            let m = TBStyle.shadowMargin
+            root.layoutSubtreeIfNeeded()
+            let fitting = root.fittingSize
+            setContentSize(NSSize(width: fitting.width + m * 2, height: fitting.height + m * 2))
+        }
         refreshSelectionState(animated: false)
     }
 
@@ -266,45 +286,7 @@ final class ToolbarPanel: NSPanel {
 
         stack.addArrangedSubview(makeSeparator())
 
-        // 2) 五色（.tb-dots：gap 6）
-        let colorsGroup = NSStackView(views: [])
-        colorsGroup.orientation = .horizontal
-        colorsGroup.alignment = .centerY
-        colorsGroup.spacing = TBStyle.dotGap
-        colorsGroup.edgeInsets = NSEdgeInsets(top: 0, left: 1, bottom: 0, right: 1)
-        for (i, color) in AnnotationModel.palette.enumerated() {
-            let button = TBColorButton(color: NSColor(cgColor: color.cgColor) ?? .red)
-            button.tag = i
-            button.target = self
-            button.action = #selector(colorTapped(_:))
-            button.onHover = { [weak self] inside in self?.handleHover(inside, button: button, text: self?.colorName(i) ?? "颜色") }
-            colorButtons.append(button)
-            colorsGroup.addArrangedSubview(button)
-        }
-        stack.addArrangedSubview(colorsGroup)
-
-        stack.addArrangedSubview(makeSeparator())
-
-        // 3) 线宽无极调节滑杆（下限 2.0pt 对齐原「细」档，连续调节至 10.0pt）
-        strokeSlider = TBStrokeSlider(minWidth: 2.0, maxWidth: 10.0)
-        strokeSlider.onChange = { [weak self] width in
-            guard let self else { return }
-            self.session?.strokeWidth = width
-            self.handleHover(true, button: self.strokeSlider, text: String(format: "线宽 %.1f pt", width))
-        }
-        strokeSlider.onCommit = { width in
-            Log.event(.editor, "toolbar.stroke", ["width": String(format: "%.1f", width)])
-        }
-        strokeSlider.onHover = { [weak self] inside in
-            guard let self else { return }
-            let tip = String(format: "线宽 %.1f pt", self.strokeSlider.value)
-            self.handleHover(inside, button: self.strokeSlider, text: tip)
-        }
-        stack.addArrangedSubview(strokeSlider)
-
-        stack.addArrangedSubview(makeSeparator())
-
-        // 4) 撤销 / 重做
+        // 2) 撤销 / 重做
         undoButton = TBIconButton(icon: .undo, fallback: "↩︎")
         undoButton.target = self
         undoButton.action = #selector(actionTapped(_:))
@@ -321,13 +303,14 @@ final class ToolbarPanel: NSPanel {
 
         stack.addArrangedSubview(makeSeparator())
 
-        // 5) 滚动截图 / 取字 / 贴图 / 画框 / 显隐（滚动截图置于取字前）
-        let scrollButton = TBIconButton(icon: .scroll, fallback: "滚")
-        scrollButton.tag = 206
-        scrollButton.target = self
-        scrollButton.action = #selector(actionTapped(_:))
-        scrollButton.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollButton, text: "滚动截图 \(Self.hotkeyTip("scroll"))") }
-        stack.addArrangedSubview(scrollButton)
+        // 3) 滚动截图 / 取字 / 贴图 / 更多（画框美化 · 隐藏工具栏收敛进更多菜单）
+        let scrollBtn = TBIconButton(icon: .scroll, fallback: "滚")
+        scrollBtn.tag = 206
+        scrollBtn.target = self
+        scrollBtn.action = #selector(actionTapped(_:))
+        scrollBtn.onHover = { [weak self] inside in self?.handleHover(inside, button: scrollBtn, text: "滚动截图 \(Self.hotkeyTip("scroll"))") }
+        scrollButton = scrollBtn
+        stack.addArrangedSubview(scrollBtn)
 
         let ocr = TBIconButton(icon: .ocr, fallback: "字")
         ocr.tag = 204
@@ -343,29 +326,18 @@ final class ToolbarPanel: NSPanel {
         pin.onHover = { [weak self] inside in self?.handleHover(inside, button: pin, text: "贴图 \(Self.hotkeyTip("pin"))") }
         stack.addArrangedSubview(pin)
 
-        let backdrop = TBIconButton(icon: .backdrop, fallback: "框")
-        backdrop.tag = 207
-        backdrop.usesSelfSelectedBackdrop = true
-        backdrop.target = self
-        backdrop.action = #selector(actionTapped(_:))
-        backdrop.onHover = { [weak self] inside in
-            let tip = Self.hotkeyTip("backdrop")
-            self?.handleHover(inside, button: backdrop, text: tip.isEmpty ? "画框美化 B" : "画框美化 \(tip)")
-        }
-        backdropButton = backdrop
-        stack.addArrangedSubview(backdrop)
-
-        let eye = TBIconButton(icon: .eye, fallback: "眼")
-        eye.tag = 200
-        eyeButton = eye
-        eye.target = self
-        eye.action = #selector(actionTapped(_:))
-        eye.onHover = { [weak self] inside in self?.handleHover(inside, button: eye, text: "隐藏工具栏 \(Self.hotkeyTip("toggleVisibility"))") }
-        stack.addArrangedSubview(eye)
+        let more = TBIconButton(icon: .more, fallback: "…")
+        more.tag = 208
+        more.usesSelfSelectedBackdrop = true
+        more.target = self
+        more.action = #selector(actionTapped(_:))
+        more.onHover = { [weak self] inside in self?.handleHover(inside, button: more, text: "更多操作") }
+        moreButton = more
+        stack.addArrangedSubview(more)
 
         stack.addArrangedSubview(makeSeparator())
 
-        // 6) 主按钮「复制」（32×32 纯图标 accent 实心键，唯一彩色 accent；tooltip 保留）
+        // 4) 主按钮「复制」（32×32 纯图标 accent 实心键，唯一彩色 accent；tooltip 保留）
         //    + 保存 + 取消（同构，无彩）
         let copy = TBPrimaryButton(icon: .copy)
         copy.tag = 201
@@ -420,10 +392,6 @@ final class ToolbarPanel: NSPanel {
         return wrapper
     }
 
-    private func colorName(_ index: Int) -> String {
-        ["红", "蓝", "黄", "黑", "白"][index % 5]
-    }
-
     // MARK: - 位置（选区下方 12pt，放不下翻上方）+ spring 出场
 
     private var targetScreen: NSScreen?
@@ -440,18 +408,35 @@ final class ToolbarPanel: NSPanel {
 
     /// 选区移动/缩放/长图滚轮缩放时平滑跟随定位（不重播入场动画，不闪烁）
     func reposition(below selection: CGRect) {
+        reposition(panelOriginFor: { visible, panelSize in
+            Self.originBelow(selection: selection, visible: visible, panelSize: panelSize)
+        })
+    }
+
+    /// 宿主窗口移动/缩放时平滑跟随定位（拼贴合成编辑窗场景）
+    func reposition(aboveGlobal hostRect: CGRect) {
+        reposition(panelOriginFor: { visible, panelSize in
+            Self.originAbove(hostRect: hostRect, visible: visible, panelSize: panelSize)
+        })
+    }
+
+    private func reposition(panelOriginFor compute: (_ visible: CGRect, _ panelSize: CGSize) -> CGPoint) {
         guard isVisible else { return }
-        applyPanelShadowPaths()
         plannedBarFrameGlobal = nil
         let margin = TBStyle.shadowMargin
         let panelSize = CGSize(width: frame.width - margin * 2,
                                height: frame.height - margin * 2)
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-        var origin = Self.originBelow(selection: selection, visible: visible, panelSize: panelSize)
+        var origin = compute(visible, panelSize)
         origin.y = min(max(origin.y, visible.minY + 8), visible.maxY - panelSize.height - 8)
         origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - panelSize.width - 8)
-        setFrameOrigin(CGPoint(x: origin.x - margin, y: origin.y - margin))
-        syncSmartRedactPill(animated: false)
+        let newOrigin = CGPoint(x: (origin.x - margin).rounded(), y: (origin.y - margin).rounded())
+        if frame.origin != newOrigin {
+            setFrameOrigin(newOrigin)
+        }
+        tooltip?.hide()
+        smartMorePanel?.hide(immediate: true)
+        syncSmartAttributePill(animated: false)
         syncSmartBackdropPill(animated: false)
     }
 
@@ -471,6 +456,15 @@ final class ToolbarPanel: NSPanel {
         return origin
     }
 
+    private static func originAbove(hostRect: CGRect, visible: CGRect, panelSize: CGSize) -> CGPoint {
+        var origin = CGPoint(x: hostRect.midX - panelSize.width / 2,
+                             y: hostRect.maxY + 12)
+        if origin.y + panelSize.height > visible.maxY - 8 {
+            origin.y = hostRect.minY - panelSize.height - 12
+        }
+        return origin
+    }
+
     /// 工具栏玻璃本体的全局可视矩形（扣除四周 shadowMargin，供 OCR 浮层精准避让）
     var visibleBarFrameGlobal: CGRect {
         frame.insetBy(dx: TBStyle.shadowMargin, dy: TBStyle.shadowMargin)
@@ -479,15 +473,16 @@ final class ToolbarPanel: NSPanel {
     override func orderFrontRegardless() {
         super.orderFrontRegardless()
         if session?.toolbarVisible ?? true {
-            syncSmartRedactPill(animated: false)
+            syncSmartAttributePill(animated: false)
             syncSmartBackdropPill(animated: false)
         }
     }
 
     override func orderOut(_ sender: Any?) {
         tooltip?.hide()
-        smartRedactPill?.hide(immediate: true)
+        smartAttributePill?.hide(immediate: true)
         smartBackdropPill?.hide(immediate: true)
+        smartMorePanel?.hide(immediate: true)
         plannedBarFrameGlobal = nil
         super.orderOut(sender)
     }
@@ -506,8 +501,9 @@ final class ToolbarPanel: NSPanel {
             }
             orderFrontRegardless()
         } else {
-            smartRedactPill?.hide(immediate: true)
+            smartAttributePill?.hide(immediate: true)
             smartBackdropPill?.hide(immediate: true)
+            smartMorePanel?.hide(immediate: true)
             orderOut(nil)
         }
     }
@@ -516,12 +512,7 @@ final class ToolbarPanel: NSPanel {
     /// 顶上放不下翻到窗底
     func place(aboveGlobal hostRect: CGRect) {
         place(panelOriginFor: { visible, panelSize in
-            var origin = CGPoint(x: hostRect.midX - panelSize.width / 2,
-                                 y: hostRect.maxY + 12)
-            if origin.y + panelSize.height > visible.maxY - 8 {
-                origin.y = hostRect.minY - panelSize.height - 12
-            }
-            return origin
+            Self.originAbove(hostRect: hostRect, visible: visible, panelSize: panelSize)
         })
     }
 
@@ -597,7 +588,7 @@ final class ToolbarPanel: NSPanel {
             }
         }
         if isVisible && (session?.toolbarVisible ?? true) {
-            syncSmartRedactPill(animated: true)
+            syncSmartAttributePill(animated: true)
             syncSmartBackdropPill(animated: true)
         }
         scheduleButtonDump()
@@ -639,8 +630,9 @@ final class ToolbarPanel: NSPanel {
     /// motion.exit 退场：fade + 居中 scale→.97 + 下沉 4pt，0.14s strong ease-out（带 dismissEpoch 复用守卫）
     func dismiss() {
         tooltip?.hide()
-        smartRedactPill?.hide(immediate: false)
+        smartAttributePill?.hide(immediate: false)
         smartBackdropPill?.hide(immediate: false)
+        smartMorePanel?.hide(immediate: false)
         plannedBarFrameGlobal = nil
         dismissEpoch += 1
         let epoch = dismissEpoch
@@ -732,9 +724,7 @@ final class ToolbarPanel: NSPanel {
     func refreshSelectionState(animated: Bool = true) {
         guard let session else { return }
         let toolChanged = session.currentTool != lastSelectedTool
-        let colorChanged = session.colorIndex != lastSelectedColor
         lastSelectedTool = session.currentTool
-        lastSelectedColor = session.colorIndex
 
         for (tool, button) in toolButtons {
             let isSel = (tool == session.currentTool)
@@ -743,84 +733,104 @@ final class ToolbarPanel: NSPanel {
                 button.playSelectPop()
             }
         }
-        for (i, button) in colorButtons.enumerated() {
-            let isSel = (i == session.colorIndex)
-            button.setSelected(isSel)
-            if animated && colorChanged && isSel {
-                button.playSelectPop()
-            }
-        }
-        strokeSlider.value = session.strokeWidth
         undoButton.isEnabled = session.store.canUndo
         redoButton.isEnabled = session.store.canRedo
         undoButton.alphaValue = session.store.canUndo ? 1 : 0.35
         redoButton.alphaValue = session.store.canRedo ? 1 : 0.35
 
-        // 更新滑动指示层（工具蓝胶囊 / 颜色选环，坐标转换到 indicators 自身空间）
+        // 更新滑动指示层（工具蓝胶囊，坐标转换到 indicators 自身空间）
         if let root = panelRoot, let indicators = indicatorView {
             root.layoutSubtreeIfNeeded()
             let toolFrame: CGRect? = toolButtons[session.currentTool].map { btn in
                 btn.convert(btn.bounds, to: indicators).insetBy(dx: 2, dy: 2)
             }
-            let colorCenter: CGPoint? = colorButtons.indices.contains(session.colorIndex)
-                ? {
-                    let btn = colorButtons[session.colorIndex]
-                    let r = btn.convert(btn.bounds, to: indicators)
-                    return CGPoint(x: r.midX, y: r.midY)
-                }()
-                : nil
-
             indicators.updateToolPill(to: toolFrame, animated: animated)
-            indicators.updateColorRing(center: colorCenter, animated: animated)
         }
-        backdropButton?.setSelected(backdropStyle.enabled)
-        syncSmartRedactPill(animated: animated)
+        moreButton?.setSelected(backdropStyle.enabled)
+        syncSmartAttributePill(animated: animated)
         syncSmartBackdropPill(animated: animated)
     }
 
     func setAutoRedactBusy(_ busy: Bool) {
-        smartRedactPill?.setBusy(busy)
+        smartAttributePill?.setBusy(busy)
     }
 
-    /// 由外部同步最新画框美化样式：更新主栏画框按钮高亮，并自动控制微调胶囊显隐与选中态刷新
+    /// 由外部同步最新画框美化样式：更新主栏「更多」按钮提示态，并自动控制微调胶囊显隐与选中态刷新
     func updateBackdropStyle(_ style: BackdropStyle) {
         let wasEnabled = backdropStyle.enabled
         backdropStyle = style
-        backdropButton?.setSelected(style.enabled)
+        moreButton?.setSelected(style.enabled)
         if isVisible && style.enabled && !wasEnabled {
-            backdropButton?.playSelectPop()
+            moreButton?.playSelectPop()
         }
         smartBackdropPill?.update(style: style)
         syncSmartBackdropPill(animated: true)
     }
 
-    /// 仅在工具栏可见且当前工具为「马赛克」时，在马赛克图标正上方 8pt 展示轻盈玻璃胶囊「✦ 智能打码 ⇧M」
-    private func syncSmartRedactPill(animated: Bool) {
+    /// 方案 B：仅当选中具体标注工具时，在工具图标上方/下方自动浮出对应属性胶囊
+    private func syncSmartAttributePill(animated: Bool) {
         guard isVisible,
               let session,
               session.toolbarVisible,
-              session.currentTool == .mosaic,
-              let mosaicBtn = toolButtons[.mosaic]
+              session.currentTool != .none,
+              let anchorBtn = toolButtons[session.currentTool]
         else {
-            smartRedactPill?.hide(immediate: !animated)
+            smartAttributePill?.hide(immediate: !animated)
             return
         }
-        let pill = smartRedactPill ?? {
-            let p = SmartRedactPillPanel { [weak self] in
-                self?.onAction(.autoRedact)
-            }
-            self.smartRedactPill = p
+        let pill = smartAttributePill ?? {
+            let p = SmartToolAttributePillPanel(
+                onColorSelect: { [weak self] index in
+                    guard let self else { return }
+                    Log.event(.editor, "toolbar.color", ["index": "\(index)"])
+                    self.session?.colorIndex = index
+                    self.refreshSelectionState(animated: true)
+                    self.onToolChange()
+                },
+                onStrokeChange: { [weak self] width, sender in
+                    guard let self else { return }
+                    self.session?.strokeWidth = width
+                    let text = (self.session?.currentTool == .mosaic)
+                        ? "马赛克 \(Int(max(8, width * 4))) px"
+                        : String(format: "线宽 %.1f pt", width)
+                    self.handlePillHover(view: sender, text: text)
+                },
+                onStrokeCommit: { width in
+                    Log.event(.editor, "toolbar.stroke", ["width": String(format: "%.1f", width)])
+                },
+                onFontSizeSelect: { [weak self] size in
+                    guard let self else { return }
+                    self.session?.textFontSize = size
+                    self.refreshSelectionState(animated: true)
+                    self.onToolChange()
+                    Log.event(.editor, "editor.text.fontSize", ["size": "\(size)"])
+                },
+                onAutoRedact: { [weak self] in
+                    self?.onAction(.autoRedact)
+                },
+                onHoverTip: { [weak self] view, text in
+                    self?.handlePillHover(view: view, text: text)
+                }
+            )
+            self.smartAttributePill = p
             return p
         }()
         pill.appearance = appearance
-        let inWindow = mosaicBtn.convert(mosaicBtn.bounds, to: nil)
+        pill.sync(
+            tool: session.currentTool,
+            colorIndex: session.colorIndex,
+            strokeWidth: session.strokeWidth,
+            textFontSize: session.textFontSize,
+            animated: animated
+        )
+        let inWindow = anchorBtn.convert(anchorBtn.bounds, to: nil)
         let btnGlobal = convertToScreen(inWindow)
         let barGlobal = plannedBarFrameGlobal ?? visibleBarFrameGlobal
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-        pill.show(anchoredAbove: btnGlobal, barRect: barGlobal, visible: visible, animated: animated)
+        pill.show(anchoredTo: btnGlobal, barRect: barGlobal, visible: visible, animated: animated)
     }
 
-    /// 仅在 `backdropStyle.enabled == true` 且工具栏可见时，在主工具栏上方（避让 SmartRedactPillPanel）展开微调胶囊
+    /// 仅在 `backdropStyle.enabled == true` 且工具栏可见时，在主工具栏上方（避让 SmartToolAttributePillPanel）展开微调胶囊
     private func syncSmartBackdropPill(animated: Bool) {
         guard isVisible,
               backdropStyle.enabled,
@@ -836,11 +846,11 @@ final class ToolbarPanel: NSPanel {
                     guard let self else { return }
                     self.backdropStyle = updated
                     self.backdropStyle.savePreference()
-                    self.backdropButton?.setSelected(updated.enabled)
+                    self.moreButton?.setSelected(updated.enabled)
                     self.onBackdropStyleChange?(updated)
                 },
                 onHoverTip: { [weak self] view, text in
-                    self?.handleBackdropPillHover(view: view, text: text)
+                    self?.handlePillHover(view: view, text: text)
                 }
             )
             self.smartBackdropPill = p
@@ -850,23 +860,19 @@ final class ToolbarPanel: NSPanel {
         pill.update(style: backdropStyle)
         let barGlobal = plannedBarFrameGlobal ?? visibleBarFrameGlobal
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-        let avoidRect: CGRect? = (smartRedactPill?.isShowing == true) ? smartRedactPill?.visiblePillFrame : nil
+        let avoidRect: CGRect? = (smartAttributePill?.isShowing == true) ? smartAttributePill?.visiblePillFrame : nil
         pill.show(anchoredToBar: barGlobal, avoiding: avoidRect, visible: visible, animated: animated)
     }
 
-    /// 工具栏显隐态图标（隐藏时 eye.slash）
-    /// 工具栏隐藏时同步收起悬停提示（病例 2026-11-15：按 H 隐藏工具栏后
-    /// tooltip 永久滞留——tracking 区随窗 orderOut 消失，mouseExited 永不触发；
-    /// tooltip 是 screenSaver 层独立 NSPanel，宿主窗没了它还浮着）
     func hideTooltip() {
         tooltip?.hide()
-        smartRedactPill?.hide(immediate: true)
+        smartAttributePill?.hide(immediate: true)
         smartBackdropPill?.hide(immediate: true)
+        smartMorePanel?.hide(immediate: true)
     }
 
     func setToolbarHidden(_ hidden: Bool) {
-        eyeButton?.setSymbol(hidden ? "eye.slash" : "eye", fallback: "眼")
-        Log.event(.editor, "toolbar.eye.icon", ["state": hidden ? "hidden" : "visible"])
+        Log.event(.editor, "toolbar.visibility", ["state": hidden ? "hidden" : "visible"])
     }
 
     // MARK: - 悬停提示
@@ -876,10 +882,6 @@ final class ToolbarPanel: NSPanel {
             if tooltip == nil { tooltip = ToolbarTooltipWindow() }
             let frameInWindow = button.convert(button.bounds, to: nil)
             var screenRect = self.convertToScreen(frameInWindow)
-            // 病例（用户 2026-11-16「label 在 bar 下面被遮一半」）：按钮顶之
-            // 上还有 bar 的 padding（12pt）——tooltip 贴按钮顶会嵌进 bar 内部，
-            // 与玻璃面板视觉混叠被「遮」。锚定改 panel 顶（窗顶）外 6pt 起
-            // panel（self）顶外 6pt：tooltip 永不嵌进玻璃面板
             screenRect.origin.y = frame.maxY - TBStyle.shadowMargin
             screenRect.size.height = 0
             tooltip?.show(text: text, above: screenRect, after: 0.16)
@@ -888,7 +890,7 @@ final class ToolbarPanel: NSPanel {
         }
     }
 
-    private func handleBackdropPillHover(view: NSView?, text: String?) {
+    private func handlePillHover(view: NSView?, text: String?) {
         guard let view, let text, let pillWindow = view.window else {
             tooltip?.hide()
             return
@@ -912,13 +914,6 @@ final class ToolbarPanel: NSPanel {
         onToolChange()
     }
 
-    @objc private func colorTapped(_ sender: NSButton) {
-        Log.event(.editor, "toolbar.color", ["index": "\(sender.tag)"])
-        session?.colorIndex = sender.tag
-        refreshSelectionState()
-        onToolChange()
-    }
-
     @objc private func actionTapped(_ sender: NSButton) {
         tooltip?.hide()
         switch sender.tag {
@@ -932,8 +927,47 @@ final class ToolbarPanel: NSPanel {
         case 205: onAction(.pin)
         case 206: onAction(.scroll)
         case 207: onAction(.toggleBackdrop)
+        case 208: toggleMoreMenu()
         default: break
         }
+    }
+
+    /// `•••` 灵动岛式展开菜单：从按钮下方顺滑弹出（不遮挡主栏），再次点击或点外区自动收起
+    private func toggleMoreMenu() {
+        guard let moreButton else { return }
+        if smartMorePanel?.isShowing == true {
+            smartMorePanel?.hide(immediate: false)
+            return
+        }
+        let panel = smartMorePanel ?? {
+            let p = SmartMoreMenuPanel(
+                onToggleBackdrop: { [weak self] in
+                    self?.onAction(.toggleBackdrop)
+                },
+                onToggleVisibility: { [weak self] in
+                    self?.onAction(.toggleVisibility)
+                }
+            )
+            self.smartMorePanel = p
+            return p
+        }()
+        panel.appearance = appearance
+        let toggleCombo = AppCoordinatorShared.coordinator?.settings.editorHotkey(for: "toggleVisibility") ?? "h"
+        let toggleTip = HotkeySpec.compactDisplay(toggleCombo)
+        panel.updateState(backdropEnabled: backdropStyle.enabled, hideShortcut: toggleTip)
+
+        let inWindow = moreButton.convert(moreButton.bounds, to: nil)
+        let btnGlobal = convertToScreen(inWindow)
+        let barGlobal = plannedBarFrameGlobal ?? visibleBarFrameGlobal
+        let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
+        let upperAvoid = (smartAttributePill?.isShowing == true) ? smartAttributePill?.visiblePillFrame : nil
+        panel.show(
+            anchoredTo: btnGlobal,
+            barRect: barGlobal,
+            upperAvoidRect: upperAvoid,
+            visible: visible,
+            triggerButton: moreButton
+        )
     }
 }
 
@@ -1192,10 +1226,12 @@ private final class TBColorButton: NSButton {
     /// + 圆形描边），subview 渲染顺序无歧义
     private let innerRing = NSView()
     private let outerRing = NSView()
+    private let dotSide: CGFloat
     private var trackingArea: NSTrackingArea?
     private var selected = false
 
-    init(color: NSColor) {
+    init(color: NSColor, dotSide: CGFloat = TBStyle.dotSide) {
+        self.dotSide = dotSide
         super.init(frame: .zero)
         isBordered = false
         bezelStyle = .regularSquare
@@ -1203,15 +1239,13 @@ private final class TBColorButton: NSButton {
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         // 命中区 = 色点本身（原型 .dot 无 hover 底色，只有 scale 1.12）。
-        // 容器独立于 icon 按钮档（用户病例：按钮 28→32 后色点间距视觉太远——
-        // 色点容器跟 dotSide+6 走，不吃 icon 尺寸档）
-        let dotHit: CGFloat = TBStyle.dotSide + 6
+        let dotHit: CGFloat = dotSide + 6
         widthAnchor.constraint(equalToConstant: dotHit).isActive = true
         heightAnchor.constraint(equalToConstant: dotHit).isActive = true
 
         dot.translatesAutoresizingMaskIntoConstraints = false
         dot.wantsLayer = true
-        dot.layer?.cornerRadius = TBStyle.dotSide / 2
+        dot.layer?.cornerRadius = dotSide / 2
         dot.layer?.backgroundColor = color.cgColor
         dot.layer?.borderWidth = 0.5
         dot.layer?.borderColor = NSColor.black.withAlphaComponent(0.28).cgColor
@@ -1229,8 +1263,8 @@ private final class TBColorButton: NSButton {
         NSLayoutConstraint.activate([
             dot.centerXAnchor.constraint(equalTo: centerXAnchor),
             dot.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: TBStyle.dotSide),
-            dot.heightAnchor.constraint(equalToConstant: TBStyle.dotSide),
+            dot.widthAnchor.constraint(equalToConstant: dotSide),
+            dot.heightAnchor.constraint(equalToConstant: dotSide),
         ])
     }
 
@@ -1247,7 +1281,7 @@ private final class TBColorButton: NSButton {
         // 持续不显示）
         let c = CGPoint(x: bounds.midX, y: bounds.midY)
         for (ring, outset) in [(innerRing, CGFloat(4.5)), (outerRing, CGFloat(8.0))] {
-            let ringSide = TBStyle.dotSide + outset * 2
+            let ringSide = dotSide + outset * 2
             ring.frame = CGRect(
                 x: c.x - ringSide / 2, y: c.y - ringSide / 2,
                 width: ringSide, height: ringSide)
@@ -1403,13 +1437,13 @@ private final class TBStrokeSlider: NSView {
         }
     }
 
-    init(minWidth: CGFloat = 2.0, maxWidth: CGFloat = 10.0) {
+    init(minWidth: CGFloat = 2.0, maxWidth: CGFloat = 10.0, compactForPill: Bool = false) {
         self.minWidth = minWidth
         self.maxWidth = maxWidth
         self.currentValue = minWidth
 
-        if TBStyle.buttonSide <= 32 {
-            self.sliderWidth = 98
+        if compactForPill || TBStyle.buttonSide <= 32 {
+            self.sliderWidth = 96
             self.trackHeight = 5.0
             self.knobWidth = 19.0
             self.knobHeight = 12.0
@@ -1437,7 +1471,7 @@ private final class TBStrokeSlider: NSView {
         layer?.masksToBounds = false
 
         widthAnchor.constraint(equalToConstant: sliderWidth).isActive = true
-        heightAnchor.constraint(equalToConstant: TBStyle.buttonSide).isActive = true
+        heightAnchor.constraint(equalToConstant: compactForPill ? 26 : TBStyle.buttonSide).isActive = true
 
         let noAnim: [String: CAAction] = [
             "bounds": NSNull(),
@@ -1705,15 +1739,12 @@ private final class TBStrokeSlider: NSView {
     }
 }
 
-// MARK: - 共享弹簧滑动选中指示层（工具 / 颜色两组丝滑物理过渡）
+// MARK: - 共享弹簧滑动选中指示层（工具胶囊物理过渡）
 
 @MainActor
 private final class TBSelectionIndicatorView: NSView {
     private let toolPill = CALayer()
-    private let colorRing = CALayer()
-
     private var toolPillVisible = false
-    private var colorRingVisible = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1724,13 +1755,6 @@ private final class TBSelectionIndicatorView: NSView {
         toolPill.borderWidth = 0.5
         toolPill.opacity = 0
         layer?.addSublayer(toolPill)
-
-        colorRing.bounds = CGRect(x: 0, y: 0, width: 19, height: 19)
-        colorRing.cornerRadius = 9.5
-        colorRing.borderWidth = 1.5
-        colorRing.backgroundColor = NSColor.clear.cgColor
-        colorRing.opacity = 0
-        layer?.addSublayer(colorRing)
 
         refreshAppearanceColors()
     }
@@ -1752,7 +1776,6 @@ private final class TBSelectionIndicatorView: NSView {
             CATransaction.setDisableActions(true)
             toolPill.backgroundColor = DesignTokens.accent.withAlphaComponent(isDark ? 0.22 : 0.20).cgColor
             toolPill.borderColor = DesignTokens.accent.withAlphaComponent(isDark ? 0.30 : 0.34).cgColor
-            colorRing.borderColor = DesignTokens.hudForeground(0.86).cgColor
             CATransaction.commit()
         }
     }
@@ -1827,34 +1850,6 @@ private final class TBSelectionIndicatorView: NSView {
                 )
                 toolPill.add(anim, forKey: "glidePosition")
             }
-        }
-    }
-
-    func updateColorRing(center: CGPoint?, animated: Bool) {
-        let shouldAnimate = animated
-        guard let center else {
-            colorRingVisible = false
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            colorRing.opacity = 0
-            CATransaction.commit()
-            return
-        }
-        let fromPos = colorRing.presentation()?.position ?? colorRing.position
-        let wasVisible = colorRingVisible
-        colorRingVisible = true
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        colorRing.position = center
-        colorRing.opacity = 1
-        CATransaction.commit()
-        if wasVisible && shouldAnimate && hypot(center.x - fromPos.x, center.y - fromPos.y) > 0.5 {
-            let anim = makeSpring(
-                keyPath: "position",
-                from: NSValue(point: fromPos),
-                to: NSValue(point: center)
-            )
-            colorRing.add(anim, forKey: "colorGlide")
         }
     }
 }
@@ -2140,34 +2135,228 @@ private extension EditorSession.Tool {
     }
 }
 
-// MARK: - 马赛克上下文「✦ 智能打码」悬浮玻璃胶囊（仅选中马赛克时轻浮出现，不占主栏空间）
+// MARK: - 灵动岛动效原语（作用于子视图 motionHost.layer，规避 NSWindow contentView.layer 被系统覆写）
 
 @MainActor
-private final class SmartRedactPillPanel: NSPanel {
-    private static let pillHeight: CGFloat = 28
-    private static let shadowMargin: CGFloat = 20
-    private static let gapAboveBar: CGFloat = 8
+private enum IslandMotion {
+    static func makeTransform(
+        in bounds: CGRect,
+        anchorX: CGFloat,
+        anchorY: CGFloat,
+        scaleX: CGFloat,
+        scaleY: CGFloat,
+        tuckY: CGFloat
+    ) -> CATransform3D {
+        var t = CATransform3DIdentity
+        t = CATransform3DTranslate(t, 0, tuckY, 0)
+        t = CATransform3DTranslate(t, anchorX, anchorY, 0)
+        t = CATransform3DScale(t, scaleX, scaleY, 1)
+        t = CATransform3DTranslate(t, -anchorX, -anchorY, 0)
+        return t
+    }
 
-    private let onTap: () -> Void
-    private let pillButton: SmartRedactPillButton
+    static func expand(
+        _ host: NSView,
+        anchorGlobalX: CGFloat,
+        panelFrame: CGRect,
+        openedBelowBar: Bool,
+        shadowMargin: CGFloat
+    ) {
+        guard let layer = host.layer else { return }
+        let b = host.bounds
+        let minX = shadowMargin + 12
+        let maxX = max(minX, b.width - shadowMargin - 12)
+        let anchorX = min(max(anchorGlobalX - panelFrame.minX, minX), maxX)
+        let anchorY = openedBelowBar ? (b.maxY - shadowMargin) : (b.minY + shadowMargin)
+        let tuckY: CGFloat = openedBelowBar ? 10 : -10
+        let startT = makeTransform(
+            in: b,
+            anchorX: anchorX,
+            anchorY: anchorY,
+            scaleX: 0.74,
+            scaleY: 0.42,
+            tuckY: tuckY
+        )
+
+        layer.removeAnimation(forKey: "islandExpand")
+        layer.removeAnimation(forKey: "islandFade")
+        layer.removeAnimation(forKey: "islandCollapse")
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.opacity = 1
+        layer.transform = CATransform3DIdentity
+        CATransaction.commit()
+
+        let spring = CASpringAnimation(keyPath: "transform")
+        spring.fromValue = NSValue(caTransform3D: startT)
+        spring.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        spring.stiffness = 340
+        spring.damping = 24
+        spring.mass = 0.88
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: "islandExpand")
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.0
+        fade.toValue = 1.0
+        fade.duration = 0.14
+        fade.timingFunction = DesignTokens.Motion.easeOutStrong
+        layer.add(fade, forKey: "islandFade")
+    }
+
+    static func morphPulse(_ host: NSView, shadowMargin: CGFloat, openedBelowBar: Bool) {
+        guard let layer = host.layer else { return }
+        let b = host.bounds
+        let anchorY = openedBelowBar ? (b.maxY - shadowMargin) : (b.minY + shadowMargin)
+        let startT = makeTransform(
+            in: b,
+            anchorX: b.midX,
+            anchorY: anchorY,
+            scaleX: 0.94,
+            scaleY: 0.92,
+            tuckY: 0
+        )
+        let spring = CASpringAnimation(keyPath: "transform")
+        spring.fromValue = NSValue(caTransform3D: startT)
+        spring.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+        spring.stiffness = 420
+        spring.damping = 28
+        spring.mass = 0.82
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: "islandMorph")
+    }
+
+    static func collapse(
+        _ host: NSView,
+        anchorGlobalX: CGFloat,
+        panelFrame: CGRect,
+        openedBelowBar: Bool,
+        shadowMargin: CGFloat,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        guard let layer = host.layer else {
+            completion()
+            return
+        }
+        let b = host.bounds
+        let minX = shadowMargin + 12
+        let maxX = max(minX, b.width - shadowMargin - 12)
+        let anchorX = min(max(anchorGlobalX - panelFrame.minX, minX), maxX)
+        let anchorY = openedBelowBar ? (b.maxY - shadowMargin) : (b.minY + shadowMargin)
+        let tuckY: CGFloat = openedBelowBar ? 7 : -7
+        let endT = makeTransform(
+            in: b,
+            anchorX: anchorX,
+            anchorY: anchorY,
+            scaleX: 0.82,
+            scaleY: 0.62,
+            tuckY: tuckY
+        )
+
+        layer.removeAnimation(forKey: "islandExpand")
+        layer.removeAnimation(forKey: "islandFade")
+
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.14)
+        CATransaction.setAnimationTimingFunction(DesignTokens.Motion.easeOutStrong)
+        CATransaction.setCompletionBlock {
+            MainActor.assumeIsolated {
+                completion()
+            }
+        }
+        layer.transform = endT
+        layer.opacity = 0
+        CATransaction.commit()
+    }
+
+    static func reset(_ host: NSView) {
+        guard let layer = host.layer else { return }
+        layer.removeAllAnimations()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.transform = CATransform3DIdentity
+        layer.opacity = 1
+        CATransaction.commit()
+    }
+}
+
+// MARK: - 上下文工具属性胶囊（方案 B：按当前工具精准呈献色点 / 粗细 / 字号 / 智能打码）
+
+@MainActor
+private final class ToolAttrOuterView: NSView {
+    weak var pillRootView: NSView?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let pill = pillRootView else { return super.hitTest(point) }
+        let local = convert(point, from: superview)
+        return pill.frame.contains(local) ? super.hitTest(point) : nil
+    }
+}
+
+@MainActor
+private final class SmartToolAttributePillPanel: NSPanel {
+    private static let pillHeight: CGFloat = 34
+    private static let shadowMargin: CGFloat = 20
+    private static let gapFromBar: CGFloat = 8
+    private static let fontSizes: [Int] = [12, 14, 17, 21]
+
+    private let onColorSelect: (Int) -> Void
+    private let onStrokeChange: (CGFloat, NSView) -> Void
+    private let onStrokeCommit: (CGFloat) -> Void
+    private let onFontSizeSelect: (Int) -> Void
+    private let onAutoRedact: () -> Void
+    private let onHoverTip: (NSView?, String?) -> Void
+
     private let glassSurface: DesignTokens.Mat.LiquidGlassSurface
+    private let motionHost = NSView()
+    private let pillRoot = NSView()
+    private let foregroundHost = NSView()
+    private let contentStack = NSStackView()
     private let outerShadowView: OuterShadowView
+    private let colorRing = CALayer()
+    private var colorRingVisible = false
+
+    private let colorsGroup = NSStackView()
+    private var colorButtons: [TBColorButton] = []
+    private let colorSeparator = TBHairlineView()
+    private let strokeSlider = TBStrokeSlider(minWidth: 2.0, maxWidth: 10.0, compactForPill: true)
+    private let redactSeparator = TBHairlineView()
+    private let fontSizeGroup = NSStackView()
+    private var fontSizeButtons: [Int: BackdropOptionPillButton] = [:]
+    private let redactButton = SmartRedactPillButton()
+
+    private var currentTool: EditorSession.Tool = .none
+    private var currentColorIndex = 0
+    private var lastAnchorGlobalX: CGFloat = 0
+    private var openedBelowBar = false
     private var hideToken = 0
     private var isShown = false
 
     var isShowing: Bool { isShown }
     var visiblePillFrame: CGRect { frame.insetBy(dx: Self.shadowMargin, dy: Self.shadowMargin) }
 
-    init(onTap: @escaping () -> Void) {
-        self.onTap = onTap
+    init(
+        onColorSelect: @escaping (Int) -> Void,
+        onStrokeChange: @escaping (CGFloat, NSView) -> Void,
+        onStrokeCommit: @escaping (CGFloat) -> Void,
+        onFontSizeSelect: @escaping (Int) -> Void,
+        onAutoRedact: @escaping () -> Void,
+        onHoverTip: @escaping (NSView?, String?) -> Void
+    ) {
+        self.onColorSelect = onColorSelect
+        self.onStrokeChange = onStrokeChange
+        self.onStrokeCommit = onStrokeCommit
+        self.onFontSizeSelect = onFontSizeSelect
+        self.onAutoRedact = onAutoRedact
+        self.onHoverTip = onHoverTip
         self.glassSurface = DesignTokens.Mat.fixedLightCrystalBlur(
-            cornerRadius: 10,
+            cornerRadius: 11,
             tintAlpha: 0.08
         )
-        self.pillButton = SmartRedactPillButton()
-        self.outerShadowView = OuterShadowView(spec: .pill, margin: Self.shadowMargin, cornerRadius: 10)
+        self.outerShadowView = OuterShadowView(spec: .pill, margin: Self.shadowMargin, cornerRadius: 11)
 
-        let initW: CGFloat = 132
+        let initW: CGFloat = 240
         let m = Self.shadowMargin
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: initW + m * 2, height: Self.pillHeight + m * 2),
@@ -2184,42 +2373,263 @@ private final class SmartRedactPillPanel: NSPanel {
         isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: initW + m * 2, height: Self.pillHeight + m * 2))
-        root.wantsLayer = true
-
-        outerShadowView.frame = root.bounds
-        outerShadowView.autoresizingMask = [.width, .height]
-        root.addSubview(outerShadowView)
-
-        pillButton.target = self
-        pillButton.action = #selector(handleTap)
-        pillButton.appearance = NSAppearance(named: .aqua)
-        root.addSubview(glassSurface.hostView)
-        root.addSubview(pillButton)
-        contentView = root
+        buildUI()
     }
 
-    @objc private func handleTap() {
-        onTap()
+    private func buildUI() {
+        let m = Self.shadowMargin
+        let outer = ToolAttrOuterView()
+        outer.wantsLayer = true
+
+        motionHost.wantsLayer = true
+        motionHost.translatesAutoresizingMaskIntoConstraints = false
+        outer.addSubview(motionHost)
+        NSLayoutConstraint.activate([
+            motionHost.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
+            motionHost.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
+            motionHost.topAnchor.constraint(equalTo: outer.topAnchor),
+            motionHost.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
+        ])
+
+        outerShadowView.translatesAutoresizingMaskIntoConstraints = false
+        motionHost.addSubview(outerShadowView)
+        NSLayoutConstraint.activate([
+            outerShadowView.leadingAnchor.constraint(equalTo: motionHost.leadingAnchor),
+            outerShadowView.trailingAnchor.constraint(equalTo: motionHost.trailingAnchor),
+            outerShadowView.topAnchor.constraint(equalTo: motionHost.topAnchor),
+            outerShadowView.bottomAnchor.constraint(equalTo: motionHost.bottomAnchor),
+        ])
+
+        pillRoot.wantsLayer = true
+        pillRoot.translatesAutoresizingMaskIntoConstraints = false
+        motionHost.addSubview(pillRoot)
+        outer.pillRootView = pillRoot
+        NSLayoutConstraint.activate([
+            pillRoot.leadingAnchor.constraint(equalTo: motionHost.leadingAnchor, constant: m),
+            pillRoot.trailingAnchor.constraint(equalTo: motionHost.trailingAnchor, constant: -m),
+            pillRoot.topAnchor.constraint(equalTo: motionHost.topAnchor, constant: m),
+            pillRoot.bottomAnchor.constraint(equalTo: motionHost.bottomAnchor, constant: -m),
+            pillRoot.heightAnchor.constraint(equalToConstant: Self.pillHeight),
+        ])
+
+        let glassHost = glassSurface.hostView
+        glassHost.translatesAutoresizingMaskIntoConstraints = false
+        pillRoot.addSubview(glassHost)
+
+        foregroundHost.wantsLayer = true
+        foregroundHost.appearance = NSAppearance(named: .aqua)
+        foregroundHost.translatesAutoresizingMaskIntoConstraints = false
+        pillRoot.addSubview(foregroundHost)
+
+        colorRing.bounds = CGRect(x: 0, y: 0, width: 18, height: 18)
+        colorRing.cornerRadius = 9
+        colorRing.borderWidth = 1.5
+        colorRing.backgroundColor = NSColor.clear.cgColor
+        colorRing.borderColor = DesignTokens.hudForeground(0.86).cgColor
+        colorRing.opacity = 0
+        foregroundHost.layer?.addSublayer(colorRing)
+
+        contentStack.orientation = .horizontal
+        contentStack.alignment = .centerY
+        contentStack.spacing = 8
+        contentStack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        foregroundHost.addSubview(contentStack)
+
+        NSLayoutConstraint.activate([
+            glassHost.leadingAnchor.constraint(equalTo: pillRoot.leadingAnchor),
+            glassHost.trailingAnchor.constraint(equalTo: pillRoot.trailingAnchor),
+            glassHost.topAnchor.constraint(equalTo: pillRoot.topAnchor),
+            glassHost.bottomAnchor.constraint(equalTo: pillRoot.bottomAnchor),
+            foregroundHost.leadingAnchor.constraint(equalTo: pillRoot.leadingAnchor),
+            foregroundHost.trailingAnchor.constraint(equalTo: pillRoot.trailingAnchor),
+            foregroundHost.topAnchor.constraint(equalTo: pillRoot.topAnchor),
+            foregroundHost.bottomAnchor.constraint(equalTo: pillRoot.bottomAnchor),
+            contentStack.leadingAnchor.constraint(equalTo: foregroundHost.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: foregroundHost.trailingAnchor),
+            contentStack.topAnchor.constraint(equalTo: foregroundHost.topAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: foregroundHost.bottomAnchor),
+        ])
+
+        // 1) 五色圆点组
+        colorsGroup.orientation = .horizontal
+        colorsGroup.alignment = .centerY
+        colorsGroup.spacing = 4
+        let colorNames = ["红", "蓝", "黄", "黑", "白"]
+        for (i, color) in AnnotationModel.palette.enumerated() {
+            let btn = TBColorButton(color: NSColor(cgColor: color.cgColor) ?? .red, dotSide: 14)
+            btn.tag = i
+            btn.target = self
+            btn.action = #selector(colorTapped(_:))
+            btn.onHover = { [weak self, weak btn] inside in
+                self?.onHoverTip(inside ? btn : nil, inside ? colorNames[i % 5] : nil)
+            }
+            colorButtons.append(btn)
+            colorsGroup.addArrangedSubview(btn)
+        }
+        contentStack.addArrangedSubview(colorsGroup)
+
+        // 2) 分隔线（色点与粗细/字号之间）
+        colorSeparator.translatesAutoresizingMaskIntoConstraints = false
+        colorSeparator.widthAnchor.constraint(equalToConstant: 0.5).isActive = true
+        colorSeparator.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        contentStack.addArrangedSubview(colorSeparator)
+
+        // 3) 线宽 / 马赛克块大小滑杆
+        strokeSlider.onChange = { [weak self] width in
+            guard let self else { return }
+            self.onStrokeChange(width, self.strokeSlider)
+        }
+        strokeSlider.onCommit = { [weak self] width in
+            self?.onStrokeCommit(width)
+        }
+        strokeSlider.onHover = { [weak self] inside in
+            guard let self else { return }
+            guard inside else {
+                self.onHoverTip(nil, nil)
+                return
+            }
+            let tip = (self.currentTool == .mosaic)
+                ? "马赛克 \(Int(max(8, self.strokeSlider.value * 4))) px"
+                : String(format: "线宽 %.1f pt", self.strokeSlider.value)
+            self.onHoverTip(self.strokeSlider, tip)
+        }
+        contentStack.addArrangedSubview(strokeSlider)
+
+        // 3.5) 分隔线（马赛克块大小与智能打码之间）
+        redactSeparator.translatesAutoresizingMaskIntoConstraints = false
+        redactSeparator.widthAnchor.constraint(equalToConstant: 0.5).isActive = true
+        redactSeparator.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        contentStack.addArrangedSubview(redactSeparator)
+
+        // 4) 文字字号 4 档 (12 / 14 / 17 / 21)
+        fontSizeGroup.orientation = .horizontal
+        fontSizeGroup.alignment = .centerY
+        fontSizeGroup.spacing = 2
+        for sz in Self.fontSizes {
+            let btn = BackdropOptionPillButton(title: "\(sz)", symbolName: nil, monospacedDigits: true)
+            btn.tag = sz
+            btn.target = self
+            btn.action = #selector(fontSizeTapped(_:))
+            btn.onHover = { [weak self, weak btn] inside in
+                self?.onHoverTip(inside ? btn : nil, inside ? "字号 \(sz) pt" : nil)
+            }
+            fontSizeButtons[sz] = btn
+            fontSizeGroup.addArrangedSubview(btn)
+        }
+        contentStack.addArrangedSubview(fontSizeGroup)
+
+        // 5) 马赛克智能打码按钮
+        redactButton.target = self
+        redactButton.action = #selector(redactTapped)
+        redactButton.onHover = { [weak self] inside in
+            guard let self else { return }
+            self.onHoverTip(inside ? self.redactButton : nil, inside ? "自动识别并遮挡敏感信息 ⇧M" : nil)
+        }
+        contentStack.addArrangedSubview(redactButton)
+
+        contentView = outer
     }
 
     func setBusy(_ busy: Bool) {
-        pillButton.setBusy(busy)
-        layoutPillContents()
+        redactButton.setBusy(busy)
     }
 
-    func show(anchoredAbove buttonRect: CGRect, barRect: CGRect, visible: CGRect, animated: Bool) {
-        hideToken += 1
-        let pillW = pillButton.preferredWidth()
-        let pillH = Self.pillHeight
-        let m = Self.shadowMargin
+    func sync(
+        tool: EditorSession.Tool,
+        colorIndex: Int,
+        strokeWidth: CGFloat,
+        textFontSize: Int,
+        animated: Bool
+    ) {
+        let colorChanged = colorIndex != currentColorIndex
+        currentTool = tool
+        currentColorIndex = colorIndex
 
-        var x = buttonRect.midX - pillW / 2
-        x = max(visible.minX + 8, min(x, visible.maxX - pillW - 8))
-        var y = barRect.maxY + Self.gapAboveBar
-        if y + pillH > visible.maxY - 8 {
-            y = barRect.minY - Self.gapAboveBar - pillH
+        let showColors = (tool != .none && tool != .mosaic)
+        let showStroke = (tool == .arrow || tool == .rect || tool == .ellipse || tool == .highlight || tool == .sequence || tool == .mosaic)
+        let showFontSize = (tool == .text)
+        let showRedact = (tool == .mosaic)
+
+        colorsGroup.isHidden = !showColors
+        strokeSlider.isHidden = !showStroke
+        fontSizeGroup.isHidden = !showFontSize
+        redactButton.isHidden = !showRedact
+        colorSeparator.isHidden = !(showColors && (showStroke || showFontSize))
+        redactSeparator.isHidden = !(showStroke && showRedact)
+
+        for (i, btn) in colorButtons.enumerated() {
+            let isSel = (i == colorIndex)
+            btn.setSelected(isSel)
+            if animated && colorChanged && isSel && showColors {
+                btn.playSelectPop()
+            }
         }
+        strokeSlider.value = strokeWidth
+        for (sz, btn) in fontSizeButtons {
+            btn.setSelected(sz == textFontSize)
+        }
+
+        contentView?.layoutSubtreeIfNeeded()
+        updateColorRing(show: showColors, colorIndex: colorIndex, animated: animated)
+    }
+
+    private func updateColorRing(show: Bool, colorIndex: Int, animated: Bool) {
+        guard show, colorButtons.indices.contains(colorIndex) else {
+            colorRingVisible = false
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            colorRing.opacity = 0
+            CATransaction.commit()
+            return
+        }
+        let btn = colorButtons[colorIndex]
+        let rect = btn.convert(btn.bounds, to: foregroundHost)
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let fromPos = colorRing.presentation()?.position ?? colorRing.position
+        let wasVisible = colorRingVisible
+        colorRingVisible = true
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        colorRing.borderColor = DesignTokens.hudForeground(0.86).cgColor
+        colorRing.position = center
+        colorRing.opacity = 1
+        CATransaction.commit()
+        if wasVisible && animated && !DesignTokens.Motion.reduceMotion && hypot(center.x - fromPos.x, center.y - fromPos.y) > 0.5 {
+            let s = CASpringAnimation(keyPath: "position")
+            s.fromValue = NSValue(point: fromPos)
+            s.toValue = NSValue(point: center)
+            s.stiffness = 420
+            s.damping = 28
+            s.mass = 0.85
+            s.duration = s.settlingDuration
+            colorRing.add(s, forKey: "attrColorGlide")
+        }
+    }
+
+    func show(anchoredTo buttonRect: CGRect, barRect: CGRect, visible: CGRect, animated: Bool) {
+        hideToken += 1
+        contentView?.layoutSubtreeIfNeeded()
+        let m = Self.shadowMargin
+        let pillW = max(120, ceil(max(pillRoot.fittingSize.width, contentStack.fittingSize.width)))
+        let pillH = Self.pillHeight
+
+        lastAnchorGlobalX = buttonRect.midX
+        var x = buttonRect.midX - pillW / 2
+        if barRect.width >= pillW {
+            x = max(barRect.minX, min(x, barRect.maxX - pillW))
+        }
+        x = max(visible.minX + 8, min(x, visible.maxX - pillW - 8))
+
+        var y = barRect.maxY + Self.gapFromBar
+        if y + pillH <= visible.maxY - 8 {
+            openedBelowBar = false
+        } else {
+            y = barRect.minY - Self.gapFromBar - pillH
+            openedBelowBar = true
+        }
+        y = min(max(y, visible.minY + 8), visible.maxY - pillH - 8)
+
         let targetFrame = CGRect(
             x: (x - m).rounded(),
             y: (y - m).rounded(),
@@ -2229,69 +2639,98 @@ private final class SmartRedactPillPanel: NSPanel {
 
         let wasShown = isShown
         isShown = true
-        setFrame(targetFrame, display: false)
-        layoutPillContents()
 
         if !wasShown {
-            let reduce = DesignTokens.Motion.reduceMotion
-            if animated && !reduce {
-                setFrameOrigin(CGPoint(x: targetFrame.minX, y: targetFrame.minY - 5))
-            }
-            alphaValue = 0
-            orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = animated ? 0.16 : 0.01
-                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
-                if animated && !reduce {
-                    self.animator().setFrame(targetFrame, display: true)
-                }
-                self.animator().alphaValue = 1
+            alphaValue = 1
+            setFrame(targetFrame, display: true)
+            contentView?.layoutSubtreeIfNeeded()
+            outerShadowView.refreshGeometry()
+            updateColorRing(show: !colorsGroup.isHidden, colorIndex: currentColorIndex, animated: false)
+            if animated {
+                IslandMotion.reset(motionHost)
+                orderFrontRegardless()
+                IslandMotion.expand(
+                    motionHost,
+                    anchorGlobalX: buttonRect.midX,
+                    panelFrame: targetFrame,
+                    openedBelowBar: openedBelowBar,
+                    shadowMargin: m
+                )
+            } else {
+                IslandMotion.reset(motionHost)
+                orderFrontRegardless()
             }
         } else {
+            if !animated && frame.size == targetFrame.size {
+                // 选区实时拖拽跟随：仅平移窗口原点，避免 120Hz 拖动期重排布局或重建阴影几何
+                if frame.origin != targetFrame.origin {
+                    setFrameOrigin(targetFrame.origin)
+                }
+                if !isVisible { orderFrontRegardless() }
+                if alphaValue != 1 { alphaValue = 1 }
+                return
+            }
+            let sizeOrPosChanged = frame != targetFrame
+            if animated && sizeOrPosChanged {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.20
+                    ctx.timingFunction = DesignTokens.Motion.springTimingFunction
+                    self.animator().setFrame(targetFrame, display: true)
+                }
+                IslandMotion.morphPulse(motionHost, shadowMargin: m, openedBelowBar: openedBelowBar)
+            } else {
+                setFrame(targetFrame, display: true)
+            }
+            contentView?.layoutSubtreeIfNeeded()
+            outerShadowView.refreshGeometry()
+            updateColorRing(show: !colorsGroup.isHidden, colorIndex: currentColorIndex, animated: animated)
             orderFrontRegardless()
             alphaValue = 1
         }
     }
 
     func hide(immediate: Bool) {
+        onHoverTip(nil, nil)
         guard isShown || isVisible else { return }
         isShown = false
         hideToken += 1
         let token = hideToken
-        if immediate || DesignTokens.Motion.reduceMotion {
+        if immediate {
+            IslandMotion.reset(motionHost)
             orderOut(nil)
             alphaValue = 1
             return
         }
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.11
-            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
-            self.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, self.hideToken == token, !self.isShown else { return }
-                self.orderOut(nil)
-                self.alphaValue = 1
-            }
-        })
+        IslandMotion.collapse(
+            motionHost,
+            anchorGlobalX: lastAnchorGlobalX,
+            panelFrame: frame,
+            openedBelowBar: openedBelowBar,
+            shadowMargin: Self.shadowMargin
+        ) { [weak self] in
+            guard let self, self.hideToken == token, !self.isShown else { return }
+            self.orderOut(nil)
+            self.alphaValue = 1
+            IslandMotion.reset(self.motionHost)
+        }
     }
 
-    private func layoutPillContents() {
-        let m = Self.shadowMargin
-        let pillRect = NSRect(
-            x: m, y: m,
-            width: max(80, frame.width - m * 2),
-            height: Self.pillHeight
-        )
-        glassSurface.hostView.frame = pillRect
-        pillButton.frame = pillRect
-        outerShadowView.frame = contentView?.bounds ?? .zero
-        outerShadowView.refreshGeometry()
+    @objc private func colorTapped(_ sender: NSButton) {
+        onColorSelect(sender.tag)
+    }
+
+    @objc private func fontSizeTapped(_ sender: NSButton) {
+        onFontSizeSelect(sender.tag)
+    }
+
+    @objc private func redactTapped() {
+        onAutoRedact()
     }
 }
 
 @MainActor
 private final class SmartRedactPillButton: NSButton {
+    var onHover: ((Bool) -> Void)?
     private var isHot = false
     private var isPressed = false
     private var isBusy = false
@@ -2304,8 +2743,12 @@ private final class SmartRedactPillButton: NSButton {
         imagePosition = .imageLeading
         imageHugsTitle = true
         image = TBIcon.symbolImage(named: "sparkles", pointSize: 11.5, weight: .semibold, hierarchical: true)
+        translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 14
+        layer?.cornerRadius = 12
+        heightAnchor.constraint(equalToConstant: 24).isActive = true
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
         applyStyle()
     }
 
@@ -2314,15 +2757,19 @@ private final class SmartRedactPillButton: NSButton {
 
     override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: preferredWidth(), height: 24)
+    }
 
     func setBusy(_ busy: Bool) {
         isBusy = busy
         isEnabled = !busy
+        invalidateIntrinsicContentSize()
         applyStyle()
     }
 
     func preferredWidth() -> CGFloat {
-        isBusy ? 92 : 122
+        isBusy ? 82 : 112
     }
 
     override func updateTrackingAreas() {
@@ -2346,11 +2793,13 @@ private final class SmartRedactPillButton: NSButton {
     override func mouseEntered(with event: NSEvent) {
         isHot = true
         applyStyle()
+        onHover?(true)
     }
 
     override func mouseExited(with event: NSEvent) {
         isHot = false
         applyStyle()
+        onHover?(false)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -2724,6 +3173,14 @@ private final class SmartBackdropPillPanel: NSPanel {
             }
         } else {
             let reduce = DesignTokens.Motion.reduceMotion
+            if (!animated || reduce) && frame.size == targetFrame.size {
+                if frame.origin != targetFrame.origin {
+                    setFrameOrigin(targetFrame.origin)
+                }
+                if !isVisible { orderFrontRegardless() }
+                if alphaValue != 1 { alphaValue = 1 }
+                return
+            }
             if animated && !reduce && frame != targetFrame {
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = 0.16
@@ -3032,6 +3489,422 @@ private final class BackdropOptionPillButton: NSButton {
                 .font: font,
                 .foregroundColor: textColor,
             ])
+        }
+    }
+}
+
+// MARK: - `•••` 灵动岛式玻璃展开菜单（锚定触发按钮下方/上方，永不遮挡主栏）
+
+@MainActor
+private final class MoreMenuOuterView: NSView {
+    weak var pillRootView: NSView?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let pill = pillRootView else { return super.hitTest(point) }
+        let local = convert(point, from: superview)
+        return pill.frame.contains(local) ? super.hitTest(point) : nil
+    }
+}
+
+@MainActor
+private final class SmartMoreMenuPanel: NSPanel {
+    private static let shadowMargin: CGFloat = 20
+    private static let gapFromBar: CGFloat = 8
+    private static let panelWidth: CGFloat = 176
+    private static let cornerRadius: CGFloat = 12
+
+    private let onToggleBackdrop: () -> Void
+    private let onToggleVisibility: () -> Void
+
+    private let glassSurface: DesignTokens.Mat.LiquidGlassSurface
+    private let motionHost = NSView()
+    private let pillRoot = NSView()
+    private let foregroundHost = NSView()
+    private let contentStack = NSStackView()
+    private let outerShadowView: OuterShadowView
+
+    private let backdropRow: MoreMenuItemRowButton
+    private let hideRow: MoreMenuItemRowButton
+
+    private weak var triggerButton: NSView?
+    private var localEventMonitor: Any?
+    private var lastAnchorGlobalX: CGFloat = 0
+    private var hideToken = 0
+    private var isShown = false
+    private var openedBelowBar = true
+
+    var isShowing: Bool { isShown }
+
+    init(
+        onToggleBackdrop: @escaping () -> Void,
+        onToggleVisibility: @escaping () -> Void
+    ) {
+        self.onToggleBackdrop = onToggleBackdrop
+        self.onToggleVisibility = onToggleVisibility
+        self.glassSurface = DesignTokens.Mat.fixedLightCrystalBlur(
+            cornerRadius: Self.cornerRadius,
+            tintAlpha: 0.08
+        )
+        self.outerShadowView = OuterShadowView(spec: .pill, margin: Self.shadowMargin, cornerRadius: Self.cornerRadius)
+        self.backdropRow = MoreMenuItemRowButton(icon: .backdrop, title: "画框美化", shortcut: "B")
+        self.hideRow = MoreMenuItemRowButton(icon: .eye, title: "隐藏工具栏", shortcut: "H")
+
+        let initH: CGFloat = 74
+        let m = Self.shadowMargin
+        super.init(
+            contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth + m * 2, height: initH + m * 2),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 3)
+        appearance = NSAppearance(named: .aqua)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isMovableByWindowBackground = false
+        isReleasedWhenClosed = false
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        buildUI()
+    }
+
+    private func buildUI() {
+        let m = Self.shadowMargin
+        let outer = MoreMenuOuterView()
+        outer.wantsLayer = true
+
+        motionHost.wantsLayer = true
+        motionHost.translatesAutoresizingMaskIntoConstraints = false
+        outer.addSubview(motionHost)
+        NSLayoutConstraint.activate([
+            motionHost.leadingAnchor.constraint(equalTo: outer.leadingAnchor),
+            motionHost.trailingAnchor.constraint(equalTo: outer.trailingAnchor),
+            motionHost.topAnchor.constraint(equalTo: outer.topAnchor),
+            motionHost.bottomAnchor.constraint(equalTo: outer.bottomAnchor),
+        ])
+
+        outerShadowView.translatesAutoresizingMaskIntoConstraints = false
+        motionHost.addSubview(outerShadowView)
+        NSLayoutConstraint.activate([
+            outerShadowView.leadingAnchor.constraint(equalTo: motionHost.leadingAnchor),
+            outerShadowView.trailingAnchor.constraint(equalTo: motionHost.trailingAnchor),
+            outerShadowView.topAnchor.constraint(equalTo: motionHost.topAnchor),
+            outerShadowView.bottomAnchor.constraint(equalTo: motionHost.bottomAnchor),
+        ])
+
+        pillRoot.wantsLayer = true
+        pillRoot.translatesAutoresizingMaskIntoConstraints = false
+        motionHost.addSubview(pillRoot)
+        outer.pillRootView = pillRoot
+        NSLayoutConstraint.activate([
+            pillRoot.leadingAnchor.constraint(equalTo: motionHost.leadingAnchor, constant: m),
+            pillRoot.trailingAnchor.constraint(equalTo: motionHost.trailingAnchor, constant: -m),
+            pillRoot.topAnchor.constraint(equalTo: motionHost.topAnchor, constant: m),
+            pillRoot.bottomAnchor.constraint(equalTo: motionHost.bottomAnchor, constant: -m),
+            pillRoot.widthAnchor.constraint(equalToConstant: Self.panelWidth),
+        ])
+
+        let glassHost = glassSurface.hostView
+        glassHost.translatesAutoresizingMaskIntoConstraints = false
+        pillRoot.addSubview(glassHost)
+
+        foregroundHost.wantsLayer = true
+        foregroundHost.appearance = NSAppearance(named: .aqua)
+        foregroundHost.translatesAutoresizingMaskIntoConstraints = false
+        pillRoot.addSubview(foregroundHost)
+
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = 2
+        contentStack.edgeInsets = NSEdgeInsets(top: 6, left: 6, bottom: 6, right: 6)
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        foregroundHost.addSubview(contentStack)
+
+        NSLayoutConstraint.activate([
+            glassHost.leadingAnchor.constraint(equalTo: pillRoot.leadingAnchor),
+            glassHost.trailingAnchor.constraint(equalTo: pillRoot.trailingAnchor),
+            glassHost.topAnchor.constraint(equalTo: pillRoot.topAnchor),
+            glassHost.bottomAnchor.constraint(equalTo: pillRoot.bottomAnchor),
+            foregroundHost.leadingAnchor.constraint(equalTo: pillRoot.leadingAnchor),
+            foregroundHost.trailingAnchor.constraint(equalTo: pillRoot.trailingAnchor),
+            foregroundHost.topAnchor.constraint(equalTo: pillRoot.topAnchor),
+            foregroundHost.bottomAnchor.constraint(equalTo: pillRoot.bottomAnchor),
+            contentStack.leadingAnchor.constraint(equalTo: foregroundHost.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: foregroundHost.trailingAnchor),
+            contentStack.topAnchor.constraint(equalTo: foregroundHost.topAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: foregroundHost.bottomAnchor),
+        ])
+
+        backdropRow.target = self
+        backdropRow.action = #selector(backdropTapped)
+        hideRow.target = self
+        hideRow.action = #selector(hideTapped)
+
+        contentStack.addArrangedSubview(backdropRow)
+        contentStack.addArrangedSubview(hideRow)
+        backdropRow.widthAnchor.constraint(equalToConstant: Self.panelWidth - 12).isActive = true
+        hideRow.widthAnchor.constraint(equalToConstant: Self.panelWidth - 12).isActive = true
+
+        contentView = outer
+    }
+
+    func updateState(backdropEnabled: Bool, hideShortcut: String) {
+        backdropRow.setChecked(backdropEnabled)
+        hideRow.setShortcut(hideShortcut.isEmpty ? "H" : hideShortcut)
+    }
+
+    func show(
+        anchoredTo buttonRect: CGRect,
+        barRect: CGRect,
+        upperAvoidRect: CGRect?,
+        visible: CGRect,
+        triggerButton: NSView
+    ) {
+        self.triggerButton = triggerButton
+        hideToken += 1
+        contentView?.layoutSubtreeIfNeeded()
+
+        let m = Self.shadowMargin
+        let pillW = Self.panelWidth
+        let pillH = max(68, ceil(contentStack.fittingSize.height))
+
+        var x = buttonRect.midX - pillW / 2
+        x = max(visible.minX + 8, min(x, visible.maxX - pillW - 8))
+
+        let belowY = barRect.minY - Self.gapFromBar - pillH
+        let y: CGFloat
+        if belowY >= visible.minY + 8 {
+            y = belowY
+            openedBelowBar = true
+        } else {
+            var aboveY = barRect.maxY + Self.gapFromBar
+            if let avoid = upperAvoidRect, avoid.minY >= barRect.maxY - 1 {
+                aboveY = avoid.maxY + 6
+            }
+            y = min(aboveY, visible.maxY - pillH - 8)
+            openedBelowBar = false
+        }
+
+        let targetFrame = CGRect(
+            x: (x - m).rounded(),
+            y: (y - m).rounded(),
+            width: pillW + m * 2,
+            height: pillH + m * 2
+        )
+
+        lastAnchorGlobalX = buttonRect.midX
+        isShown = true
+        installDismissMonitor()
+        alphaValue = 1
+        setFrame(targetFrame, display: true)
+        contentView?.layoutSubtreeIfNeeded()
+        outerShadowView.refreshGeometry()
+        IslandMotion.reset(motionHost)
+        orderFrontRegardless()
+        IslandMotion.expand(
+            motionHost,
+            anchorGlobalX: buttonRect.midX,
+            panelFrame: targetFrame,
+            openedBelowBar: openedBelowBar,
+            shadowMargin: m
+        )
+    }
+
+    func hide(immediate: Bool) {
+        removeDismissMonitor()
+        guard isShown || isVisible else { return }
+        isShown = false
+        hideToken += 1
+        let token = hideToken
+
+        if immediate {
+            IslandMotion.reset(motionHost)
+            orderOut(nil)
+            alphaValue = 1
+            return
+        }
+
+        IslandMotion.collapse(
+            motionHost,
+            anchorGlobalX: lastAnchorGlobalX,
+            panelFrame: frame,
+            openedBelowBar: openedBelowBar,
+            shadowMargin: Self.shadowMargin
+        ) { [weak self] in
+            guard let self, self.hideToken == token, !self.isShown else { return }
+            self.orderOut(nil)
+            self.alphaValue = 1
+            IslandMotion.reset(self.motionHost)
+        }
+    }
+
+    private func installDismissMonitor() {
+        removeDismissMonitor()
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self, self.isShown else { return }
+                let clickWin = event.window
+                if clickWin === self { return }
+                if let trigger = self.triggerButton, clickWin === trigger.window {
+                    let ptInTrigger = trigger.convert(event.locationInWindow, from: nil)
+                    if trigger.bounds.contains(ptInTrigger) {
+                        return
+                    }
+                }
+                self.hide(immediate: false)
+            }
+            return event
+        }
+    }
+
+    private func removeDismissMonitor() {
+        if let localEventMonitor {
+            NSEvent.removeMonitor(localEventMonitor)
+            self.localEventMonitor = nil
+        }
+    }
+
+    @objc private func backdropTapped() {
+        hide(immediate: false)
+        onToggleBackdrop()
+    }
+
+    @objc private func hideTapped() {
+        hide(immediate: true)
+        onToggleVisibility()
+    }
+}
+
+@MainActor
+private final class MoreMenuItemRowButton: NSButton {
+    private let iconView = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let checkView = NSImageView()
+    private let kbdLabel = NSTextField(labelWithString: "")
+    private var trackingArea: NSTrackingArea?
+    private var isHot = false
+    private var isPressed = false
+    private var isChecked = false
+
+    init(icon: TBIcon.Kind, title titleText: String, shortcut: String) {
+        super.init(frame: .zero)
+        isBordered = false
+        bezelStyle = .regularSquare
+        title = ""
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
+
+        iconView.image = TBIcon.image(icon, pointSize: 12.5)
+        iconView.imageScaling = .scaleProportionallyDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(iconView)
+
+        titleLabel.stringValue = titleText
+        titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(titleLabel)
+
+        checkView.image = TBIcon.symbolImage(named: "checkmark", pointSize: 10.5, weight: .bold, hierarchical: false)
+        checkView.contentTintColor = DesignTokens.accent
+        checkView.translatesAutoresizingMaskIntoConstraints = false
+        checkView.isHidden = true
+        addSubview(checkView)
+
+        kbdLabel.stringValue = shortcut
+        kbdLabel.font = .monospacedSystemFont(ofSize: 10.5, weight: .medium)
+        kbdLabel.alignment = .right
+        kbdLabel.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(kbdLabel)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 30),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            kbdLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+            kbdLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            checkView.trailingAnchor.constraint(equalTo: kbdLabel.leadingAnchor, constant: -6),
+            checkView.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        applyStyle()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("MoreMenuItemRowButton 只走代码创建") }
+
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+
+    func setChecked(_ checked: Bool) {
+        isChecked = checked
+        checkView.isHidden = !checked
+        applyStyle()
+    }
+
+    func setShortcut(_ text: String) {
+        kbdLabel.stringValue = text
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyStyle()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHot = true
+        applyStyle()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHot = false
+        applyStyle()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        isPressed = true
+        applyStyle()
+        TactilePress.animate(view: self, pressed: true, scale: 0.97)
+        super.mouseDown(with: event)
+        isPressed = false
+        TactilePress.animate(view: self, pressed: false)
+        applyStyle()
+    }
+
+    private func applyStyle() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            if isPressed {
+                layer?.backgroundColor = DesignTokens.fillPress.cgColor
+            } else if isHot {
+                layer?.backgroundColor = DesignTokens.fillHover.cgColor
+            } else {
+                layer?.backgroundColor = NSColor.clear.cgColor
+            }
+            iconView.contentTintColor = isChecked ? DesignTokens.accent : (isHot ? DesignTokens.label1 : DesignTokens.label2)
+            titleLabel.textColor = isChecked ? DesignTokens.accent : DesignTokens.label1
+            kbdLabel.textColor = DesignTokens.label3
         }
     }
 }

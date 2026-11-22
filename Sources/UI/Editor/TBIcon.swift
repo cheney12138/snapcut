@@ -13,7 +13,7 @@ enum TBIcon {
     /// 图标全集（与工具栏按钮一一对应）
     enum Kind {
         case arrow, rect, text, mosaic, sequence, highlight, ellipse
-        case undo, redo, ocr, pin, backdrop, eye
+        case undo, redo, ocr, pin, backdrop, eye, more
         case save, cancel, copy, scroll
     }
 
@@ -54,6 +54,8 @@ enum TBIcon {
             return Spec(symbol: "sparkles.rectangle.stack", pointSizeDelta: 0, weight: .medium, hierarchical: true)
         case .eye:
             return Spec(symbol: "eye", pointSizeDelta: -0.5, weight: .medium, hierarchical: true)
+        case .more:
+            return Spec(symbol: "ellipsis", pointSizeDelta: -0.5, weight: .semibold, hierarchical: false)
         case .copy:
             return Spec(symbol: "doc.on.doc", pointSizeDelta: -1.0, weight: .medium, hierarchical: false)
         case .save:

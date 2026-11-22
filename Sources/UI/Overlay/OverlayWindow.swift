@@ -603,6 +603,7 @@ final class OverlayView: NSView {
         guard next != editorRectLocal else { return }
         editorRectLocal = next
         controller.zoomStandaloneSelection(to: convertToGlobalRect(editorRectLocal))
+        syncToolbarForLiveSelection()
         needsDisplay = true
     }
 
@@ -857,6 +858,7 @@ final class OverlayView: NSView {
                 }
                 return
             }
+            selectionLocal = snapToPixelGrid(selectionLocal)
             phase = .confirmed
             needsDisplay = true
             // 松手即激活：capture 冻结 ~100-200ms 期间用户可能已按键，
@@ -1012,6 +1014,11 @@ final class OverlayView: NSView {
         needsDisplay = true
     }
 
+    private func syncToolbarForLiveSelection() {
+        guard let screen = window?.screen ?? NSScreen.main else { return }
+        controller.repositionToolbar(forLiveSelectionGlobal: convertToGlobalRect(editorRectLocal), on: screen)
+    }
+
     private func handleEditorDragged(_ point: CGPoint) {
         switch editGesture {
         case .resize(let edge, let startRect):
@@ -1028,6 +1035,7 @@ final class OverlayView: NSView {
                     startRect, edge: edge, to: point, limit: bounds
                 )
             }
+            syncToolbarForLiveSelection()
             needsDisplay = true
             return
         case .move(let startRect, let startPoint):
@@ -1037,6 +1045,7 @@ final class OverlayView: NSView {
             } else {
                 editorRectLocal = SelectionGeometry.moved(startRect, by: delta, limit: bounds)
             }
+            syncToolbarForLiveSelection()
             needsDisplay = true
             return
         case .none:
@@ -1101,9 +1110,27 @@ final class OverlayView: NSView {
         ])
     }
 
+    /// 将选区对齐到屏幕物理像素格（如 2x Retina 按 0.5pt 取整），保证裁剪与 1:1 绘制零亚像素偏移
+    private func snapToPixelGrid(_ rect: CGRect) -> CGRect {
+        guard !isStandaloneImage else { return rect }
+        let scale = max(1, window?.backingScaleFactor ?? 2)
+        let invScale = 1.0 / scale
+        let minX = max(0, (rect.minX * scale).rounded() * invScale)
+        let minY = max(0, (rect.minY * scale).rounded() * invScale)
+        let maxX = min(bounds.width, (rect.maxX * scale).rounded() * invScale)
+        let maxY = min(bounds.height, (rect.maxY * scale).rounded() * invScale)
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(invScale, maxX - minX),
+            height: max(invScale, maxY - minY)
+        )
+    }
+
     private func commitSelectionResize() {
         guard editorSession != nil, let screen = window?.screen else { return }
         let oldLocal = sessionLocalRect()
+        editorRectLocal = snapToPixelGrid(editorRectLocal)
         let newLocal = editorRectLocal
         let offset = SelectionGeometry.annotationOffset(old: oldLocal, new: newLocal)
         let global = convertToGlobalRect(newLocal)
@@ -1117,6 +1144,7 @@ final class OverlayView: NSView {
     private func commitSelectionMove() {
         guard editorSession != nil, let screen = window?.screen else { return }
         let oldLocal = sessionLocalRect()
+        editorRectLocal = snapToPixelGrid(editorRectLocal)
         let newLocal = editorRectLocal
         let offset = SelectionGeometry.annotationOffset(old: oldLocal, new: newLocal)
         let global = convertToGlobalRect(newLocal)
@@ -1320,12 +1348,22 @@ final class OverlayView: NSView {
         textFieldAnchor = annotationPoint
     }
 
-    /// 供工具栏点选颜色时实时同步正在输入中的文字颜色与虚线框
+    /// 供工具栏点选颜色或字号时实时同步正在输入中的文字颜色、字号与浮条选中态
     func syncActiveTextColor() {
         guard let field = textField as? GlassTextField else { return }
         let color = currentAnnotationColor()
         field.textColor = color
         field.annotationColor = color
+        if let size = editorSession?.textFontSize {
+            let targetFont = NSFont.systemFont(ofSize: CGFloat(size), weight: .semibold)
+            if field.font?.pointSize != targetFont.pointSize {
+                field.font = targetFont
+                resizeActiveTextField()
+            }
+            if let idx = Self.textFontSizes.firstIndex(of: size) {
+                fontSizePicker?.select(index: idx, animated: true)
+            }
+        }
         field.refreshPlaceholder()
         if let editor = window?.fieldEditor(false, for: field) as? NSTextView {
             editor.insertionPointColor = color
@@ -1425,6 +1463,7 @@ final class OverlayView: NSView {
             if let tf = self.textField {
                 self.window?.makeFirstResponder(tf)
             }
+            self.controller.syncToolbarFromEditor()
             Log.event(.editor, "editor.text.fontSize", ["size": "\(size)"])
         }
         let size = FontSizeBarView.preferredSize(buttonCount: sizes.count)

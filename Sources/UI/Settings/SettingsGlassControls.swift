@@ -1658,15 +1658,14 @@ final class ToolbarMiniPreviewView: NSView {
 
         let iconPt: CGFloat
         let gap: CGFloat
-        let dotSide: CGFloat
         let cornerRadius: CGFloat
         switch size {
         case .compact:
-            iconPt = 11; gap = 5; dotSide = 7; cornerRadius = 9
+            iconPt = 11; gap = 5; cornerRadius = 9
         case .regular:
-            iconPt = 13; gap = 7; dotSide = 8.5; cornerRadius = 11
+            iconPt = 13; gap = 7; cornerRadius = 11
         case .large:
-            iconPt = 15; gap = 9; dotSide = 10; cornerRadius = 13
+            iconPt = 15; gap = 9; cornerRadius = 13
         }
 
         pillContainer.layer?.cornerRadius = cornerRadius
@@ -1704,41 +1703,26 @@ final class ToolbarMiniPreviewView: NSView {
             }
         }
 
-        let sep = NSView()
-        sep.wantsLayer = true
-        sep.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
-        sep.translatesAutoresizingMaskIntoConstraints = false
-        sep.widthAnchor.constraint(equalToConstant: 0.5).isActive = true
-        sep.heightAnchor.constraint(equalToConstant: iconPt + 2).isActive = true
-        pillStack.addArrangedSubview(sep)
-
-        let previewColors: [NSColor] = [
-            NSColor(srgbRed: 1, green: 0.23, blue: 0.19, alpha: 1),
-            NSColor(srgbRed: 0, green: 0.48, blue: 1, alpha: 1),
-            NSColor(srgbRed: 1, green: 0.84, blue: 0.04, alpha: 1),
-        ]
-        for (i, c) in previewColors.enumerated() {
-            let dot = NSView()
-            dot.wantsLayer = true
-            dot.layer?.backgroundColor = c.cgColor
-            dot.layer?.cornerRadius = dotSide / 2
-            if i == 0 {
-                dot.layer?.borderWidth = 1.2
-                dot.layer?.borderColor = NSColor.white.withAlphaComponent(0.9).cgColor
-            }
-            dot.translatesAutoresizingMaskIntoConstraints = false
-            dot.widthAnchor.constraint(equalToConstant: dotSide).isActive = true
-            dot.heightAnchor.constraint(equalToConstant: dotSide).isActive = true
-            pillStack.addArrangedSubview(dot)
+        func addMiniSeparator() {
+            let sep = NSView()
+            sep.wantsLayer = true
+            sep.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
+            sep.translatesAutoresizingMaskIntoConstraints = false
+            sep.widthAnchor.constraint(equalToConstant: 0.5).isActive = true
+            sep.heightAnchor.constraint(equalToConstant: iconPt + 2).isActive = true
+            pillStack.addArrangedSubview(sep)
         }
 
-        let sep2 = NSView()
-        sep2.wantsLayer = true
-        sep2.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
-        sep2.translatesAutoresizingMaskIntoConstraints = false
-        sep2.widthAnchor.constraint(equalToConstant: 0.5).isActive = true
-        sep2.heightAnchor.constraint(equalToConstant: iconPt + 2).isActive = true
-        pillStack.addArrangedSubview(sep2)
+        addMiniSeparator()
+
+        for kind in [TBIcon.Kind.scroll, .ocr, .pin, .more] {
+            let iv = NSImageView()
+            iv.image = TBIcon.image(kind, pointSize: iconPt - 0.5)
+            iv.contentTintColor = NSColor.white.withAlphaComponent(0.76)
+            pillStack.addArrangedSubview(iv)
+        }
+
+        addMiniSeparator()
 
         let copyPill = NSView()
         copyPill.wantsLayer = true

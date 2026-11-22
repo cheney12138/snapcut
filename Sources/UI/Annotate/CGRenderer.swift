@@ -30,15 +30,7 @@ enum CGRenderer {
         // 0. 马赛克像素化：选区本地 point rect × scale → 底图像素 rect，逐个打码
         // （与编辑器预览 renderMosaicPreview 同一算法，「编辑器所见 = 导出所得」）
         let baseWithMosaic = applyMosaic(base: base, annotations: annotations, scale: scale)
-        guard let ctx = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return base }
+        guard let ctx = makeRGBA8Context(width: width, height: height, matching: baseWithMosaic) else { return base }
         // 1. 底图（已含马赛克像素化）正常方向（Y-up 上下文直接 draw 即正立）
         ctx.draw(baseWithMosaic, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
         // 2. 标注层：几何是选区本地 Y-down point 坐标 → 翻转 + 像素缩放后绘制
@@ -374,12 +366,7 @@ enum CGRenderer {
             clamped.append((rect: pxRect, blockSize: job.blockSize))
         }
         guard !clamped.isEmpty,
-              let ctx = CGContext(
-                data: nil, width: width, height: height,
-                bitsPerComponent: 8, bytesPerRow: 0,
-                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              ) else { return image }
+              let ctx = makeRGBA8Context(width: width, height: height, matching: image) else { return image }
         // 画底图（一次；多区域共用同一全图上下文，避免逐区域全图重绘）
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
         for (pxRect, blockSize) in clamped {
@@ -387,12 +374,7 @@ enum CGRenderer {
             let blocksX = max(1, Int(pxRect.width) / blockSize)
             let blocksY = max(1, Int(pxRect.height) / blockSize)
             guard let cropped = image.cropping(to: pxRect),
-                  let smallCtx = CGContext(
-                    data: nil, width: blocksX, height: blocksY,
-                    bitsPerComponent: 8, bytesPerRow: 0,
-                    space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                  ) else { continue }
+                  let smallCtx = makeRGBA8Context(width: blocksX, height: blocksY, matching: image) else { continue }
             smallCtx.interpolationQuality = .low
             smallCtx.draw(cropped, in: CGRect(x: 0, y: 0, width: CGFloat(blocksX), height: CGFloat(blocksY)))
             guard let small = smallCtx.makeImage() else { continue }
@@ -417,6 +399,34 @@ enum CGRenderer {
         CGRect(
             x: min(r.minX, r.maxX), y: min(r.minY, r.maxY),
             width: abs(r.width), height: abs(r.height)
+        )
+    }
+
+    /// 优先沿用源图 RGB 色域（如 Display P3）创建 8-bit 上下文，避免广色域退化为 sRGB 且零多余转换开销
+    private static func makeRGBA8Context(width: Int, height: Int, matching image: CGImage?) -> CGContext? {
+        if let preferred = image?.colorSpace,
+           preferred.model == .rgb,
+           !CGColorSpaceUsesExtendedRange(preferred),
+           let ctx = CGContext(
+               data: nil,
+               width: width,
+               height: height,
+               bitsPerComponent: 8,
+               bytesPerRow: 0,
+               space: preferred,
+               bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+           ) {
+            return ctx
+        }
+        let fallback = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        return CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: fallback,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         )
     }
 
@@ -701,17 +711,8 @@ enum CGRenderer {
 
         let pxW = max(1, Int((layout.canvasSize.width * safeScale).rounded()))
         let pxH = max(1, Int((layout.canvasSize.height * safeScale).rounded()))
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
-        guard let ctx = CGContext(
-            data: nil,
-            width: pxW,
-            height: pxH,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return image }
+        guard let ctx = makeRGBA8Context(width: pxW, height: pxH, matching: image) else { return image }
 
         let canvasW = layout.canvasSize.width
         let canvasH = layout.canvasSize.height

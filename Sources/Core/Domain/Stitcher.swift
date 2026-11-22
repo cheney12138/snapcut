@@ -344,15 +344,11 @@ enum Stitcher {
                single.width == canvasWidth, single.height == canvasHeight {
                 return Result(image: single, seams: seams)
             }
-            let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-            guard let ctx = CGContext(
-                data: nil,
+            guard let ctx = PixelBuffer.makeContext(
                 width: canvasWidth,
                 height: canvasHeight,
-                bitsPerComponent: 8,
                 bytesPerRow: canvasWidth * 4,
-                space: space,
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+                preferredColorSpace: firstFrameImage?.colorSpace
             ), let ptr = ctx.data else {
                 throw StitcherError.renderFailed("CGContext 创建失败（\(canvasWidth)x\(canvasHeight)）")
             }
@@ -510,15 +506,11 @@ struct PixelBuffer: Sendable {
         self.width = w
         self.height = h
 
-        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil,
+        guard let ctx = Self.makeContext(
             width: w,
             height: h,
-            bitsPerComponent: 8,
             bytesPerRow: w * 4,
-            space: space,
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+            preferredColorSpace: cgImage.colorSpace
         ) else {
             self.data = []
             self.signature = []
@@ -535,6 +527,39 @@ struct PixelBuffer: Sendable {
         self.signature = (0..<h).map { row in
             Self.rowSignatureY(data: pixelData, width: w, y: row, samples: samples)
         }
+    }
+
+    /// 优先沿用源图 RGB 色域（如 Display P3），避免每帧做广色域→sRGB 重采样与色偏；不支持时回落 sRGB
+    static func makeContext(
+        width: Int,
+        height: Int,
+        bytesPerRow: Int,
+        preferredColorSpace: CGColorSpace?
+    ) -> CGContext? {
+        if let preferred = preferredColorSpace,
+           preferred.model == .rgb,
+           !CGColorSpaceUsesExtendedRange(preferred),
+           let ctx = CGContext(
+               data: nil,
+               width: width,
+               height: height,
+               bitsPerComponent: 8,
+               bytesPerRow: bytesPerRow,
+               space: preferred,
+               bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+           ) {
+            return ctx
+        }
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        return CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: space,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        )
     }
 
     private static func rowSignatureY(data: [UInt8], width: Int, y: Int, samples: Int) -> [UInt8] {

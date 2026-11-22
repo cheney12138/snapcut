@@ -133,6 +133,7 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
         toolbar.updateScreen(window.screen ?? NSScreen.main ?? NSScreen.screens[0])
         toolbar.configure(
             session: session,
+            capabilities: .collage,
             onToolChange: { [weak self] in self?.editorView?.needsDisplay = true },
             onAction: { [weak self] action in self?.toolbarAction(action) }
         )
@@ -308,8 +309,22 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
 
     // MARK: - NSWindowDelegate
 
+    func windowDidMove(_ notification: Notification) {
+        repositionToolbar()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        repositionToolbar()
+    }
+
     func windowWillClose(_ notification: Notification) {
         closeEditor()
+    }
+
+    private func repositionToolbar() {
+        guard let window, let toolbar else { return }
+        toolbar.updateScreen(window.screen ?? NSScreen.main ?? NSScreen.screens[0])
+        toolbar.reposition(aboveGlobal: window.frame)
     }
 
     // MARK: - EditorKeyRouter 动作集（内容视图 keyDown 用）

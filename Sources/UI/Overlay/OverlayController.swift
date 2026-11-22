@@ -74,6 +74,9 @@ final class OverlayController {
     private var scrollUpEventsSinceGrowth = 0
     private var boundaryWallStaticFrames = 0
     private var boundaryWallStartTime: CFAbsoluteTime?
+    private var boundaryWallEdge: ScrollBoundaryEdge?
+    private var boundaryWallCheckWork: DispatchWorkItem?
+    private var lastScrollStepOutcome: ScrollStitchPipeline.StepOutcome?
     private var scrollViewportHeightPx = 1
     private var scrollInContainedRegion = false
     /// 串行流式增量拼接管线（actor 隔离，保证严格按采集顺序处理）
@@ -506,8 +509,8 @@ final class OverlayController {
         scrollFrameInFlight = false
         scrollFrameQueue.removeAll()
         scrollPipeline = nil
-        boundaryWallStaticFrames = 0
-        boundaryWallStartTime = nil
+        lastScrollStepOutcome = nil
+        resetBoundaryWall()
         unregisterScrollHotKeys()
         removeScrollWheelMonitor()
         scrollBottomWork?.cancel()
@@ -531,7 +534,6 @@ final class OverlayController {
         lastUpScrollTime = 0
         scrollDownEventsSinceGrowth = 0
         scrollUpEventsSinceGrowth = 0
-        boundaryWallStaticFrames = 0
         scrollInContainedRegion = false
         scrollEverScrolled = false
         // 焦点屏语义：滚动态只可能挂在 scrollScreen 上，其余屏窗口不换态
@@ -592,6 +594,13 @@ final class OverlayController {
             lastUpScrollTime = now
             scrollUpEventsSinceGrowth += 1
             scrollDownEventsSinceGrowth = 0
+        }
+        // SCStream 在画面静止时 0 推帧：若停在底缘/顶缘且无滚动条/橡皮筋动画，仍由滚轮输入兜底触发撞墙检测
+        if !scrollBottomDetected,
+           scrollEverScrolled,
+           let outcome = lastScrollStepOutcome,
+           let edge = activeBoundaryWallEdge(outcome) {
+            armBoundaryWall(edge: edge, fromFrame: false)
         }
     }
 
@@ -731,9 +740,19 @@ final class OverlayController {
         selectionRectGlobal = newGlobal
     }
 
+    /// 选区移动/缩放/平移过程中实时让工具栏（及附属胶囊）同步跟随当前全局选区
+    func repositionToolbar(forLiveSelectionGlobal globalRect: CGRect, on screen: NSScreen) {
+        guard let session = editorSession else { return }
+        toolbar?.updateScreen(screen)
+        toolbar?.reposition(below: toolbarAnchorRectGlobal(for: globalRect, session: session))
+    }
+
     /// 工具栏定位与贴图落位参考的全局矩形（开启画框时返回画框外沿全局矩形，否则返回选区全局矩形）
     private func toolbarAnchorRectGlobal(for session: EditorSession) -> CGRect {
-        let selection = session.selectionGlobal
+        toolbarAnchorRectGlobal(for: session.selectionGlobal, session: session)
+    }
+
+    private func toolbarAnchorRectGlobal(for selection: CGRect, session: EditorSession) -> CGRect {
         guard let layout = session.currentBackdropLayout(for: selection.size) else {
             return selection
         }
@@ -788,6 +807,7 @@ final class OverlayController {
         toolbar.updateScreen(screen)
         toolbar.configure(
             session: session,
+            capabilities: .screenshot,
             onToolChange: { [weak self] in
                 self?.editorWindow()?.overlayView.syncActiveTextColor()
                 self?.editorWindow()?.overlayView.needsDisplay = true
@@ -832,6 +852,10 @@ final class OverlayController {
     private func editorWindow() -> OverlayWindow? {
         guard let screen = selectionScreen else { return nil }
         return windows.first { $0.owningScreen == screen }
+    }
+
+    func syncToolbarFromEditor() {
+        toolbar?.refreshSelectionState(animated: true)
     }
 
     func toolbarAction(_ action: ToolbarPanel.Action) {
@@ -1093,8 +1117,8 @@ final class OverlayController {
         lastUpScrollTime = 0
         scrollDownEventsSinceGrowth = 0
         scrollUpEventsSinceGrowth = 0
-        boundaryWallStaticFrames = 0
-        boundaryWallStartTime = nil
+        lastScrollStepOutcome = nil
+        resetBoundaryWall()
         scrollInContainedRegion = false
         scrollEverScrolled = false
 
@@ -1230,24 +1254,84 @@ final class OverlayController {
     }
 
     /// 双向边界撞墙检测：
-    /// - 向下滑到底：位于画布最底缘 + 最近 0.65s 内有持续向下滚动输入；
-    /// - 从下往上滑到顶：位于画布最顶缘（posY ≤ 16）+ 最近 0.65s 内有持续向上滚动输入；
+    /// - 向下滑到底：位于画布最底缘 + 最近 0.75s 内有持续向下滚动输入；
+    /// - 从下往上滑到顶：位于画布最顶缘（posY ≤ edgeTolerance）+ 最近 0.75s 内有持续向上滚动输入；
     /// 中途停下来看屏无滚动输入时恒返 nil，绝不误触发自动结束。
     private func activeBoundaryWallEdge(_ outcome: ScrollStitchPipeline.StepOutcome) -> ScrollBoundaryEdge? {
         guard scrollEverScrolled else { return nil }
         let now = CFAbsoluteTimeGetCurrent()
-        let atBottomEdge = outcome.viewportPosition >= outcome.maxViewportPosition - 16
-        if atBottomEdge && (now - lastDownScrollTime) <= 0.65 && scrollDownEventsSinceGrowth >= 2 {
+        let edgeTolerance = min(40, max(16, outcome.maxViewportPosition / 4))
+        let atBottomEdge = outcome.viewportPosition >= outcome.maxViewportPosition - edgeTolerance
+        if atBottomEdge && (now - lastDownScrollTime) <= 0.75 && scrollDownEventsSinceGrowth >= 2 {
             return .bottom
         }
-        let atTopEdge = outcome.viewportPosition <= 16
-        if atTopEdge && (now - lastUpScrollTime) <= 0.65 && scrollUpEventsSinceGrowth >= 2 {
+        let atTopEdge = outcome.viewportPosition <= edgeTolerance
+        if atTopEdge && (now - lastUpScrollTime) <= 0.75 && scrollUpEventsSinceGrowth >= 2 {
             return .top
         }
         return nil
     }
 
+    private func resetBoundaryWall() {
+        boundaryWallCheckWork?.cancel()
+        boundaryWallCheckWork = nil
+        boundaryWallStaticFrames = 0
+        boundaryWallStartTime = nil
+        boundaryWallEdge = nil
+    }
+
+    private func armBoundaryWall(edge: ScrollBoundaryEdge, fromFrame: Bool) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if boundaryWallEdge != edge || boundaryWallStartTime == nil {
+            boundaryWallCheckWork?.cancel()
+            boundaryWallCheckWork = nil
+            boundaryWallEdge = edge
+            boundaryWallStartTime = now
+            boundaryWallStaticFrames = 0
+        }
+        if fromFrame {
+            boundaryWallStaticFrames += 1
+        }
+        let start = boundaryWallStartTime ?? now
+        let elapsed = now - start
+        if elapsed >= 0.32, !scrollFrameInFlight, scrollFrameQueue.isEmpty {
+            resetBoundaryWall()
+            detectScrollBottom(isTop: edge == .top)
+            return
+        }
+        guard boundaryWallCheckWork == nil else { return }
+        scheduleBoundaryWallCheck(expectedEdge: edge, delay: max(0.05, 0.32 - elapsed))
+    }
+
+    private func scheduleBoundaryWallCheck(expectedEdge: ScrollBoundaryEdge, delay: TimeInterval) {
+        boundaryWallCheckWork?.cancel()
+        let token = scrollSessionToken
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.scrollSessionToken == token,
+                  self.scrollController != nil,
+                  !self.scrollBottomDetected,
+                  self.scrollEverScrolled,
+                  let outcome = self.lastScrollStepOutcome,
+                  let edge = self.activeBoundaryWallEdge(outcome),
+                  edge == expectedEdge
+            else {
+                return
+            }
+            self.boundaryWallCheckWork = nil
+            if self.scrollFrameInFlight || !self.scrollFrameQueue.isEmpty {
+                self.scheduleBoundaryWallCheck(expectedEdge: expectedEdge, delay: 0.08)
+                return
+            }
+            self.resetBoundaryWall()
+            self.detectScrollBottom(isTop: edge == .top)
+        }
+        boundaryWallCheckWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     private func applyScrollStepOutcome(_ outcome: ScrollStitchPipeline.StepOutcome) {
+        lastScrollStepOutcome = outcome
         scrollAcceptedCount = outcome.frameCount
         scrollStitchedHeightPx = outcome.canvasHeight
         if outcome.viewportHeight > 0 {
@@ -1257,8 +1341,7 @@ final class OverlayController {
 
         switch outcome.status {
         case .firstFrame:
-            boundaryWallStaticFrames = 0
-            boundaryWallStartTime = nil
+            resetBoundaryWall()
             scrollInContainedRegion = false
             Log.event(.scroll, "scroll.frame.n", [
                 "n": "1", "pxH": "\(outcome.canvasHeight)", "prepMs": "\(outcome.prepMs)",
@@ -1266,24 +1349,15 @@ final class OverlayController {
             scrollHUD?.update(state: .waiting)
 
         case .staticFrame:
-            // 仅当用户在底缘继续下滚或顶缘继续上滚撞墙不增长时累计（60fps 下需帧数 ≥ 4 且持续 ≥ 0.32s，防误触）
+            // 仅当用户在底缘继续下滚或顶缘继续上滚撞墙不增长时累计（持续 ≥ 0.32s；若画面静止不再推帧则由定时器接力确认）
             if let edge = activeBoundaryWallEdge(outcome) {
-                let now = CFAbsoluteTimeGetCurrent()
-                if boundaryWallStartTime == nil { boundaryWallStartTime = now }
-                boundaryWallStaticFrames += 1
-                if boundaryWallStaticFrames >= 4,
-                   let start = boundaryWallStartTime,
-                   (now - start) >= 0.32 {
-                    detectScrollBottom(isTop: edge == .top)
-                }
+                armBoundaryWall(edge: edge, fromFrame: true)
             } else {
-                boundaryWallStaticFrames = 0
-                boundaryWallStartTime = nil
+                resetBoundaryWall()
             }
 
         case .skipped:
-            boundaryWallStaticFrames = 0
-            boundaryWallStartTime = nil
+            resetBoundaryWall()
             var fields: [String: String] = [
                 "afterN": "\(outcome.frameCount)",
                 "prepMs": "\(outcome.prepMs)",
@@ -1315,8 +1389,7 @@ final class OverlayController {
             }
             scrollDownEventsSinceGrowth = 0
             scrollUpEventsSinceGrowth = 0
-            boundaryWallStaticFrames = 0
-            boundaryWallStartTime = nil
+            resetBoundaryWall()
             scrollInContainedRegion = false
             revokeBottomIfNeeded()
             Log.event(.scroll, "scroll.frame.n", [
@@ -1340,8 +1413,7 @@ final class OverlayController {
             }
             scrollDownEventsSinceGrowth = 0
             scrollUpEventsSinceGrowth = 0
-            boundaryWallStaticFrames = 0
-            boundaryWallStartTime = nil
+            resetBoundaryWall()
             scrollInContainedRegion = false
             revokeBottomIfNeeded()
             Log.event(.scroll, "scroll.frame.n", [
@@ -1358,18 +1430,10 @@ final class OverlayController {
         case .contained(let positionY, let totalHeight):
             // 若是在画布底缘继续下滚或顶缘继续上滚（例如 macOS 边界橡皮筋回弹），视作触底/触顶而非回滚
             if let edge = activeBoundaryWallEdge(outcome) {
-                let now = CFAbsoluteTimeGetCurrent()
-                if boundaryWallStartTime == nil { boundaryWallStartTime = now }
-                boundaryWallStaticFrames += 1
-                if boundaryWallStaticFrames >= 4,
-                   let start = boundaryWallStartTime,
-                   (now - start) >= 0.32 {
-                    detectScrollBottom(isTop: edge == .top)
-                }
+                armBoundaryWall(edge: edge, fromFrame: true)
                 return
             }
-            boundaryWallStaticFrames = 0
-            boundaryWallStartTime = nil
+            resetBoundaryWall()
             scrollInContainedRegion = true
             revokeBottomIfNeeded()
             Log.event(.scroll, "scroll.frame.contained", [
@@ -1449,6 +1513,8 @@ final class OverlayController {
         guard let controller = scrollController, let pipeline = scrollPipeline else { return }
         scrollBottomWork?.cancel()
         scrollBottomWork = nil
+        lastScrollStepOutcome = nil
+        resetBoundaryWall()
         scrollDroppedHintWork?.cancel()
         scrollDroppedHintWork = nil
         removeScrollWheelMonitor()
