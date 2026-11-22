@@ -42,6 +42,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
     private var permButtonRef: GlassMiniButton?
     private var permHintRef: NSTextField?
     private var permStatusLabel: NSTextField?
+    private var updateSwitch: GlassSwitch!
+    private var updateNoteLabel: NSTextField!
 
     // 通用 tab 控件
     private var launchAtLoginSwitch: GlassSwitch!
@@ -104,6 +106,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         // 病例：权限状态只在 buildAboutPane 时刷过一次（首次 open），用户事后
         // 授权再开窗口仍显示「未授权」旧文案——每次 open 都要重刷
         refreshPermissionStatus()
+        refreshUpdateStatus()
         // LSUIElement（.accessory 策略）下，系统协作激活不会真正把 App 切到前台：
         // 设置窗看起来在前，但用户一点面板，焦点就被让回之前的 App（窗「退后台」）。
         // 设置窗打开期间临时切 .regular，关闭时还原。
@@ -316,6 +319,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
 
     func windowDidBecomeKey(_ notification: Notification) {
         refreshPermissionStatus()
+        refreshUpdateStatus()
         refreshLaunchAtLoginStatus()
     }
 
@@ -1101,12 +1105,14 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
         let stack = NSStackView(views: [
             iconView, nameLabel, versionLabel, tagline,
             permCard,
+            buildUpdateCard(),
         ])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 8
         stack.setCustomSpacing(4, after: versionLabel)
         stack.setCustomSpacing(28, after: tagline)
+        stack.setCustomSpacing(12, after: permCard)
         stack.translatesAutoresizingMaskIntoConstraints = false
         aboutPane.addSubview(stack)
         // 关于页内容垂直居中于 pane（sidebar 布局下 top 锚定会显秃）
@@ -1134,6 +1140,99 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSCo
             permHintRef?.stringValue = "未授权时无法截屏；授权后需重启 Snapcut"
             Log.event(.app, "settings.permission", ["state": "denied"])
         }
+    }
+
+    /// 更新卡（与权限卡同宽 320）：手动检查 + 每日自动检查开关 + 上次检查时间
+    ///
+    /// 反馈全部交给 Sparkle 自己的窗口/弹窗（进度、已是最新、发现新版本），
+    /// 我们只负责起点和开关——自己再画一套「正在检查…」的状态机，等于把
+    /// Sparkle 已经做对的事重做一遍，且状态一定会对不上。
+    private func buildUpdateCard() -> CrystalGlassContainer {
+        updateSwitch = GlassSwitch()
+        updateSwitch.target = self
+        updateSwitch.action = #selector(updateAutoToggled(_:))
+
+        let checkButton = GlassMiniButton(title: "检查更新…")
+        checkButton.target = self
+        checkButton.action = #selector(checkForUpdatesClicked)
+
+        let updateNoteLabel = NSTextField(labelWithString: "")
+        updateNoteLabel.font = DesignTokens.Font.note
+        updateNoteLabel.textColor = DesignTokens.label3
+        updateNoteLabel.lineBreakMode = .byWordWrapping
+        updateNoteLabel.alignment = .center
+        self.updateNoteLabel = updateNoteLabel
+
+        let card = CrystalGlassContainer(cornerRadius: 12, tintAlpha: 0.08, shadowMargin: 10)
+        let rows = NSStackView(views: [
+            aboutRow("检查更新", trailing: [checkButton]),
+            SettingsHairlineView(),
+            aboutRow("每日自动检查", trailing: [updateSwitch]),
+            updateNoteLabel,
+        ])
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 6
+        rows.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        rows.setCustomSpacing(6, after: rows.views[0])
+        rows.setCustomSpacing(6, after: rows.views[1])
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        card.contentContainer.addSubview(rows)
+        NSLayoutConstraint.activate([
+            rows.topAnchor.constraint(equalTo: card.contentContainer.topAnchor),
+            rows.bottomAnchor.constraint(equalTo: card.contentContainer.bottomAnchor),
+            rows.leadingAnchor.constraint(equalTo: card.contentContainer.leadingAnchor),
+            rows.trailingAnchor.constraint(equalTo: card.contentContainer.trailingAnchor),
+            rows.widthAnchor.constraint(equalToConstant: 320),
+        ])
+        return card
+    }
+
+    /// 关于页的行（宽度由卡片固定 320 决定，不像通用页那样写死 448）
+    private func aboutRow(_ labelText: String, trailing: [NSView]) -> NSStackView {
+        let label = NSTextField(labelWithString: labelText)
+        label.font = DesignTokens.Font.body
+        label.textColor = DesignTokens.label1
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
+        let stack = NSStackView(views: [label, spacer] + trailing)
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = DesignTokens.Spacing.s2
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return stack
+    }
+
+    @objc private func checkForUpdatesClicked() {
+        AppCoordinatorShared.deps?.updating.checkForUpdates()
+        // Sparkle 的窗口是异步出现的，回来刷一下上次检查时间
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.refreshUpdateStatus()
+        }
+    }
+
+    @objc private func updateAutoToggled(_ sender: GlassSwitch) {
+        AppCoordinatorShared.deps?.updating.automaticallyChecksForUpdates = sender.isOn
+        refreshUpdateStatus()
+    }
+
+    /// 更新状态回填（打开窗口 / 切换 tab 时调用）
+    @MainActor
+    private func refreshUpdateStatus() {
+        guard let updating = AppCoordinatorShared.deps?.updating else {
+            updateSwitch?.setOn(false, animated: false)
+            updateNoteLabel?.stringValue = "更新服务未就绪"
+            return
+        }
+        updateSwitch?.setOn(updating.automaticallyChecksForUpdates, animated: false)
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "?"
+        updateNoteLabel?.stringValue = updating.lastCheckDescription
+            .map { "当前 \(version) · \($0)" } ?? "当前 \(version) · 每日自动检查一次"
     }
 
     @objc private func openPermissionSettings() {

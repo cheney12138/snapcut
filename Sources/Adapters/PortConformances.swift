@@ -122,7 +122,8 @@ extension Dependencies {
             textRecognizer: VisionTextRecognizerAdapter(),
             hotkeys: CarbonHotKeyCenter.shared,
             permission: ScreenPermissionAdapter(),
-            pinning: PinPresenterAdapter()
+            pinning: PinPresenterAdapter(),
+            updating: SparkleUpdater.shared
         )
     }
 }
