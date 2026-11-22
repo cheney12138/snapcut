@@ -41,19 +41,28 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private var permStatusLabel: NSTextField?
 
     // 通用 tab 控件
+    private var launchAtLoginSwitch: NSSwitch!
+    private var launchAtLoginHintRow: NSView!
+    private var launchAtLoginHintLabel: NSTextField!
+    private var launchAtLoginOpenBtn: NSButton!
+    private var toolbarSizeSegment: NSSegmentedControl!
     private var afterCapturePopup: NSPopUpButton!
     private var pathField: NSTextField!
     private var filenamePopup: NSPopUpButton!
     private var historyField: NSTextField!
     private var historyStepper: NSStepper!
+    private var autoIndexOCRSwitch: NSSwitch!
     private var notifySwitch: NSSwitch!
     private var soundSwitch: NSSwitch!
 
     // 快捷键 tab 控件
     private var regionRecorder: HotkeyRecorderView!
     private var fullScreenRecorder: HotkeyRecorderView!
+    private var historySpotlightRecorder: HotkeyRecorderView!
     /// 编辑器热键（工具栏后半段 8 动作）录制器，key = action key
     private var editorRecorders: [String: HotkeyRecorderView] = [:]
+    /// 视觉记忆面板操作热键录制器，key = action key
+    private var spotlightRecorders: [String: HotkeyRecorderView] = [:]
     private var hotkeyHint: NSTextField!
 
     private init() {
@@ -88,8 +97,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         // mat.window / mat.card：窗口类界面跟随系统外观（迁移差异 §10-6，
-        // token 表给了暗/亮双值；不再钉 darkAqua）
-        window?.center()
+        // token 表给了暗/亮双值；不再钉 darkAqua）；唤起时居中于光标所在屏幕
+        if let window {
+            let origin = DisplayRegistry.centerOrigin(for: window.frame.size)
+            window.setFrameOrigin(origin)
+        }
         window?.makeKeyAndOrderFront(nil)
         Log.event(.app, "settings.window.open")
     }
@@ -250,9 +262,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
 
     // MARK: - 窗口关闭：退出录制态（设置本身已即时保存，无需收尾）
 
+    func windowDidBecomeKey(_ notification: Notification) {
+        refreshPermissionStatus()
+        refreshLaunchAtLoginStatus()
+    }
+
     func windowWillClose(_ notification: Notification) {
         regionRecorder?.endRecordingIfNeeded()
         fullScreenRecorder?.endRecordingIfNeeded()
+        historySpotlightRecorder?.endRecordingIfNeeded()
         for r in editorRecorders.values { r.endRecordingIfNeeded() }
         // 设置窗关闭：还原 LSUIElement 形态（show() 里临时切的 .regular）。
         // 策略还原即自动让出前台，焦点回之前的 App。
@@ -269,6 +287,45 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     }
 
     private func buildGeneralPane() {
+        // 登录时自动启动（SMAppService.mainApp 原生登录项）
+        launchAtLoginSwitch = NSSwitch()
+        launchAtLoginSwitch.target = self
+        launchAtLoginSwitch.action = #selector(launchAtLoginToggled(_:))
+
+        launchAtLoginHintLabel = NSTextField(labelWithString: "")
+        launchAtLoginHintLabel.font = .systemFont(ofSize: 11)
+        launchAtLoginHintLabel.textColor = .secondaryLabelColor
+        launchAtLoginHintLabel.lineBreakMode = .byWordWrapping
+        launchAtLoginHintLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        launchAtLoginOpenBtn = NSButton(title: "打开登录项…", target: self, action: #selector(openLoginItemsSettings))
+        launchAtLoginOpenBtn.bezelStyle = .rounded
+        launchAtLoginOpenBtn.controlSize = .small
+        launchAtLoginOpenBtn.font = .systemFont(ofSize: 11, weight: .medium)
+
+        let hintSpacer = NSView()
+        hintSpacer.translatesAutoresizingMaskIntoConstraints = false
+        hintSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
+
+        let hintStack = NSStackView(views: [launchAtLoginHintLabel, hintSpacer, launchAtLoginOpenBtn])
+        hintStack.orientation = .horizontal
+        hintStack.alignment = .centerY
+        hintStack.spacing = 8
+        hintStack.translatesAutoresizingMaskIntoConstraints = false
+        hintStack.widthAnchor.constraint(equalToConstant: Self.rowWidth).isActive = true
+        launchAtLoginHintRow = hintStack
+        launchAtLoginHintRow.isHidden = true
+
+        let startupRowStack = NSStackView(views: [
+            row("登录时自动启动", trailing: [launchAtLoginSwitch]),
+            launchAtLoginHintRow,
+        ])
+        startupRowStack.orientation = .vertical
+        startupRowStack.alignment = .leading
+        startupRowStack.spacing = 6
+
+        let startupCard = makeGroupCard(title: "启动", rows: [startupRowStack])
+
         // 截图完成后
         afterCapturePopup = NSPopUpButton()
         afterCapturePopup.translatesAutoresizingMaskIntoConstraints = false
@@ -327,6 +384,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         unitLabel.textColor = .secondaryLabelColor
 
         // 开关（NSSwitch：System Settings 同款，行式左标签右开关）
+        autoIndexOCRSwitch = NSSwitch()
+        autoIndexOCRSwitch.target = self
+        autoIndexOCRSwitch.action = #selector(autoIndexOCRToggled(_:))
         notifySwitch = NSSwitch()
         notifySwitch.target = self
         notifySwitch.action = #selector(notifyToggled(_:))
@@ -334,8 +394,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         soundSwitch.target = self
         soundSwitch.action = #selector(soundToggled(_:))
 
+        // 工具栏大小档位（紧凑 / 标准 / 大号，即时生效）
+        toolbarSizeSegment = NSSegmentedControl(
+            labels: ["紧凑", "标准", "大号"],
+            trackingMode: .selectOne,
+            target: self,
+            action: #selector(toolbarSizeChanged(_:))
+        )
+        toolbarSizeSegment.segmentStyle = .rounded
+        toolbarSizeSegment.controlSize = .regular
+        toolbarSizeSegment.translatesAutoresizingMaskIntoConstraints = false
+        toolbarSizeSegment.widthAnchor.constraint(equalToConstant: 180).isActive = true
+
         // 四张磨砂分组卡（8pt 栅格：卡间距 12，卡内边距 12/16）
         let captureCard = makeGroupCard(title: "截图", rows: [
+            row("工具栏大小", trailing: [toolbarSizeSegment]),
             row("截图完成后", trailing: [afterCapturePopup]),
             row("保存目录", trailing: [pathField, chooseButton]),
         ])
@@ -344,6 +417,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         ])
         let historyCard = makeGroupCard(title: "历史", rows: [
             row("历史保留", trailing: [historyField, historyStepper, unitLabel]),
+            row("后台自动识别历史文字", trailing: [autoIndexOCRSwitch]),
         ])
         let notifyCard = makeGroupCard(title: "通知", rows: [
             row("复制后显示通知", trailing: [notifySwitch]),
@@ -353,7 +427,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         // 工具栏排序（用户裁定 2026-11-17）：行序 = toolbarOrder；▲▼ 调序即时生效
         let orderCard = makeGroupCard(title: "工具栏排序", rows: buildToolbarOrderRows())
 
-        let outer = NSStackView(views: [captureCard, orderCard, fileCard, historyCard, notifyCard])
+        let outer = NSStackView(views: [startupCard, captureCard, orderCard, fileCard, historyCard, notifyCard])
         outer.orientation = .vertical
         outer.alignment = .leading
         outer.spacing = 12
@@ -366,12 +440,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         var rows: [NSView] = []
         let order = settings.toolbarOrderSafe()
         for (idx, raw) in order.enumerated() {
-            let name: String
-            switch raw {
-            case 206: name = "滚动截图"
-            default:
-                name = EditorSession.Tool(rawValue: raw)?.label ?? "未知(\(raw))"
-            }
+            let name = EditorSession.Tool(rawValue: raw)?.label ?? "未知(\(raw))"
             let label = NSTextField(labelWithString: "\(idx + 1). \(name)")
             label.font = .systemFont(ofSize: 12)
 
@@ -400,10 +469,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
 
     /// 调序：toolbarOrder 里把 raw 上/下移，persist 即时生效
     private func moveToolbarOrder(_ raw: Int, delta: Int) {
-        guard let idx = settings.toolbarOrder.firstIndex(of: raw) else { return }
+        var normalized = settings.toolbarOrderSafe()
+        guard let idx = normalized.firstIndex(of: raw) else { return }
         let target = idx + delta
-        guard target >= 0, target < settings.toolbarOrder.count else { return }
-        settings.toolbarOrder.swapAt(idx, target)
+        guard target >= 0, target < normalized.count else { return }
+        normalized.swapAt(idx, target)
+        settings.toolbarOrder = normalized
         Log.event(.app, "settings.toolbarOrder", ["moved": "\(raw)", "to": "\(target)"])
         persist()
         rebuildOrderCard()
@@ -413,7 +484,54 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private func rebuildOrderCard() {
         generalPane.subviews.forEach { $0.removeFromSuperview() }
         buildGeneralPane()
+        refreshControls()
         selectTab(0)
+    }
+
+    @objc private func launchAtLoginToggled(_ sender: NSSwitch) {
+        let wantEnable = sender.state == .on
+        switch LaunchAtLoginManager.setEnabled(wantEnable) {
+        case .success(let status):
+            applyLaunchAtLoginStatus(status, errorMessage: nil)
+        case .failure(let error):
+            applyLaunchAtLoginStatus(LaunchAtLoginManager.status, errorMessage: "设置失败：\(error.localizedDescription)")
+        }
+    }
+
+    @objc private func openLoginItemsSettings() {
+        LaunchAtLoginManager.openSystemSettingsLoginItems()
+    }
+
+    private func refreshLaunchAtLoginStatus() {
+        guard launchAtLoginSwitch != nil else { return }
+        applyLaunchAtLoginStatus(LaunchAtLoginManager.status, errorMessage: nil)
+    }
+
+    private func applyLaunchAtLoginStatus(_ status: LaunchAtLoginStatus, errorMessage: String?) {
+        launchAtLoginSwitch.state = (status == .enabled || status == .requiresApproval) ? .on : .off
+        if let errorMessage {
+            launchAtLoginHintLabel.stringValue = errorMessage
+            launchAtLoginHintLabel.textColor = DesignTokens.statusError
+            launchAtLoginOpenBtn.isHidden = false
+            launchAtLoginHintRow.isHidden = false
+        } else if status == .requiresApproval {
+            launchAtLoginHintLabel.stringValue = "需在「系统设置 → 通用 → 登录项」中允许 Snapcut"
+            launchAtLoginHintLabel.textColor = .systemOrange
+            launchAtLoginOpenBtn.isHidden = false
+            launchAtLoginHintRow.isHidden = false
+        } else {
+            launchAtLoginHintRow.isHidden = true
+        }
+    }
+
+    @objc private func toolbarSizeChanged(_ sender: NSSegmentedControl) {
+        let all = AppSettings.ToolbarSize.allCases
+        guard all.indices.contains(sender.selectedSegment) else { return }
+        let chosen = all[sender.selectedSegment]
+        guard settings.toolbarSize != chosen else { return }
+        settings.toolbarSize = chosen
+        Log.event(.app, "settings.toolbarSize", ["size": chosen.rawValue])
+        persist()
     }
 
     @objc private func afterCaptureChanged(_ sender: NSPopUpButton) {
@@ -480,6 +598,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
     }
 
+    @objc private func autoIndexOCRToggled(_ sender: NSSwitch) {
+        settings.autoIndexHistoryOCR = sender.state == .on
+        Log.event(.app, "settings.autoIndexOCR", ["enabled": "\(settings.autoIndexHistoryOCR)"])
+        persist()
+    }
+
     @objc private func notifyToggled(_ sender: NSSwitch) {
         settings.showCopyNotification = sender.state == .on
         persist()
@@ -488,6 +612,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     @objc private func soundToggled(_ sender: NSSwitch) {
         settings.playCaptureSound = sender.state == .on
         persist()
+        if settings.playCaptureSound {
+            CaptureSoundPlayer.play(force: true)
+        }
     }
 
     // MARK: - 快捷键 tab
@@ -505,23 +632,46 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         ("scroll", "滚动截图"),
     ]
 
+    /// 视觉记忆搜索面板操作热键行定义
+    private static let spotlightHotkeyRows: [(key: String, label: String)] = [
+        ("copyImage", "复制原图"),
+        ("reopenEdit", "重新编辑"),
+        ("pin", "贴图"),
+        ("copyOCR", "复制文字"),
+    ]
+
     private func buildHotkeyPane() {
         regionRecorder = HotkeyRecorderView()
         fullScreenRecorder = HotkeyRecorderView()
+        historySpotlightRecorder = HotkeyRecorderView()
 
         hotkeyHint = NSTextField(labelWithString: "")
         hotkeyHint.font = .systemFont(ofSize: 11)
         hotkeyHint.textColor = .systemRed
         hotkeyHint.isHidden = true
 
-        wireRecorder(regionRecorder, other: fullScreenRecorder)
-        wireRecorder(fullScreenRecorder, other: regionRecorder)
+        wireGlobalRecorder(regionRecorder)
+        wireGlobalRecorder(fullScreenRecorder)
+        wireGlobalRecorder(historySpotlightRecorder)
 
-        // 磨砂分组卡（与通用页同一玻璃语言）：两行录制行 + 红字提示
+        // 磨砂分组卡（与通用页同一玻璃语言）：三行全局录制行
         let card = makeGroupCard(title: "全局热键", rows: [
             row("区域截图", trailing: [regionRecorder]),
             row("全屏截图", trailing: [fullScreenRecorder]),
+            row("视觉记忆搜索", trailing: [historySpotlightRecorder]),
         ])
+
+        // 视觉记忆搜索浮窗内快捷键
+        var spotlightRows: [NSView] = []
+        for (actionKey, label) in Self.spotlightHotkeyRows {
+            let rec = HotkeyRecorderView()
+            rec.allowReturnKey = true
+            rec.setCombo(settings.spotlightHotkey(for: actionKey))
+            wireSpotlightRecorder(rec, actionKey: actionKey)
+            spotlightRecorders[actionKey] = rec
+            spotlightRows.append(row(label, trailing: [rec]))
+        }
+        let spotlightCard = makeGroupCard(title: "视觉记忆面板（搜索浮窗内生效）", rows: spotlightRows)
 
         // 编辑器操作热键（工具栏后半段，仅截图编辑时生效）
         var editorRows: [NSView] = []
@@ -547,26 +697,81 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             hotkeyHint.bottomAnchor.constraint(equalTo: hintWrap.bottomAnchor),
         ])
 
-        let outer = NSStackView(views: [card, editorCard, hintWrap])
+        let outer = NSStackView(views: [card, spotlightCard, editorCard, hintWrap])
         outer.orientation = .vertical
         outer.alignment = .leading
         outer.spacing = 0
         outer.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
         outer.setCustomSpacing(8, after: card)
+        outer.setCustomSpacing(8, after: spotlightCard)
         outer.setCustomSpacing(8, after: editorCard)
         pinStack(outer, to: hotkeyPane)
     }
 
-    /// 编辑器热键录制：进入录制时停掉所有其他录制器（全局两个 + 编辑器八个）
+    private func stopOtherRecorders(except current: HotkeyRecorderView) {
+        for other in [regionRecorder, fullScreenRecorder, historySpotlightRecorder] {
+            if let other, other !== current {
+                other.endRecordingIfNeeded()
+            }
+        }
+        for r in editorRecorders.values where r !== current {
+            r.endRecordingIfNeeded()
+        }
+        for r in spotlightRecorders.values where r !== current {
+            r.endRecordingIfNeeded()
+        }
+        hotkeyHint.isHidden = true
+    }
+
+    private func wireSpotlightRecorder(_ recorder: HotkeyRecorderView, actionKey: String) {
+        recorder.onStart = { [weak self, weak recorder] in
+            guard let self, let recorder else { return }
+            self.stopOtherRecorders(except: recorder)
+        }
+        recorder.onCombo = { [weak self, weak recorder] combo in
+            guard let self, let recorder else { return }
+            self.handleSpotlightCombo(from: recorder, actionKey: actionKey, combo: combo)
+        }
+    }
+
+    private func handleSpotlightCombo(from recorder: HotkeyRecorderView, actionKey: String, combo: String?) {
+        guard let combo else {
+            hotkeyHint.stringValue = "组合无效：需含修饰键（如 ⌘E）、F 功能键或 Return"
+            hotkeyHint.isHidden = false
+            return
+        }
+        for rowDef in Self.spotlightHotkeyRows where rowDef.key != actionKey {
+            if combosConflict(combo, settings.spotlightHotkey(for: rowDef.key)) {
+                hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被视觉记忆「\(rowDef.label)」占用"
+                hotkeyHint.isHidden = false
+                return
+            }
+        }
+        let globalSlots: [(combo: String, label: String)] = [
+            (settings.hotkeyRegion, "区域截图（全局）"),
+            (settings.hotkeyFullScreen, "全屏截图（全局）"),
+            (settings.hotkeyHistorySpotlight, "视觉记忆搜索（全局）"),
+        ]
+        for slot in globalSlots where combosConflict(combo, slot.combo) {
+            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「\(slot.label)」占用"
+            hotkeyHint.isHidden = false
+            return
+        }
+        hotkeyHint.isHidden = true
+        var hotkeys = settings.spotlightHotkeys
+        if hotkeys.isEmpty { hotkeys = AppSettings.defaultSpotlightHotkeys }
+        hotkeys[actionKey] = combo
+        settings.spotlightHotkeys = hotkeys
+        recorder.setCombo(combo)
+        Log.event(.app, "settings.spotlightHotkey", ["action": actionKey, "combo": combo])
+        persist()
+    }
+
+    /// 编辑器热键录制：进入录制时停掉所有其他录制器
     private func wireEditorRecorder(_ recorder: HotkeyRecorderView, actionKey: String) {
         recorder.onStart = { [weak self, weak recorder] in
-            self?.regionRecorder?.endRecordingIfNeeded()
-            self?.fullScreenRecorder?.endRecordingIfNeeded()
-            for (k, r) in self?.editorRecorders ?? [:] where k != actionKey {
-                r.endRecordingIfNeeded()
-            }
-            self?.hotkeyHint.isHidden = true
-            _ = recorder
+            guard let self, let recorder else { return }
+            self.stopOtherRecorders(except: recorder)
         }
         recorder.onCombo = { [weak self, weak recorder] combo in
             guard let self, let recorder else { return }
@@ -582,25 +787,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         }
         // 冲突检查：其他编辑器动作 + 全局热键 + 内置保留键（S=滚动 / C=取色 / 空格=移动 / 1-6=工具 / ⌘⌥S=快存）
         for rowDef in Self.editorHotkeyRows where rowDef.key != actionKey {
-            if settings.editorHotkey(for: rowDef.key) == combo {
+            if combosConflict(combo, settings.editorHotkey(for: rowDef.key)) {
                 hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「\(rowDef.label)」占用"
                 hotkeyHint.isHidden = false
                 return
             }
         }
-        if combo == settings.hotkeyRegion {
-            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「区域截图（全局）」占用"
-            hotkeyHint.isHidden = false
-            return
-        }
-        if combo == settings.hotkeyFullScreen {
-            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「全屏截图（全局）」占用"
+        let globalSlots: [(combo: String, label: String)] = [
+            (settings.hotkeyRegion, "区域截图（全局）"),
+            (settings.hotkeyFullScreen, "全屏截图（全局）"),
+            (settings.hotkeyHistorySpotlight, "视觉记忆搜索（全局）"),
+        ]
+        for slot in globalSlots where combosConflict(combo, slot.combo) {
+            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「\(slot.label)」占用"
             hotkeyHint.isHidden = false
             return
         }
         let reserved: [String: String] = ["c": "取色", "space": "移动贴图", "cmd+opt+s": "快速保存"]
         // （s 不再内置保留：滚动截图已可自定义，同组冲突检查会指到「滚动截图」行）
-        if let name = reserved[combo] {
+        if let name = reserved.first(where: { combosConflict(combo, $0.key) })?.value {
             hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」是内置功能「\(name)」的按键，请换一个"
             hotkeyHint.isHidden = false
             return
@@ -615,11 +820,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         persist()
     }
 
-    private func wireRecorder(_ recorder: HotkeyRecorderView, other: HotkeyRecorderView) {
-        recorder.onStart = { [weak self, weak recorder, weak other] in
-            other?.endRecordingIfNeeded()
-            self?.hotkeyHint.isHidden = true
-            _ = recorder
+    private func wireGlobalRecorder(_ recorder: HotkeyRecorderView) {
+        recorder.onStart = { [weak self, weak recorder] in
+            guard let self, let recorder else { return }
+            self.stopOtherRecorders(except: recorder)
         }
         recorder.onCombo = { [weak self, weak recorder] combo in
             guard let self, let recorder else { return }
@@ -634,27 +838,64 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             hotkeyHint.isHidden = false
             return
         }
-        let isRegion = recorder === regionRecorder
-        let otherCombo = isRegion ? settings.hotkeyFullScreen : settings.hotkeyRegion
-        let otherName = isRegion ? "全屏截图" : "区域截图"
-        if combo == otherCombo {
-            hotkeyHint.stringValue = "「\(combo)」已被「\(otherName)」占用"
+        let slot: String
+        let otherGlobals: [(combo: String, label: String)]
+        if recorder === regionRecorder {
+            slot = "region"
+            otherGlobals = [
+                (settings.hotkeyFullScreen, "全屏截图"),
+                (settings.hotkeyHistorySpotlight, "视觉记忆搜索"),
+            ]
+        } else if recorder === fullScreenRecorder {
+            slot = "fullScreen"
+            otherGlobals = [
+                (settings.hotkeyRegion, "区域截图"),
+                (settings.hotkeyHistorySpotlight, "视觉记忆搜索"),
+            ]
+        } else {
+            slot = "historySpotlight"
+            otherGlobals = [
+                (settings.hotkeyRegion, "区域截图"),
+                (settings.hotkeyFullScreen, "全屏截图"),
+            ]
+        }
+        for other in otherGlobals where combosConflict(combo, other.combo) {
+            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被「\(other.label)」占用"
+            hotkeyHint.isHidden = false
+            return
+        }
+        for rowDef in Self.editorHotkeyRows where combosConflict(combo, settings.editorHotkey(for: rowDef.key)) {
+            hotkeyHint.stringValue = "「\(HotkeySpec.display(combo))」已被编辑器「\(rowDef.label)」占用"
             hotkeyHint.isHidden = false
             return
         }
         hotkeyHint.isHidden = true
-        if isRegion {
+        if recorder === regionRecorder {
             settings.hotkeyRegion = combo
             regionRecorder.setCombo(combo)
-        } else {
+        } else if recorder === fullScreenRecorder {
             settings.hotkeyFullScreen = combo
             fullScreenRecorder.setCombo(combo)
+        } else {
+            settings.hotkeyHistorySpotlight = combo
+            historySpotlightRecorder.setCombo(combo)
         }
         Log.event(.app, "settings.hotkey", [
-            "slot": isRegion ? "region" : "fullScreen",
+            "slot": slot,
             "combo": combo,
         ])
         persist()
+    }
+
+    /// 语义化热键比较：兼容修饰键顺序差异（如 "opt+cmd+v" 与 "cmd+opt+v"）
+    private func combosConflict(_ lhs: String, _ rhs: String) -> Bool {
+        guard !lhs.isEmpty, !rhs.isEmpty else { return false }
+        if lhs == rhs { return true }
+        if let l = HotkeySpec.parse(lhs, allowBare: true),
+           let r = HotkeySpec.parse(rhs, allowBare: true) {
+            return l == r
+        }
+        return false
     }
 
     // MARK: - 关于 tab
@@ -778,6 +1019,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     // MARK: - 刷新（打开窗口时从设置回填控件）
 
     private func refreshControls() {
+        refreshLaunchAtLoginStatus()
+        if let idx = AppSettings.ToolbarSize.allCases.firstIndex(of: settings.toolbarSize) {
+            toolbarSizeSegment?.selectedSegment = idx
+        }
         selectPopup(afterCapturePopup, rawValue: settings.afterCapture.rawValue)
         selectPopup(filenamePopup, rawValue: settings.filenameStyle.rawValue)
         pathField.stringValue = settings.saveDirectoryPath
@@ -786,10 +1031,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
             min(max(settings.historyLimit, AppSettings.historyLimitRange.lowerBound),
                 AppSettings.historyLimitRange.upperBound)
         )
+        autoIndexOCRSwitch?.state = settings.autoIndexHistoryOCR ? .on : .off
         notifySwitch.state = settings.showCopyNotification ? .on : .off
         soundSwitch.state = settings.playCaptureSound ? .on : .off
         regionRecorder?.setCombo(settings.hotkeyRegion)
         fullScreenRecorder?.setCombo(settings.hotkeyFullScreen)
+        historySpotlightRecorder?.setCombo(settings.hotkeyHistorySpotlight)
+        for (actionKey, recorder) in editorRecorders {
+            recorder.setCombo(settings.editorHotkey(for: actionKey))
+        }
+        for (actionKey, recorder) in spotlightRecorders {
+            recorder.setCombo(settings.spotlightHotkey(for: actionKey))
+        }
         hotkeyHint?.isHidden = true
     }
 
@@ -807,6 +1060,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
         // 启动，改键后要重启——rebind 即时重注册 Carbon）
         AppCoordinatorShared.coordinator?.settings = settings
         AppCoordinatorShared.coordinator?.rebindCaptureHotkeys()
+        AppCoordinatorShared.coordinator?.invalidateToolbar()
     }
 
     // MARK: - 布局助手（磨砂分组卡 / 行高 36 / 8pt 栅格）
@@ -902,14 +1156,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTo
     private static let rowWidth: CGFloat = 488   // 560 − 窗边 20×2 − 卡内边距 16×2
 
     private func pinStack(_ stack: NSStackView, to pane: NSView) {
-        pane.addSubview(stack)
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let doc = SettingsFlippedDocumentView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        scroll.documentView = doc
+        pane.addSubview(scroll)
+
         NSLayoutConstraint.activate([
-            // fullSizeContentView：顶部用 safeArea（避开 toolbar/titlebar 区），
-            // 否则卡片压进 titlebar 区（磨砂上叠 toolbar）
-            stack.topAnchor.constraint(equalTo: pane.safeAreaLayoutGuide.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: pane.bottomAnchor),
+            // fullSizeContentView：顶部用 safeArea（避开 toolbar/titlebar 区）
+            scroll.topAnchor.constraint(equalTo: pane.safeAreaLayoutGuide.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+
+            stack.topAnchor.constraint(equalTo: doc.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
         ])
     }
 
@@ -1004,6 +1282,8 @@ private final class HotkeyRecorderView: NSButton {
     /// 命名键合法（"cmd+return"）；裸命名键仍非法（return/esc 与录制控件
     /// 自身的确认/取消语义冲突）。
     var allowBare = false
+    /// 视觉记忆面板等支持无修饰 Return 键的场景（裸字母仍禁止，避免抢搜索输入）
+    var allowReturnKey = false
     var onCombo: (String?) -> Void = { _ in }
     /// 进入录制态回调（取消另一个录制器、隐藏红字提示）
     var onStart: () -> Void = {}
@@ -1161,8 +1441,8 @@ private final class HotkeyRecorderView: NSButton {
             // F 键白名单对两类录制器都放行（用户裁定 2026-11-17 终报「改不了
             // 我再给你最后一次机会」——全局热键行录 F1 也被「需含修饰键」拒）。
             // F 键无打字冲突，裸用作全局热键也安全
-            let isBareFKey = key.count == 2 && key.hasPrefix("f") && (key.dropFirst().first?.isNumber == true)
-            if isBareFKey {
+            let isBareFKey = key.hasPrefix("f") && key.count >= 2 && key.dropFirst().allSatisfy(\.isNumber)
+            if isBareFKey || (allowReturnKey && key == "return") {
                 onCombo(key)
                 isRecording = false
                 updateDisplay()
@@ -1202,19 +1482,7 @@ private final class HotkeyRecorderView: NSButton {
     }
 
     static func symbolString(for combo: String) -> String {
-        let parts = combo.split(separator: "+").map(String.init)
-        guard let key = parts.last else { return combo }
-        var prefix = ""
-        for mod in parts.dropLast() {
-            switch mod {
-            case "cmd": prefix += "⌘"
-            case "shift": prefix += "⇧"
-            case "opt": prefix += "⌥"
-            case "ctrl": prefix += "⌃"
-            default: break
-            }
-        }
-        return prefix + (key.count == 1 ? key.uppercased() : key)
+        HotkeySpec.compactDisplay(combo)
     }
 
     private static let specialKeys: [UInt16: String] = [
@@ -1224,4 +1492,9 @@ private final class HotkeyRecorderView: NSButton {
         98: "f7", 100: "f8", 101: "f9", 109: "f10", 103: "f11", 111: "f12",
         123: "left", 124: "right", 125: "down", 126: "up",
     ]
+}
+
+/// 顶部对齐的滚动文档视图（确保设置页卡片从顶部向下自然滚动，不倒挂底部）
+private final class SettingsFlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }

@@ -34,18 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let coordinator = AppCoordinator()
         self.coordinator = coordinator
         coordinator.start()
-        // 预激活（用户病例 2026-11-16「重启后第一次唤起卡手」）：accessory App
-        // 的首次 NSApp.activate 由 macOS 冷启动激活流程，实测 ~1.7s——期间
-        // overlay 已上屏但鼠标事件仍路由给前台 App（用户拖动选中的是 TUI 文字）。
-        // 启动时激活一次并立刻退出，把首次激活成本留在启动刻，之后每次唤起
-        // 都是热激活（<50ms）。
-        NSApp.activate(ignoringOtherApps: true)
-        // 重试风暴（用户病例「重启框选又不流畅」日志铁证：keptActive active=
-        // false——单发 activate 在重启杀旧进程的焦点扰动下被丢弃，App 永久
-        // 冷启动，首次唤起 1.4s 激活真空=拖拽事件漏给 TUI）：启动后 3 秒
-        // 内每 100ms 重发直到 active——启动刻一次性消化激活成本
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.warmupActivationRetry()
+        // 静默预热 SCK XPC 与可复用工具栏（不抢前台焦点、不做 activate 重试风暴）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak coordinator] in
+            coordinator?.warmupAfterLaunch()
         }
     }
 
@@ -56,17 +47,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 终止：只放行「托盘菜单退出」（NSApp.terminate 由 QuitItem 触发时
     /// presentQuit 路径）。简单起见：一律 Cancel，用户退出走 terminate(nil)
     /// 的专用标记。
-    private func warmupActivationRetry(attempts: Int = 30) {
-        if NSApp.isActive || attempts <= 0 {
-            self.coordinator?.releaseActivationAfterWarmup()
-            return
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.warmupActivationRetry(attempts: attempts - 1)
-        }
-    }
-
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // 用户显式退出放行：① SnapcutQuitController（菜单退出）的热标记；
         // ② Apple event quit（osascript/系统「退出」）：此时距离用户上次交互

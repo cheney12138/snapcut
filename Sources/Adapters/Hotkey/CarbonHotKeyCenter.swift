@@ -104,6 +104,7 @@ final class CarbonHotKeyCenter {
                     )
                     if hkID.signature == kSnapcutHotKeySignature {
                         let center = Unmanaged<CarbonHotKeyCenter>.fromOpaque(userData).takeUnretainedValue()
+                        Log.event(.hotkey, "hotkey.fired", ["id": "\(hkID.id)"])
                         center.hotKeyIDs[hkID.id]?()
                     }
                     return OSStatus(noErr)

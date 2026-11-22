@@ -82,8 +82,13 @@ enum CGRenderer {
             break
 
         case .sequence(let anchor):
-            // 字号/半径由渲染器常量统一（badgeFontSize 20 / badgeRadius 17，见 drawText）
-            drawText("\(a.index ?? 1)", at: anchor, color: color, badge: true, context: context, yDown: yDown)
+            drawSequenceBadge(
+                number: a.index ?? 1,
+                at: anchor,
+                color: color,
+                strokeWidth: width,
+                context: context
+            )
 
         case .highlight(let from, let to):
             context.setStrokeColor(color.withAlphaComponent(0.4).cgColor)
@@ -146,81 +151,166 @@ enum CGRenderer {
         context.fillPath()
     }
 
-    /// 徽章几何（对齐 Snow Shot 序号观感）：圆直径 = 1.68 × 数字字号
-    /// （Snow Shot resolve_serial_number_badge_diameter：行高 1.2em + 0.4em padding），
-    /// 字号 20 semibold ⇒ 单个数字墨迹高 ≈ 14.3pt、圆直径 ≈ 34pt（半径 17），
-    /// 数字/圆径比例 42% ≈ Snow Shot（24pt 字号 / 40px 直径 = 42%）——
-    /// 病例（用户实报「这字号你能看清啊」）：旧版字号 16 + 半径 13，墨迹仅 11pt。
-    private static let badgeFontSize: CGFloat = 20
-    private static let badgeRadius: CGFloat = 17
+    /// Apple / CleanShot X 风格序号标注徽章：
+    /// - 尺寸随工具栏 3 档粗细点自适应（细 24pt / 中 28pt / 粗 32pt 直径；两位数自动微缩字号保持优雅留白）；
+    /// - 柔散投影 + 1.75pt 干净外白环分离背景文字 + 柔和上亮下深微渐变 + 顶缘高光弧；
+    /// - SF Pro Rounded Bold 字体 + `useGlyphPathBounds` 墨迹边界精确光学居中（彻底消除数字偏下/偏左）。
+    private static func drawSequenceBadge(
+        number: Int,
+        at anchor: CGPoint,
+        color: NSColor,
+        strokeWidth: CGFloat,
+        context: CGContext
+    ) {
+        let text = "\(number)"
+        // 连续粗细映射（2pt 起步=24pt，随无极滑杆线性平滑增至最高 34pt）
+        let diameter = (24 + min(max(strokeWidth - 2, 0), 8) * 1.25).rounded()
+        let radius = diameter / 2
 
-    /// 文字（text/sequence 共用；sequence 画成实心圆徽章）
-    ///
-    /// 徽章对比度（病例：白色/黄色徽章 + 白色数字 ⇒ 白底白字看不见）：
-    /// 按底色亮度选数字颜色（亮底黑字/暗底白字），并加一圈同色系描边，
-    /// 保证徽章在任意底色的截图上都能被看见。
-    private static func drawText(_ text: String, at anchor: CGPoint, color: NSColor, size: CGFloat? = nil, badge: Bool = false, context: CGContext, yDown: Bool) {
-        guard !text.isEmpty else { return }
-        let fontSize = size ?? (badge ? badgeFontSize : 14)
-        let font = NSFont.systemFont(ofSize: fontSize, weight: badge ? .semibold : .medium)
-        // 徽章底色亮度 → 数字颜色（0.299/0.587/0.114 加权亮度，阈值 0.6）
-        let components = color.usingColorSpace(.sRGB)
-        let luminance = badge
-            ? 0.299 * (components?.redComponent ?? 0)
-                + 0.587 * (components?.greenComponent ?? 0)
-                + 0.114 * (components?.blueComponent ?? 0)
-            : 0
-        let onLightFill = luminance > 0.6
+        let srgb = color.usingColorSpace(.sRGB) ?? color
+        let rComp = srgb.redComponent
+        let gComp = srgb.greenComponent
+        let bComp = srgb.blueComponent
+        let luminance = 0.299 * rComp + 0.587 * gComp + 0.114 * bComp
+        let isLightFill = luminance > 0.64
+        let isNearWhite = luminance > 0.90
+
+        // 外白环尺寸（在彩底与文字背景上形成利落呼吸隔离带）
+        let ringWidth: CGFloat = 1.75
+        let outerRect = CGRect(
+            x: anchor.x - radius - ringWidth,
+            y: anchor.y - radius - ringWidth,
+            width: (radius + ringWidth) * 2,
+            height: (radius + ringWidth) * 2
+        )
+        let innerRect = CGRect(
+            x: anchor.x - radius,
+            y: anchor.y - radius,
+            width: diameter,
+            height: diameter
+        )
+
+        // 1. 柔和悬浮投影 + 纯净外隔离环（CGContext 阴影 offset 在设备空间 Y-up，负 Y = 向下投射）
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: -1.5),
+            blur: 5.5,
+            color: NSColor.black.withAlphaComponent(0.24).cgColor
+        )
+        let ringColor = isNearWhite
+            ? NSColor(srgbRed: 0.92, green: 0.92, blue: 0.94, alpha: 1)
+            : NSColor.white.withAlphaComponent(0.96)
+        context.setFillColor(ringColor.cgColor)
+        context.fillEllipse(in: outerRect)
+        context.restoreGState()
+
+        // 外圈极细暗影发丝边（白底页面上让外白环轮廓依然干净利落）
+        context.saveGState()
+        context.setStrokeColor(NSColor.black.withAlphaComponent(isNearWhite ? 0.18 : 0.10).cgColor)
+        context.setLineWidth(0.5)
+        context.strokeEllipse(in: outerRect.insetBy(dx: 0.25, dy: 0.25))
+        context.restoreGState()
+
+        // 2. 徽章本体：细腻顶亮底深微渐变（比纯平红圆更有 Apple 立体光泽）
+        let topColor = NSColor(
+            srgbRed: min(1, rComp + (1 - rComp) * 0.14),
+            green: min(1, gComp + (1 - gComp) * 0.14),
+            blue: min(1, bComp + (1 - bComp) * 0.14),
+            alpha: 1
+        )
+        let bottomColor = NSColor(
+            srgbRed: max(0, rComp * 0.90),
+            green: max(0, gComp * 0.90),
+            blue: max(0, bComp * 0.90),
+            alpha: 1
+        )
+        context.saveGState()
+        context.addEllipse(in: innerRect)
+        context.clip()
+        if let space = CGColorSpace(name: CGColorSpace.sRGB),
+           let gradient = CGGradient(
+            colorsSpace: space,
+            colors: [topColor.cgColor, color.cgColor, bottomColor.cgColor] as CFArray,
+            locations: [0.0, 0.45, 1.0]
+           ) {
+            context.drawLinearGradient(
+                gradient,
+                start: CGPoint(x: anchor.x, y: innerRect.minY),
+                end: CGPoint(x: anchor.x, y: innerRect.maxY),
+                options: []
+            )
+        } else {
+            context.setFillColor(color.cgColor)
+            context.fillEllipse(in: innerRect)
+        }
+        // 细腻内圈高光边
+        context.setStrokeColor(NSColor.white.withAlphaComponent(isLightFill ? 0.35 : 0.22).cgColor)
+        context.setLineWidth(0.75)
+        context.strokeEllipse(in: innerRect.insetBy(dx: 0.375, dy: 0.375))
+        context.restoreGState()
+
+        // 3. SF Pro Rounded Bold 数字，按实际字形墨迹框（useGlyphPathBounds）精确光学居中
+        let baseFontSize = diameter * (text.count >= 2 ? 0.46 : 0.54)
+        let systemFont = NSFont.systemFont(ofSize: baseFontSize, weight: .bold)
+        let roundedFont: NSFont
+        if let desc = systemFont.fontDescriptor.withDesign(.rounded),
+           let f = NSFont(descriptor: desc, size: baseFontSize) {
+            roundedFont = f
+        } else {
+            roundedFont = systemFont
+        }
+        let textColor = isLightFill
+            ? NSColor(srgbRed: 28 / 255, green: 28 / 255, blue: 30 / 255, alpha: 1)
+            : NSColor.white
+
         let attributed = NSAttributedString(string: text, attributes: [
-            .font: font,
-            .foregroundColor: badge ? (onLightFill ? NSColor.black : NSColor.white) : color,
+            .font: roundedFont,
+            .foregroundColor: textColor,
         ])
         let line = CTLineCreateWithAttributedString(attributed)
-        let lineBounds = CTLineGetBoundsWithOptions(line, .useOpticalBounds)
+        let glyphBounds = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
 
-        var origin = anchor
-        if badge {
-            let radius = badgeRadius
-            let circle = CGRect(
-                x: anchor.x - radius, y: anchor.y - radius,
-                width: radius * 2, height: radius * 2
-            )
-            // 实心圆底
-            context.setFillColor(color.cgColor)
-            context.fillEllipse(in: circle)
-            // 描边圈：亮底加深色圈（白底截图上白徽章不可见的同源问题）
-            context.setStrokeColor((onLightFill ? NSColor.black : NSColor.white)
-                .withAlphaComponent(0.55).cgColor)
-            context.setLineWidth(1.5)
-            context.strokeEllipse(in: circle)
-            // 数字水平居中；垂直由下方 baseline 公式处理（Y-down 语义）
-            origin = CGPoint(
-                x: anchor.x - lineBounds.width / 2,
-                y: anchor.y
-            )
-        }
-        // CoreText 假设 Y-up 上下文；两种调用方都必须局部翻成 Y-up 画字：
-        // - yDown（编辑器画布，isFlipped）：上下文是 Y-down ⇒ 必须翻，不翻则字形倒置
-        //   且基线语义错乱（实拍病例：badge 数字完全没画进圆里，圆内白色像素≈0）
-        // - !yDown（导出 composite，标注层已整体翻成 Y-down 同一约定）⇒ 同样翻
-        // 基线取「anchor 向下半行高」（Y-down 语义），翻转后字形 [0, ascent] 恰好
-        // 以 anchor 为视觉中心。
         context.saveGState()
-        let baseline: CGFloat
-        if badge {
-            baseline = origin.y + lineBounds.height / 2 + font.descender
-        } else {
-            baseline = origin.y
+        if !isLightFill {
+            context.setShadow(
+                offset: CGSize(width: 0, height: -0.75),
+                blur: 1.2,
+                color: NSColor.black.withAlphaComponent(0.18).cgColor
+            )
         }
-        context.translateBy(x: origin.x, y: baseline)
+        // Y-down 上下文中局部翻为 Y-up 后，字形墨迹中心 (midX, midY) 严格落于 anchor
+        context.translateBy(x: anchor.x - glyphBounds.midX, y: anchor.y + glyphBounds.midY)
         context.scaleBy(x: 1, y: -1)
-        // ⚠️ 关键修复（用户两轮实报「序号乱序」的实锤根因）：CTLineDraw 会把已画
-        // 行的 advance 累加进 context 的 text matrix（tx += 行宽），而 text matrix
-        // 不属于 graphics state——saveGState/restoreGState 恢复不了它。同一帧里
-        // 画第 N 个文字标注时字形整体右漂 10.4pt × N：圆圈（纯路径）留在原地，
-        // 数字漂进相邻圆圈或空白处 ⇒ 用户看到「圆里没数字 / 数字乱序」。
-        // （像素实验：6 个同字段徽章顺序绘制，ink x 实测 60/126/200/267/341/411，
-        // textMatrix tx 每次 +10.42；置 identity 后 61/121/181/241/301/361 全对位。）
+        context.textMatrix = .identity
+        CTLineDraw(line, context)
+        context.restoreGState()
+    }
+
+    /// 普通文字标注绘制（Apple Markup 风格：semibold 清晰字重 + 克制自适应可读性微影，明暗截图皆利落）
+    private static func drawText(_ text: String, at anchor: CGPoint, color: NSColor, size: CGFloat? = nil, context: CGContext, yDown: Bool) {
+        guard !text.isEmpty else { return }
+        let fontSize = size ?? 14
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let srgb = color.usingColorSpace(.sRGB) ?? color
+        let luminance = 0.299 * srgb.redComponent + 0.587 * srgb.greenComponent + 0.114 * srgb.blueComponent
+        let isVeryDark = luminance < 0.22
+
+        let attributed = NSAttributedString(string: text, attributes: [
+            .font: font,
+            .foregroundColor: color,
+        ])
+        let line = CTLineCreateWithAttributedString(attributed)
+
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: isVeryDark ? 0 : -0.75),
+            blur: isVeryDark ? 2.5 : 2.2,
+            color: (isVeryDark
+                ? NSColor.white.withAlphaComponent(0.50)
+                : NSColor.black.withAlphaComponent(0.28)).cgColor
+        )
+        context.translateBy(x: anchor.x, y: anchor.y)
+        context.scaleBy(x: 1, y: -1)
         context.textMatrix = .identity
         CTLineDraw(line, context)
         context.restoreGState()
@@ -328,5 +418,358 @@ enum CGRenderer {
             x: min(r.minX, r.maxX), y: min(r.minY, r.maxY),
             width: abs(r.width), height: abs(r.height)
         )
+    }
+
+    // MARK: - 克制画框美化（Smart Backdrop：预览与导出统一渲染管线）
+
+    /// 快速采样图像四边主色（下采样到最大边 ≤ 128px 后沿四边各取 24 个内缩 1px 样本）
+    ///
+    /// - Returns: 边缘色彩较一致（≥ 55% 样本单通道平均偏差 ≤ 0.16）时返回中位主色，
+    ///   若边缘透明或色彩高度杂乱则返回 `nil`（调用方优雅回落，避免强行补色违和）。
+    static func detectEdgeColor(of image: CGImage) -> RGBAColor? {
+        guard image.width > 0, image.height > 0 else { return nil }
+
+        let maxSide: CGFloat = 128
+        let longest = CGFloat(max(image.width, image.height))
+        let downscale = min(1, maxSide / longest)
+        let bufW = max(1, Int((CGFloat(image.width) * downscale).rounded()))
+        let bufH = max(1, Int((CGFloat(image.height) * downscale).rounded()))
+        let bytesPerRow = bufW * 4
+        var pixels = [UInt8](repeating: 0, count: bufH * bytesPerRow)
+
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let drawn = pixels.withUnsafeMutableBytes { rawBuffer -> Bool in
+            guard let baseAddress = rawBuffer.baseAddress,
+                  let ctx = CGContext(
+                    data: baseAddress,
+                    width: bufW,
+                    height: bufH,
+                    bitsPerComponent: 8,
+                    bytesPerRow: bytesPerRow,
+                    space: colorSpace,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else { return false }
+            ctx.interpolationQuality = .low
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: bufW, height: bufH))
+            return true
+        }
+        guard drawn else { return nil }
+
+        let insetX = bufW > 2 ? 1 : 0
+        let insetY = bufH > 2 ? 1 : 0
+        let minX = insetX
+        let maxX = bufW - 1 - insetX
+        let minY = insetY
+        let maxY = bufH - 1 - insetY
+        let samplesPerEdge = 24
+
+        struct Sample {
+            let r: CGFloat
+            let g: CGFloat
+            let b: CGFloat
+        }
+
+        var samples: [Sample] = []
+        samples.reserveCapacity(samplesPerEdge * 4)
+
+        func appendSample(x rawX: Int, y rawY: Int) {
+            let x = min(bufW - 1, max(0, rawX))
+            let y = min(bufH - 1, max(0, rawY))
+            let offset = y * bytesPerRow + x * 4
+            let alphaByte = pixels[offset + 3]
+            guard alphaByte >= 16 else { return }
+            let alpha = CGFloat(alphaByte) / 255.0
+            let r = min(1, max(0, (CGFloat(pixels[offset]) / 255.0) / alpha))
+            let g = min(1, max(0, (CGFloat(pixels[offset + 1]) / 255.0) / alpha))
+            let b = min(1, max(0, (CGFloat(pixels[offset + 2]) / 255.0) / alpha))
+            samples.append(Sample(r: r, g: g, b: b))
+        }
+
+        for i in 0..<samplesPerEdge {
+            let t = (CGFloat(i) + 0.5) / CGFloat(samplesPerEdge)
+            let x = Int((CGFloat(minX) + t * CGFloat(maxX - minX)).rounded())
+            let y = Int((CGFloat(minY) + t * CGFloat(maxY - minY)).rounded())
+            appendSample(x: x, y: minY)
+            appendSample(x: x, y: maxY)
+            appendSample(x: minX, y: y)
+            appendSample(x: maxX, y: y)
+        }
+
+        guard samples.count >= 8 else { return nil }
+
+        func median(_ values: [CGFloat]) -> CGFloat {
+            let sorted = values.sorted()
+            let mid = sorted.count / 2
+            if sorted.count.isMultiple(of: 2) {
+                return (sorted[mid - 1] + sorted[mid]) * 0.5
+            }
+            return sorted[mid]
+        }
+
+        let medR = median(samples.map(\.r))
+        let medG = median(samples.map(\.g))
+        let medB = median(samples.map(\.b))
+
+        let threshold: CGFloat = 0.16
+        let matchingCount = samples.reduce(0) { count, sample in
+            let meanDelta = (abs(sample.r - medR) + abs(sample.g - medG) + abs(sample.b - medB)) / 3.0
+            return count + (meanDelta <= threshold ? 1 : 0)
+        }
+
+        guard CGFloat(matchingCount) / CGFloat(samples.count) >= 0.55 else { return nil }
+        return RGBAColor(red: medR, green: medG, blue: medB, alpha: 1)
+    }
+
+    /// 计算柔和克制的边缘主色均衡内衬（仅在开启 autoBalance 且检测到有效边缘主色时启用）
+    static func effectiveBalanceInset(
+        for style: BackdropStyle,
+        imagePointSize: CGSize,
+        edgeColor: RGBAColor?
+    ) -> CGFloat {
+        guard style.autoBalance, edgeColor != nil else { return 0 }
+        let shortSide = min(imagePointSize.width, imagePointSize.height)
+        guard shortSide > 0 else { return 0 }
+        return min(16, max(8, shortSide * 0.03)).rounded()
+    }
+
+    /// 绘制背景线性渐变（预览与导出共用；`startPoint`/`endPoint` 始终以视觉左上为 `(0,0)`、右下为 `(1,1)`）
+    static func drawBackdropBackground(
+        style: BackdropStyle,
+        in rect: CGRect,
+        context: CGContext,
+        contextIsYDown: Bool
+    ) {
+        guard !rect.isEmpty else { return }
+        let colors = style.preset.colors
+        guard !colors.isEmpty else { return }
+
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.clip(to: rect)
+
+        let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let cgColors = colors.map(\.cgColor)
+        if cgColors.count >= 2 {
+            let count = cgColors.count
+            let locations = (0..<count).map { CGFloat($0) / CGFloat(count - 1) }
+            if let gradient = CGGradient(
+                colorsSpace: space,
+                colors: cgColors as CFArray,
+                locations: locations
+            ) {
+                let startNorm = style.preset.startPoint
+                let endNorm = style.preset.endPoint
+                let start = CGPoint(
+                    x: rect.minX + startNorm.x * rect.width,
+                    y: contextIsYDown
+                        ? rect.minY + startNorm.y * rect.height
+                        : rect.maxY - startNorm.y * rect.height
+                )
+                let end = CGPoint(
+                    x: rect.minX + endNorm.x * rect.width,
+                    y: contextIsYDown
+                        ? rect.minY + endNorm.y * rect.height
+                        : rect.maxY - endNorm.y * rect.height
+                )
+                context.drawLinearGradient(
+                    gradient,
+                    start: start,
+                    end: end,
+                    options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+                )
+                return
+            }
+        }
+
+        context.setFillColor(cgColors[0])
+        context.fill(rect)
+    }
+
+    /// 绘制圆角卡片双层 Apple 风格柔和投影与均衡衬底（预览与导出共用）
+    ///
+    /// - Note: `CGBitmapContext`（`contextIsYDown == false`）的 `setShadow` 在设备空间 Y-up 上，
+    ///   需以负 `offset.height` 向下投影并按 CTM 缩放补偿；layer-backed flipped AppKit 视图
+    ///   （`contextIsYDown == true`）已带翻转后的 BaseCTM，正 `offset.height` 向下投影且按 pt 计。
+    static func drawBackdropCardChrome(
+        cardRect: CGRect,
+        cornerRadius: CGFloat,
+        isDarkBackdrop: Bool,
+        cushionColor: RGBAColor?,
+        context: CGContext,
+        contextIsYDown: Bool
+    ) {
+        guard cardRect.width > 0, cardRect.height > 0 else { return }
+        let clampedRadius = min(max(0, cornerRadius), min(cardRect.width, cardRect.height) * 0.5)
+        let cardPath = CGPath(
+            roundedRect: cardRect,
+            cornerWidth: clampedRadius,
+            cornerHeight: clampedRadius,
+            transform: nil
+        )
+
+        let ySign: CGFloat = contextIsYDown ? 1 : -1
+        let shadowScale: CGFloat = contextIsYDown
+            ? 1
+            : max(1, hypot(context.ctm.a, context.ctm.b))
+
+        let fillColor: CGColor
+        if let cushionColor {
+            fillColor = cushionColor.withAlpha(1).cgColor
+        } else if isDarkBackdrop {
+            fillColor = CGColor(srgbRed: 0.11, green: 0.12, blue: 0.14, alpha: 1)
+        } else {
+            fillColor = CGColor(srgbRed: 0.98, green: 0.98, blue: 0.99, alpha: 1)
+        }
+
+        // 1. 远层环境大柔影
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: ySign * 14 * shadowScale),
+            blur: 32 * shadowScale,
+            color: CGColor(srgbRed: 0, green: 0, blue: 0, alpha: isDarkBackdrop ? 0.48 : 0.14)
+        )
+        context.addPath(cardPath)
+        context.setFillColor(fillColor)
+        context.fillPath()
+        context.restoreGState()
+
+        // 2. 近层接触微影 + 干净不透明卡片衬底
+        context.saveGState()
+        context.setShadow(
+            offset: CGSize(width: 0, height: ySign * 3 * shadowScale),
+            blur: 8 * shadowScale,
+            color: CGColor(srgbRed: 0, green: 0, blue: 0, alpha: isDarkBackdrop ? 0.28 : 0.08)
+        )
+        context.addPath(cardPath)
+        context.setFillColor(fillColor)
+        context.fillPath()
+        context.restoreGState()
+    }
+
+    /// 绘制圆角卡片外沿内缩半线宽的 0.5pt 克制发丝描边（预览与导出共用）
+    static func drawBackdropCardHairline(
+        cardRect: CGRect,
+        cornerRadius: CGFloat,
+        isDarkBackdrop: Bool,
+        lineWidth: CGFloat,
+        context: CGContext
+    ) {
+        guard cardRect.width > 0, cardRect.height > 0, lineWidth > 0 else { return }
+        let inset = lineWidth * 0.5
+        let insetRect = cardRect.insetBy(dx: inset, dy: inset)
+        guard insetRect.width > 0, insetRect.height > 0 else { return }
+
+        let adjustedRadius = min(
+            max(0, cornerRadius - inset),
+            min(insetRect.width, insetRect.height) * 0.5
+        )
+        let path = CGPath(
+            roundedRect: insetRect,
+            cornerWidth: adjustedRadius,
+            cornerHeight: adjustedRadius,
+            transform: nil
+        )
+        let strokeColor = isDarkBackdrop
+            ? CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.14)
+            : CGColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.08)
+
+        context.saveGState()
+        context.addPath(path)
+        context.setStrokeColor(strokeColor)
+        context.setLineWidth(lineWidth)
+        context.strokePath()
+        context.restoreGState()
+    }
+
+    /// 导出合成：在截图外围渲染克制画框（渐变背景 + 双层柔影卡片 + 可选边缘主色均衡内衬 + 发丝描边）
+    static func renderWithBackdrop(
+        image: CGImage,
+        style: BackdropStyle,
+        scale: CGFloat,
+        precomputedEdgeColor: RGBAColor? = nil
+    ) -> CGImage {
+        guard style.enabled else { return image }
+
+        let safeScale = max(1, scale)
+        let imagePointSize = CGSize(
+            width: CGFloat(image.width) / safeScale,
+            height: CGFloat(image.height) / safeScale
+        )
+        let edgeColor = style.autoBalance ? (precomputedEdgeColor ?? detectEdgeColor(of: image)) : nil
+        let inset = effectiveBalanceInset(for: style, imagePointSize: imagePointSize, edgeColor: edgeColor)
+        let layout = style.layout(for: imagePointSize, balanceInset: inset)
+
+        let pxW = max(1, Int((layout.canvasSize.width * safeScale).rounded()))
+        let pxH = max(1, Int((layout.canvasSize.height * safeScale).rounded()))
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: pxW,
+            height: pxH,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return image }
+
+        let canvasW = layout.canvasSize.width
+        let canvasH = layout.canvasSize.height
+        func yUpRect(_ rect: CGRect) -> CGRect {
+            CGRect(x: rect.minX, y: canvasH - rect.maxY, width: rect.width, height: rect.height)
+        }
+
+        ctx.saveGState()
+        ctx.scaleBy(x: safeScale, y: safeScale)
+
+        let canvasRect = CGRect(x: 0, y: 0, width: canvasW, height: canvasH)
+        let cardRectYUp = yUpRect(layout.cardRect)
+        let imageRectYUp = yUpRect(layout.imageRect)
+        let isDark = style.preset.isDark
+
+        // 1. 铺满线性渐变背景
+        drawBackdropBackground(style: style, in: canvasRect, context: ctx, contextIsYDown: false)
+
+        // 2. 绘制圆角卡片双层柔影与均衡内衬底
+        drawBackdropCardChrome(
+            cardRect: cardRectYUp,
+            cornerRadius: layout.cornerRadius,
+            isDarkBackdrop: isDark,
+            cushionColor: inset > 0 ? edgeColor : nil,
+            context: ctx,
+            contextIsYDown: false
+        )
+
+        // 3. 圆角裁切 cardRect 并精确绘制原图到 imageRect
+        let cardPath = CGPath(
+            roundedRect: cardRectYUp,
+            cornerWidth: layout.cornerRadius,
+            cornerHeight: layout.cornerRadius,
+            transform: nil
+        )
+        ctx.saveGState()
+        ctx.addPath(cardPath)
+        ctx.clip()
+        let pxOriginX = imageRectYUp.minX * safeScale
+        let pxOriginY = imageRectYUp.minY * safeScale
+        let isPixelAligned = abs(pxOriginX - pxOriginX.rounded()) < 0.01
+            && abs(pxOriginY - pxOriginY.rounded()) < 0.01
+            && abs(imageRectYUp.width * safeScale - CGFloat(image.width)) < 0.5
+            && abs(imageRectYUp.height * safeScale - CGFloat(image.height)) < 0.5
+        ctx.interpolationQuality = isPixelAligned ? .none : .high
+        ctx.draw(image, in: imageRectYUp)
+        ctx.restoreGState()
+
+        // 4. 绘制 0.5pt 精致发丝描边
+        drawBackdropCardHairline(
+            cardRect: cardRectYUp,
+            cornerRadius: layout.cornerRadius,
+            isDarkBackdrop: isDark,
+            lineWidth: 0.5,
+            context: ctx
+        )
+
+        ctx.restoreGState()
+        return ctx.makeImage() ?? image
     }
 }

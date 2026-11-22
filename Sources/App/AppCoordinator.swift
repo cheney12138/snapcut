@@ -43,14 +43,26 @@ final class AppCoordinator {
         }
     }
 
-    /// 启动预激活（用户病例 2026-11-17 终报「重启后第一次必延迟、咔咔的」：
-    /// LSUIElement 从非激活态的首次 activate 需 ~750ms（无手势上下文被
-    /// 系统降级处理）——窗上屏后第一批鼠标事件漏给前台 App（TUI 选字 +
-    /// 框选乱跳）。终案：warmup 后**保持激活**不释放（启动瞬间的焦点抢夺
-    /// 由 restart.sh 语境消化）——此后每次唤起 activate 是「已激活 App 再
-    /// 激活」热路径，即时生效）
-    func releaseActivationAfterWarmup() {
-        Log.event(.app, "app.warmup.keptActive", ["active": "\(NSApp.isActive)"])
+    /// 启动静默预热（不抢焦点）：
+    /// 1. 已授权时预热 SCShareableContent XPC 连接（消除重启后首次 F1 115ms 冷启动开销）；
+    /// 2. 预建 OverlayController 与可复用 ToolbarPanel（消除首次框选松手时的工具栏冷构建卡顿）。
+    func warmupAfterLaunch() {
+        if overlayController == nil {
+            overlayController = OverlayController()
+        }
+        overlayController?.warmup()
+        if deps.permission.isGranted() {
+            Task.detached(priority: .utility) {
+                await SCKCapture.shared.warmup()
+            }
+        }
+        Log.event(.app, "app.warmup.ready", ["granted": "\(deps.permission.isGranted())"])
+        if settings.autoIndexHistoryOCR {
+            Task(priority: .background) { @MainActor [weak self] in
+                guard let self, self.settings.autoIndexHistoryOCR else { return }
+                HistoryStore.shared.backfillMissingOCRIfNeeded()
+            }
+        }
     }
 
     func start() {
@@ -61,11 +73,18 @@ final class AppCoordinator {
         syncPermissionMirror()
         settings = UserDefaultsSettingsStore().load()
         HistoryStore.shared.maxItems = max(1, settings.historyLimit)
+        HistoryStore.shared.textRecognizer = deps.textRecognizer
+        HistoryStore.shared.autoIndexOCREnabled = settings.autoIndexHistoryOCR
+        HistoryStore.shared.onItemsChanged = {
+            HistorySpotlightPanel.shared.reloadIfVisible()
+        }
         Log.event(.app, "settings.applied", [
             "afterCapture": settings.afterCapture.rawValue,
             "historyLimit": "\(settings.historyLimit)",
+            "autoIndexOCR": "\(settings.autoIndexHistoryOCR)",
             "hotkeyRegion": settings.hotkeyRegion,
             "hotkeyFullScreen": settings.hotkeyFullScreen,
+            "hotkeyHistorySpotlight": settings.hotkeyHistorySpotlight,
         ])
         scheduleSelfTestIfRequested()
         tray.setup(coordinator: self)
@@ -76,9 +95,17 @@ final class AppCoordinator {
         // 的 status item 被 ControlCenter 驱逐（assertion invalidated）时，AppKit
         // 走 sudden termination 路径自动终止 App。ProcessInfo 禁用后，即使 item
         // 被逐，App 持续运行，item 通常会被 CC 重新接纳（assertion 重建）。
+        // 禁止系统 App Nap / 定时合并：防止后台菜单栏 App 进入低功耗休眠后
+        // 延迟或堆积 Carbon 全局热键事件（解决「按好几次 F1 没反应、随后瞬间连发」病例）
+        keepAwakeActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "Global screenshot hotkeys require instant wakeup"
+        )
         ProcessInfo.processInfo.disableSuddenTermination()
         ProcessInfo.processInfo.disableAutomaticTermination("snapcut-menubar")
     }
+
+    private var keepAwakeActivity: NSObjectProtocol?
 
     /// 坑 33（启动即退·第三形态）：MenuBarExtra-only + LSUIElement 的 SwiftUI App，
     /// 在「无可见窗口」（权限已 granted、引导跳过）时 run loop 自动结束退出——
@@ -162,42 +189,63 @@ final class AppCoordinator {
             )
             guard let window = created else { return }
             self.onboardingWindow = window
-            window.showCentered(on: NSScreen.main ?? NSScreen.screens[0])
+            window.showCentered(on: DisplayRegistry.screenAtMouse() ?? NSScreen.main ?? NSScreen.screens[0])
             Log.event(.app, "onboarding.show", ["granted": "\(granted)"])
         }
     }
 
-    /// 按用户设置注册两个截图热键（解析失败回落默认 ⌘⇧A / ⌘⇧S）
-    /// 截图两键的热键 id（设置保存后重注册用——病例「改完不生效」：
+    /// 按用户设置注册截图与视觉记忆全局热键（解析失败回落默认 ⌘⇧A / ⌘⇧S / ⌥⌘V）
+    /// 热键 id（设置保存后重注册用——病例「改完不生效」：
     /// 注册只在启动，改键要重启才生效）
     private var regionHotKeyID: UInt32?
     /// 兜底热键只注册一次（rebind 重跑 registerCaptureHotkeys 时防 -9878 重复）
     private var everRegisteredFallbacks = false
     private var fullHotKeyID: UInt32?
+    private var historySpotlightHotKeyID: UInt32?
+
+    /// 设置保存后立即重建工具栏（工具栏大小档位 / 按钮排序即时生效，无需重启）
+    func invalidateToolbar() {
+        overlayController?.invalidateToolbar()
+    }
 
     /// 设置保存后重绑定（SettingsWindowController.persist 回灌时调）
     func rebindCaptureHotkeys() {
         hotkeyCenter.unregister(regionHotKeyID)
         hotkeyCenter.unregister(fullHotKeyID)
+        hotkeyCenter.unregister(historySpotlightHotKeyID)
         regionHotKeyID = nil
         fullHotKeyID = nil
+        historySpotlightHotKeyID = nil
         registerCaptureHotkeys()
+
+        HistoryStore.shared.maxItems = max(1, settings.historyLimit)
+        HistoryStore.shared.autoIndexOCREnabled = settings.autoIndexHistoryOCR
+        if settings.autoIndexHistoryOCR {
+            HistoryStore.shared.backfillMissingOCRIfNeeded()
+        }
+
         Log.event(.hotkey, "hotkey.rebind", [
-            "region": settings.hotkeyRegion, "full": settings.hotkeyFullScreen,
+            "region": settings.hotkeyRegion,
+            "full": settings.hotkeyFullScreen,
+            "spotlight": settings.hotkeyHistorySpotlight,
         ])
     }
 
     private func registerCaptureHotkeys() {
         let region = HotkeySpec.parse(settings.hotkeyRegion) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_A), modifiers: [.command, .shift])
         let full = HotkeySpec.parse(settings.hotkeyFullScreen) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_S), modifiers: [.command, .shift])
+        let spotlight = HotkeySpec.parse(settings.hotkeyHistorySpotlight) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_V), modifiers: [.option, .command])
         regionHotKeyID = hotkeyCenter.register(keyCode: region.keyCode, modifiers: region.modifiers) { [weak self] in
             self?.beginRegionCapture()
         }
         fullHotKeyID = hotkeyCenter.register(keyCode: full.keyCode, modifiers: full.modifiers) { [weak self] in
             self?.beginFullScreenCapture()
         }
-        // ⚠️ 兜底三键（⌥⌘H/⌃⌥D/⌥⌘,）只注册一次——rebind 不会走这里
-        guard regionHotKeyID == nil || !everRegisteredFallbacks else { return }
+        historySpotlightHotKeyID = hotkeyCenter.register(keyCode: spotlight.keyCode, modifiers: spotlight.modifiers) { [weak self] in
+            self?.toggleHistorySpotlight()
+        }
+        // ⚠️ 兜底热键（⌥⌘H / ⌃⌥D / ⌥⌘, / ⌥⌘P）只注册一次——rebind 不会走这里
+        guard !everRegisteredFallbacks else { return }
         everRegisteredFallbacks = true
         // 兜底可达性（菜单栏满时图标会被系统隐藏，实测连最小 App 也不显示）：
         // ⌥⌘H 在光标处弹出完整菜单，⌥⌘, 直接开设置
@@ -215,6 +263,12 @@ final class AppCoordinator {
         ) {
             Log.event(.hotkey, "hotkey.settings", ["key": "opt-cmd-comma"])
             SettingsWindowController.shared.show(store: UserDefaultsSettingsStore())
+        }
+        // 贴图 Boss Key（一键隐藏/恢复全部贴图）：⌥⌘P
+        deps.hotkeys.register(
+            keyCode: UInt32(kVK_ANSI_P), modifiers: [.option, .command]
+        ) { [weak self] in
+            self?.toggleAllPinsVisibility()
         }
     }
 
@@ -282,6 +336,12 @@ final class AppCoordinator {
     }
 
     func beginRegionCapture() {
+        if state == .overlay {
+            // 已在选区态时再次按 F1：若光标移到了另一块屏则直接切换屏幕重开，
+            // 若在同屏则立刻提至最前并刷新十字准星与放大镜，绝不静默丢弃让用户以为卡死
+            overlayController?.refocusOrSwitchScreenForCapture()
+            return
+        }
         guard state == .idle else {
             Log.event(.app, "capture.ignored", ["state": state.rawValue])
             return
@@ -302,12 +362,9 @@ final class AppCoordinator {
                 } else {
                     self.exporter.copyToClipboard(image)
                     // 复制反馈（设置可关）：右下角 toast，不抢焦点。
-                    // 点击 toast → 打开截图继续编辑（用户功能 2026-11-17）
-                    if self.settings.showCopyNotification {
-                        CaptureToast.show(image: image, onClick: { [weak self] in
-                            self?.reopenEditor(image: image)
-                        })
-                    }
+                    // 点击 toast → 恢复干净底图 + 矢量标注继续重编
+                    let snapshot = self.overlayController?.lastExportSnapshot
+                    self.showCopyToast(image: image, snapshot: snapshot)
                 }
             case .save(let image):
                 self.state = .exporting
@@ -323,21 +380,168 @@ final class AppCoordinator {
         }
     }
 
-    /// toast 点击重开编辑（复用 overlay 生命周期,回车/导出走同一 completion 链）
-    private func reopenEditor(image: CGImage) {
+    /// 呼出或收起视觉记忆库 Spotlight 搜索面板（⌥⌘V / 托盘入口共用）
+    func toggleHistorySpotlight() {
+        if HistorySpotlightPanel.shared.isVisible {
+            HistorySpotlightPanel.shared.dismiss()
+            return
+        }
+        guard state == .idle else {
+            Log.event(.history, "history.spotlight.ignored", ["state": state.rawValue])
+            return
+        }
+        let callbacks = HistorySpotlightPanel.Callbacks(
+            loadRecords: {
+                HistoryStore.shared.records()
+            },
+            loadThumbnail: { record, maxSize in
+                HistoryStore.shared.thumbnail(
+                    forRecordID: record.id,
+                    pixelSize: CGSize(width: record.width, height: record.height),
+                    maxSize: maxSize
+                )
+            },
+            onCopyImage: { [weak self] record in
+                guard let self else { return }
+                let copied = HistoryStore.shared.copyToPasteboard(id: record.id)
+                guard copied else {
+                    CaptureToast.show(message: "无法读取历史截图", status: .warn)
+                    return
+                }
+                guard self.settings.showCopyNotification else { return }
+                if let fullImage = HistoryStore.shared.loadFullImage(for: record.id) {
+                    let recordID = record.id
+                    CaptureToast.show(image: fullImage, onClick: { [weak self] in
+                        guard let self else { return }
+                        if let editable = HistoryStore.shared.loadEditableSession(for: recordID) {
+                            self.reopenEditor(
+                                image: editable.baseImage,
+                                initialAnnotations: editable.payload.annotations,
+                                savedCanvasSize: editable.payload.canvasSize
+                            )
+                        } else {
+                            self.reopenEditor(image: fullImage)
+                        }
+                    })
+                } else {
+                    CaptureToast.show(message: "已复制到剪贴板", status: .ok)
+                }
+            },
+            onReopenEdit: { [weak self] record in
+                guard let self else { return }
+                if let editable = HistoryStore.shared.loadEditableSession(for: record.id) {
+                    self.reopenEditor(
+                        image: editable.baseImage,
+                        initialAnnotations: editable.payload.annotations,
+                        savedCanvasSize: editable.payload.canvasSize
+                    )
+                } else if let fullImage = HistoryStore.shared.loadFullImage(for: record.id) {
+                    self.reopenEditor(image: fullImage)
+                } else {
+                    CaptureToast.show(message: "无法读取历史截图", status: .warn)
+                }
+            },
+            onPin: { [weak self] record in
+                guard let self else { return }
+                guard let img = HistoryStore.shared.loadFullImage(for: record.id) else {
+                    CaptureToast.show(message: "无法读取历史截图", status: .warn)
+                    return
+                }
+                let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })
+                    ?? NSScreen.main ?? NSScreen.screens.first
+                guard let screen else { return }
+                let visible = screen.visibleFrame
+                let backing = max(1, screen.backingScaleFactor)
+                let logicalW = max(1, CGFloat(img.width) / backing)
+                let logicalH = max(1, CGFloat(img.height) / backing)
+                let fit = min(1.0, min((visible.width * 0.75) / logicalW, (visible.height * 0.75) / logicalH))
+                let w = max(1, (logicalW * fit).rounded())
+                let h = max(1, (logicalH * fit).rounded())
+                let rect = CGRect(
+                    x: (visible.midX - w / 2).rounded(),
+                    y: (visible.midY - h / 2).rounded(),
+                    width: w,
+                    height: h
+                )
+                self.deps.pinning.pin(img, atGlobalRect: rect)
+            },
+            onCopyOCRText: { [weak self] record in
+                guard let self else { return }
+                if !record.ocrText.isEmpty {
+                    self.deps.clipboard.writeText(record.ocrText)
+                    CaptureToast.show(message: "已复制识别文字")
+                } else {
+                    CaptureToast.show(message: "该截图暂无可复制文字", status: .warn)
+                }
+            }
+        )
+        HistorySpotlightPanel.shared.toggle(callbacks: callbacks)
+    }
+
+    /// 全局隐藏/恢复全部贴图（Boss Key ⌥⌘P / 托盘入口共用）
+    func toggleAllPinsVisibility() {
+        guard PinWindowController.hasLivePins else {
+            Log.event(.pin, "pin.bossKey.noop")
+            return
+        }
+        let hidden = PinWindowController.toggleAllVisibility()
+        CaptureToast.show(message: hidden ? "已隐藏全部贴图（再按 ⌥⌘P 唤回）" : "已恢复全部贴图")
+    }
+
+    private func showCopyToast(image: CGImage, snapshot: EditableExportSnapshot?) {
+        guard settings.showCopyNotification else { return }
+        CaptureToast.show(image: image, onClick: { [weak self] in
+            if let snapshot, !snapshot.annotations.isEmpty {
+                self?.reopenEditor(
+                    image: snapshot.baseImage,
+                    initialAnnotations: snapshot.annotations,
+                    savedCanvasSize: snapshot.canvasSize
+                )
+            } else {
+                self?.reopenEditor(image: image)
+            }
+        })
+    }
+
+    /// 外源图 / 拼贴合成图统一无边框标注编辑器入口（复用 overlay + Liquid Glass 工具栏）
+    func openStandaloneEditor(
+        image: CGImage,
+        preferredScreen: NSScreen? = nil,
+        preferredRect: CGRect? = nil
+    ) {
+        reopenEditor(image: image, preferredScreen: preferredScreen, preferredRect: preferredRect)
+    }
+
+    /// toast 点击重开编辑 / 历史重编 / 拼贴合并编辑（复用 overlay 生命周期，回车/导出走同一 completion 链）
+    private func reopenEditor(
+        image: CGImage,
+        initialAnnotations: [AnnotationModel]? = nil,
+        savedCanvasSize: CGSize? = nil,
+        preferredScreen: NSScreen? = nil,
+        preferredRect: CGRect? = nil
+    ) {
+        guard state == .idle else {
+            Log.event(.app, "toast.reopen.ignored", ["state": state.rawValue])
+            return
+        }
+        state = .confirm
         if overlayController == nil {
             overlayController = OverlayController()
         }
-        overlayController?.openEditor(image: image, completion: { [weak self] result in
+        overlayController?.openEditor(
+            image: image,
+            initialAnnotations: initialAnnotations,
+            savedCanvasSize: savedCanvasSize,
+            preferredScreen: preferredScreen,
+            preferredRect: preferredRect,
+            completion: { [weak self] result in
             guard let self else { return }
             switch result {
             case .copy(let img):
+                self.state = .exporting
                 self.exporter.copyToClipboard(img)
-                if self.settings.showCopyNotification {
-                    CaptureToast.show(image: img, onClick: { [weak self] in
-                        self?.reopenEditor(image: img)
-                    })
-                }
+                let snapshot = self.overlayController?.lastExportSnapshot
+                self.showCopyToast(image: img, snapshot: snapshot)
             case .save(let img):
                 self.state = .exporting
                 self.exporter.savePanel(img)
@@ -388,6 +592,8 @@ final class AppCoordinator {
             case .copy(let image):
                 self.state = .exporting
                 self.exporter.copyToClipboard(image)
+                let snapshot = self.overlayController?.lastExportSnapshot
+                self.showCopyToast(image: image, snapshot: snapshot)
             case .save(let image):
                 self.state = .exporting
                 self.exporter.savePanel(image)

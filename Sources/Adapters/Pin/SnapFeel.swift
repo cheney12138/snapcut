@@ -1,126 +1,246 @@
 import AppKit
+import CoreGraphics
 import QuartzCore
 
-/// 磁吸手感（任务 B「再做顺滑一点」）：落位缓动 + 分离阻力 + 重吸防抖。
-///
-/// 参数（用户裁定 + 实现推演，全部集中在此便于实机调参）：
-/// - 落位缓动 100ms ease-out（80–120ms 带中值）：吸附「啪嗒」变「嗒~」
-/// - 分离回滑 100ms ease-out：46px 硬阈值断开不再瞬间跳回
-/// - 阻力带 24px：release 46 前 24px 区间跟随比 1:1 → 0.6:1 线性渐变
-/// - 重吸防抖 200ms：刚分离后 200ms 内同伙伴同边不再吸附（防抖动）
+/// 松手吸附动效参数 + 视觉预览叠层 + 松手滑入动画器（零拖中阻力 / 零死区）。
 enum SnapFeel {
-    /// 吸附落位缓动时长（80–120ms 带中值）
-    static let landingDuration: TimeInterval = 0.10
-    /// 分离回滑缓动时长（消除硬跳回）
-    static let releaseDuration: TimeInterval = 0.10
-    /// 分离阻力带宽度（乐高化 2026-11-16：24 → 10——轻拉即开）
-    static let resistBand: CGFloat = 10
-    /// 阻力带末端跟随比（0.85:1——衰减感保留但不钉死）
-    static let maxFollowRatio: CGFloat = 0.85
-    /// 分离后同伙伴同边重吸防抖窗口
-    static let resnapDebounce: TimeInterval = 0.2
-
-    /// 分离阻力位移量（CGSize）：吸附态拖出方向与吸附边相反时，位置从全钉死
-    /// 渐变为 0.6:1 跟随（线性 ramp 0 → 0.6，跨 24px 阻力带）。
-    /// - Parameters:
-    ///   - candidate: 自由位置外框（外框空间）
-    ///   - outcome: 当前吸附结果（贴合位外框）
-    static func resistOffset(candidate: CGRect, outcome: MagnetSnapOutcome) -> CGSize {
-        let snap = outcome.frame
-        let alongX: Bool
-        // d = 沿吸附边法线的带符号拖出距离（正 = 远离贴合点）
-        let d: CGFloat
-        switch outcome.edge {
-        case .right:  alongX = true;  d = candidate.maxX - snap.maxX // 移动盒贴对方右侧，拖出 = 向右拉
-        case .left:   alongX = true;  d = candidate.minX - snap.minX
-        case .top:    alongX = false; d = candidate.maxY - snap.maxY // 全局 Y-up，「上」= maxY 侧
-        case .bottom: alongX = false; d = candidate.minY - snap.minY
-        }
-        let pull = abs(d)
-        let zoneStart = MagnetGroup.releaseDistance - resistBand
-        guard pull > zoneStart else { return .zero }
-        let progress = min((pull - zoneStart) / resistBand, 1)
-        let ratio = maxFollowRatio * progress   // 0 → 0.6 渐变
-        let offset = (pull - zoneStart) * ratio * (d < 0 ? -1 : 1)
-        return alongX ? CGSize(width: offset, height: 0) : CGSize(width: 0, height: offset)
-    }
+    /// 松手后滑入贴合位的缓动时长（160ms strong ease-out，顺滑利落）
+    static let glideDuration: TimeInterval = 0.16
+    /// 视觉预览叠层淡入/淡出时长
+    static let previewFadeIn: TimeInterval = 0.10
+    static let previewFadeOut: TimeInterval = 0.09
 }
 
-/// 分离后重吸防抖：刚分离（snapped → free）后 resnapDebounce 窗口内，
-/// 同伙伴同边的吸附判定作废（防「分离→回弹→再吸」抖动循环）。
-struct SnapResnapGuard {
-    private var lastRelease: (partnerID: String, edge: MagnetEdge, at: TimeInterval)?
+/// 拖动期纯视觉吸附预览叠层（绝不篡改卡片位置、绝不拦截鼠标事件）：
+/// - 鬼影落位框（浅强调蓝半透填充 + 1.5pt 圆角线）
+/// - 12pt 缝隙居中轻引导线
+/// - 软对齐参考线（仅当触发上/下/左/右/中线软对齐时显示，类似 Keynote / 桌面智能参考线）
+@MainActor
+final class SnapPreviewOverlay {
+    static let shared = SnapPreviewOverlay()
 
-    /// 分离瞬间记录（在 dragMoved 的无吸附分支调用）
-    mutating func noteRelease(partnerID: String, edge: MagnetEdge, now: TimeInterval) {
-        lastRelease = (partnerID, edge, now)
-    }
+    private let panel: NSPanel
+    private let previewView: SnapPreviewView
+    private var visible = false
+    private var hideToken = 0
 
-    /// 吸附判定结果是否应作废（同伙伴同边 + 窗口期内）
-    mutating func shouldSuppress(partnerID: String, edge: MagnetEdge, now: TimeInterval) -> Bool {
-        if let last = lastRelease,
-           last.partnerID == partnerID, last.edge == edge,
-           now - last.at < SnapFeel.resnapDebounce {
-            return true
-        }
-        lastRelease = nil   // 窗口外/不同边 → 记录作废
-        return false
-    }
-}
-
-/// 吸附落位/分离缓动器：主线程逐帧拖动模型下的轻量插值。
-///
-/// - 进入吸附（或吸附目标/边变化）：从上一渲染位 ease-out 滑向贴合位（landingDuration）
-/// - 分离（吸附帧 → 自由帧）：从上一渲染位 ease-out 回滑到自由位（releaseDuration），
-///   消除 46px 磁滞断开瞬间的硬跳回
-/// - 稳态吸附帧 / 稳态自由帧：1:1 硬跟随（无滞后；缓动只在状态切换时介入）
-struct SnapEaser {
-    private var animFrom: CGPoint?
-    private var animT0: TimeInterval = 0
-    private var animDuration: TimeInterval = SnapFeel.landingDuration
-    private var lastRendered: CGPoint?
-    private var wasSnapped = false
-
-    /// 吸附帧：target = 本帧贴合位渲染目标（含阻力位移）；newSnap = 吸附刚建立或目标/边变化
-    mutating func snapFrame(target: CGPoint, newSnap: Bool, now: TimeInterval) -> CGPoint {
-        if newSnap, let last = lastRendered {
-            animFrom = last
-            animT0 = now
-            animDuration = SnapFeel.landingDuration
-        }
-        wasSnapped = true
-        return glide(to: target, now: now)
-    }
-
-    /// 自由帧：target = 本帧自由跟随位；吸附→分离的过渡帧自动启动回滑缓动
-    mutating func freeFrame(target: CGPoint, now: TimeInterval) -> CGPoint {
-        let released = wasSnapped
-        wasSnapped = false
-        if released, let last = lastRendered {
-            animFrom = last
-            animT0 = now
-            animDuration = SnapFeel.releaseDuration
-        }
-        return glide(to: target, now: now)
-    }
-
-    private mutating func glide(to target: CGPoint, now: TimeInterval) -> CGPoint {
-        guard let from = animFrom else {
-            lastRendered = target
-            return target
-        }
-        let p = (now - animT0) / animDuration
-        guard p < 1 else {
-            animFrom = nil
-            lastRendered = target
-            return target
-        }
-        let eased = 1 - pow(1 - p, 3)   // ease-out cubic
-        let rendered = CGPoint(
-            x: from.x + (target.x - from.x) * eased,
-            y: from.y + (target.y - from.y) * eased
+    private init() {
+        let p = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
         )
-        lastRendered = rendered
-        return rendered
+        p.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 2)
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        p.hasShadow = false
+        p.ignoresMouseEvents = true
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.isReleasedWhenClosed = false
+        let v = SnapPreviewView(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        p.contentView = v
+        self.panel = p
+        self.previewView = v
+    }
+
+    func show(outcome: MagnetSnapOutcome) {
+        hideToken += 1
+        var boundsRect = outcome.frame
+        boundsRect = include(line: outcome.seamGuide, in: boundsRect)
+        if let align = outcome.alignGuide {
+            boundsRect = include(line: align, in: boundsRect)
+        }
+        let panelFrame = boundsRect.insetBy(dx: -24, dy: -24).integral
+        panel.setFrame(panelFrame, display: false)
+        previewView.frame = NSRect(origin: .zero, size: panelFrame.size)
+        previewView.panelOrigin = panelFrame.origin
+        previewView.outcome = outcome
+        previewView.needsDisplay = true
+
+        if !visible {
+            visible = true
+            panel.alphaValue = 0
+            panel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = SnapFeel.previewFadeIn
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                panel.animator().alphaValue = 1
+            }
+        } else {
+            panel.orderFrontRegardless()
+            if panel.alphaValue < 0.99 {
+                panel.alphaValue = 1
+            }
+        }
+    }
+
+    func hide(immediate: Bool = false) {
+        guard visible || panel.isVisible else { return }
+        visible = false
+        hideToken += 1
+        let token = hideToken
+        if immediate || DesignTokens.Motion.reduceMotion {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = SnapFeel.previewFadeOut
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            self.panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, self.hideToken == token, !self.visible else { return }
+                self.panel.orderOut(nil)
+                self.panel.alphaValue = 1
+            }
+        })
+    }
+
+    private func include(line: MagnetGuideLine, in rect: CGRect) -> CGRect {
+        let minX = min(line.start.x, line.end.x)
+        let maxX = max(line.start.x, line.end.x)
+        let minY = min(line.start.y, line.end.y)
+        let maxY = max(line.start.y, line.end.y)
+        return rect.union(CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY)))
+    }
+}
+
+@MainActor
+private final class SnapPreviewView: NSView {
+    var panelOrigin: CGPoint = .zero
+    var outcome: MagnetSnapOutcome?
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let outcome, let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // 全局 Y-up 转本视图本地 Y-up（默认 NSView 即 Y-up，直接减去 panelOrigin）
+        func localRect(_ r: CGRect) -> CGRect {
+            r.offsetBy(dx: -panelOrigin.x, dy: -panelOrigin.y)
+        }
+        func localPoint(_ p: CGPoint) -> CGPoint {
+            CGPoint(x: p.x - panelOrigin.x, y: p.y - panelOrigin.y)
+        }
+
+        // 1. 鬼影落位框（浅蓝半透底 + 1.5pt 圆角高亮框）
+        let ghost = localRect(outcome.frame)
+        let r = PinContentView.cornerRadius
+        let ghostPath = CGPath(roundedRect: ghost.insetBy(dx: 0.75, dy: 0.75), cornerWidth: r, cornerHeight: r, transform: nil)
+        ctx.saveGState()
+        ctx.addPath(ghostPath)
+        ctx.setFillColor(DesignTokens.accent.withAlphaComponent(0.09).cgColor)
+        ctx.fillPath()
+        ctx.addPath(ghostPath)
+        ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.62).cgColor)
+        ctx.setLineWidth(1.5)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // 2. 贴合缝隙轻引导线（12pt 缝隙居中）
+        let seamStart = localPoint(outcome.seamGuide.start)
+        let seamEnd = localPoint(outcome.seamGuide.end)
+        if hypot(seamEnd.x - seamStart.x, seamEnd.y - seamStart.y) >= 8 {
+            ctx.saveGState()
+            ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.36).cgColor)
+            ctx.setLineWidth(1.0)
+            ctx.setLineCap(.round)
+            ctx.move(to: seamStart)
+            ctx.addLine(to: seamEnd)
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+
+        // 3. 软对齐参考线（仅当触发上/下/左/右/中线软对齐时显示，清晰克制）
+        if let align = outcome.alignGuide {
+            let a = localPoint(align.start)
+            let b = localPoint(align.end)
+            ctx.saveGState()
+            ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.86).cgColor)
+            ctx.setLineWidth(1.0)
+            ctx.setLineCap(.round)
+            ctx.move(to: a)
+            ctx.addLine(to: b)
+            ctx.strokePath()
+
+            // 两端 3pt 小刻度锚点（Apple Keynote 智能参考线质感）
+            let isHorizontal = abs(a.y - b.y) < 0.5
+            let tick: CGFloat = 2.5
+            ctx.setLineWidth(1.0)
+            for pt in [a, b] {
+                if isHorizontal {
+                    ctx.move(to: CGPoint(x: pt.x, y: pt.y - tick))
+                    ctx.addLine(to: CGPoint(x: pt.x, y: pt.y + tick))
+                } else {
+                    ctx.move(to: CGPoint(x: pt.x - tick, y: pt.y))
+                    ctx.addLine(to: CGPoint(x: pt.x + tick, y: pt.y))
+                }
+            }
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+    }
+}
+
+/// 松手落位滑入动画器：在 ~160ms 内将一组贴图从当前位置按 strong ease-out 顺滑过渡到目标位置，
+/// 同步驱动回调刷新磨砂托盘位置，确保整组与单卡视觉零跳变。
+@MainActor
+final class SnapGlideAnimator {
+    static let shared = SnapGlideAnimator()
+
+    private var timer: Timer?
+    private var token = 0
+
+    private init() {}
+
+    func cancel() {
+        token += 1
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func glide(
+        items: [(pin: PinWindowController, from: CGPoint, to: CGPoint)],
+        duration: TimeInterval = SnapFeel.glideDuration,
+        onStep: @escaping @MainActor () -> Void,
+        onComplete: @escaping @MainActor () -> Void
+    ) {
+        cancel()
+        let maxShift = items.reduce(CGFloat(0)) { acc, item in
+            max(acc, hypot(item.to.x - item.from.x, item.to.y - item.from.y))
+        }
+        if maxShift < 0.5 || DesignTokens.Motion.reduceMotion {
+            for item in items { item.pin.setFrameOrigin(item.to) }
+            onStep()
+            onComplete()
+            return
+        }
+
+        let myToken = token
+        let start = CACurrentMediaTime()
+        let stepTimer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.token == myToken else { return }
+                let raw = (CACurrentMediaTime() - start) / duration
+                if raw >= 1.0 {
+                    self.timer?.invalidate()
+                    self.timer = nil
+                    for item in items { item.pin.setFrameOrigin(item.to) }
+                    onStep()
+                    onComplete()
+                    return
+                }
+                // Strong ease-out quartic（近似 cubic-bezier(0.23, 1, 0.32, 1)）
+                let eased = 1.0 - pow(1.0 - raw, 4.0)
+                for item in items {
+                    let x = item.from.x + (item.to.x - item.from.x) * eased
+                    let y = item.from.y + (item.to.y - item.from.y) * eased
+                    item.pin.setFrameOrigin(CGPoint(x: x, y: y))
+                }
+                onStep()
+            }
+        }
+        RunLoop.main.add(stepTimer, forMode: .common)
+        timer = stepTimer
     }
 }

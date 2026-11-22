@@ -4,10 +4,10 @@ import CoreGraphics
 /// 贴图（Pin）控制器：每张贴图一个实例，静态数组持有防提前释放，关闭时移除。
 /// 入口：PinWindowController.pin(_:atGlobalRect:on:)，多张贴图互不影响（各自 scale/alpha/窗口）。
 ///
-/// 拖动模型（设计定稿 §1.1，弃 performDrag 裁决）：AppKit performDrag 的内部
-/// 事件循环让视图收不到 mouseDragged → 磁吸无从计算。普通拖 / ⌘组拖 / ⌥拆组拖
-/// 统一手动 setFrameOrigin（主线程逐帧，模式来源：已验证的 beginOptionDrag），
-/// 拖动中 MagnetEngine 实时吸附预览，mouseUp 提交 union。
+/// 拖动与拼贴模型（用户裁定 2026-11-20）：
+/// - 直接拖单卡 = 1:1 丝滑自由移动（零中途阻力/死区）；若单卡原属某拼贴组，拖远（>44pt）松手自动自然脱离，拖在附近松手保持同组微调；
+/// - 靠近其他贴图进入吸附区 = 仅展示视觉预览（鬼影落位框 + 软对齐参考线），松手后顺滑滑入贴合位成组；
+/// - 拖顶部悬浮栏 / 磨砂玻璃托盘 / ⌘+拖 = 整组刚体移动。
 @MainActor
 final class PinWindowController {
     // MARK: - 常量
@@ -16,73 +16,67 @@ final class PinWindowController {
     static let maxScale: CGFloat = 5.0   // 500%
     static let minAlpha: CGFloat = 0.2   // 20%
     static let maxAlpha: CGFloat = 1.0   // 100%
-    static let zoomSensitivity: CGFloat = 0.1    // 每单位 deltaY 的缩放步进
-    static let alphaSensitivity: CGFloat = 0.05  // 每单位 deltaY 的透明度步进
+    static let zoomSensitivity: CGFloat = 0.1
+    static let alphaSensitivity: CGFloat = 0.05
     static let hudFadeDelay: Duration = .seconds(1)
     static let hudFadeDuration: TimeInterval = 0.25
-
-    /// 成组视觉（§1.3）：8pt 白垫 + 1px 描边 = 窗体每侧外扩 9pt；圆角 10 在视图绘制
-    static let groupPad: CGFloat = 8
-    static let groupBorder: CGFloat = 1
-    static var groupPadTotal: CGFloat { groupPad + groupBorder }
 
     private static let logCategory: LogCategory = .pin
 
     // MARK: - 存活贴图注册
 
-    /// 控制器持有的静态数组：窗口关闭前实例不会被 ARC 回收（防提前释放）
     private static var live: [PinWindowController] = []
     static var livePins: [PinWindowController] { live }
+    private(set) static var areAllPinsHidden = false
+    static var hasLivePins: Bool { !live.isEmpty }
 
     // MARK: - 状态
 
     let image: CGImage
-    /// 100% 时的全局 frame（points，AppKit 全局坐标 Y-up）
+    /// 100% 时的全局 frame（points，AppKit 全局坐标 Y-up，严格保持原图宽高比）
     private let baseRect: CGRect
+    /// 原生 1:1 像素清晰度对应的 scale（普通截图 ≈ 1.0；长图初始缩放到屏高时 > 1.0）
+    private let nativeScaleFactor: CGFloat
+    /// 动态最大缩放倍数：超长滚动图可平滑放大到原生清晰度，同时不越过 WindowServer 安全位图上限
+    private let effectiveMaxScale: CGFloat
     private let window: PinWindow
     let contentView: PinContentView
     private(set) var scale: CGFloat = 1
     private var alpha: CGFloat = 1
     private var hudHideTask: Task<Void, Never>?
 
-    /// 成组视觉标志（白垫/描边由视图绘制；窗体 frame 外扩 9pt，setInGroup 驱动）
+    /// 是否处于某个拼贴组内（视觉归属由底层统一磨砂玻璃托盘承担，本窗尺寸零跳变）
     private(set) var inGroup = false
 
     var windowFrame: CGRect { window.frame }
 
-    /// 成组/未成组下的外框换算：inset=true 时未成组窗体外扩 9pt（虚拟外框空间）
-    func windowFrame(insetByGroupPad inset: Bool) -> CGRect {
-        guard inset, !inGroup else { return window.frame }
-        return window.frame.insetBy(dx: -Self.groupPadTotal, dy: -Self.groupPadTotal)
-    }
-
-    // MARK: - 手动拖动状态（磁吸）
+    // MARK: - 手动拖动状态
 
     private struct DragState {
         /// 光标相对窗口左上角（视觉）的偏移；拖动中保持不变
         var grabOffset: CGPoint
         var originalFrame: CGRect
         var groupDrag: Bool
-        /// ⌥拖 = 拆组拖（按下即脱离所在组）
-        var detach: Bool
-        /// 当前吸附预览（mouseUp 提交 union）
-        var snapped: (partner: PinWindowController, edge: MagnetEdge)?
-        /// ⌘组拖的成员起始 frame（外框空间 = 窗体 frame，成员皆已成组）
+        /// ⌥ 强拆快捷修饰键（兼容老习惯；不按 ⌥ 拖远也会自动脱离）
+        var forceDetach: Bool
+        var pendingForceDetach: Bool = false
+        /// 当前松手吸附预览（拖动中仅画视觉预览，不劫持卡片位置；mouseUp 滑入提交）
+        var snapOutcome: MagnetSnapOutcome?
+        var snapPartner: PinWindowController?
+        /// ⌘ 组拖的成员起始 frame
         var members: [(pin: PinWindowController, startFrame: CGRect)]
-        /// ⌥拆组延迟提交（真实拖动 >3pt 才算，防 ⌥单击误拆）
-        var pendingDetach: Bool = false
-        /// 磁吸手感（任务 B）：落位/分离缓动器 + 重吸防抖（每次拖动新建 → 自动重置）
-        var easer = SnapEaser()
-        var resnap = SnapResnapGuard()
+        /// 单卡直拖出组预览标志（避免频繁重复刷新 alpha）
+        var detachingPreview: Bool = false
     }
 
     private var drag: DragState?
 
     // MARK: - 入口
 
-    /// 贴一张图：窗口 frame = rect（全局 points），图像 1:1 绘制。
-    /// rect 应满足 rect.size × screen.backingScaleFactor == image 像素尺寸，保证像素精确。
     static func pin(_ image: CGImage, atGlobalRect rect: CGRect, on screen: NSScreen) {
+        if areAllPinsHidden {
+            _ = toggleAllVisibility()
+        }
         let controller = PinWindowController(image: image, atGlobalRect: rect, on: screen)
         live.append(controller)
         controller.showWindow()
@@ -97,12 +91,80 @@ final class PinWindowController {
         ])
     }
 
+    /// 全局一键隐藏/唤回所有贴图及拼贴组托盘/顶栏（Boss Key），完整保留位置、缩放、透明度与分组状态。
+    @discardableResult
+    static func toggleAllVisibility() -> Bool {
+        guard !live.isEmpty else {
+            areAllPinsHidden = false
+            return false
+        }
+        if !areAllPinsHidden {
+            areAllPinsHidden = true
+            SnapPreviewOverlay.shared.hide(immediate: true)
+            PinMagnetRegistry.shared.setAllGroupPanelsHidden(true)
+            for controller in live {
+                controller.window.orderOut(nil)
+            }
+        } else {
+            areAllPinsHidden = false
+            PinMagnetRegistry.shared.setAllGroupPanelsHidden(false)
+            for controller in live {
+                controller.window.orderFrontRegardless()
+            }
+            PinMagnetRegistry.shared.bringBorderPanelsToFront()
+        }
+        Log.event(logCategory, "pin.bossKey", [
+            "hidden": "\(areAllPinsHidden)",
+            "count": "\(live.count)",
+        ])
+        return areAllPinsHidden
+    }
+
+    private static func aspectSafeRect(for image: CGImage, requested rect: CGRect, on screen: NSScreen) -> CGRect {
+        let imgW = max(1, CGFloat(image.width))
+        let imgH = max(1, CGFloat(image.height))
+        let imgAspect = imgW / imgH
+        let backing = max(1, screen.backingScaleFactor)
+        let visible = screen.visibleFrame
+
+        let rectValid = rect.width >= 20 && rect.height >= 20
+        let aspectMatches = rectValid && abs((rect.width / rect.height) - imgAspect) <= 0.04
+        let fitsComfortably = rectValid
+            && rect.width <= visible.width * 0.95
+            && rect.height <= visible.height * 0.95
+
+        if aspectMatches && fitsComfortably {
+            return rect
+        }
+
+        let logicalW = imgW / backing
+        let logicalH = imgH / backing
+        let maxW = visible.width * 0.82
+        let maxH = visible.height * 0.82
+        let fit = min(1.0, min(maxW / logicalW, maxH / logicalH))
+        let w = max(60, (logicalW * fit).rounded())
+        let h = max(60, (logicalH * fit).rounded())
+
+        let center = rectValid ? CGPoint(x: rect.midX, y: rect.midY) : CGPoint(x: visible.midX, y: visible.midY)
+        let x = min(max(center.x - w / 2, visible.minX + 12), visible.maxX - w - 12)
+        let y = min(max(center.y - h / 2, visible.minY + 12), visible.maxY - h - 12)
+        return CGRect(x: x.rounded(), y: y.rounded(), width: w, height: h)
+    }
+
     private init(image: CGImage, atGlobalRect rect: CGRect, on screen: NSScreen) {
         self.image = image
-        self.baseRect = rect
+        let safeRect = Self.aspectSafeRect(for: image, requested: rect, on: screen)
+        self.baseRect = safeRect
+        let backing = max(1, screen.backingScaleFactor)
+        let nativeLogicalW = CGFloat(image.width) / backing
+        let nativeFactor = max(1.0, nativeLogicalW / max(1, safeRect.width))
+        let maxSafeDimPt = min(7200.0, 14400.0 / backing)
+        let maxScaleByBacking = maxSafeDimPt / max(1, max(safeRect.width, safeRect.height))
+        self.nativeScaleFactor = min(nativeFactor, maxScaleByBacking)
+        self.effectiveMaxScale = max(1.0, min(max(Self.maxScale, nativeFactor * 2.5), maxScaleByBacking))
 
         let win = PinWindow(
-            contentRect: rect,
+            contentRect: safeRect,
             styleMask: .borderless,
             backing: .buffered,
             defer: false,
@@ -113,87 +175,65 @@ final class PinWindowController {
         win.backgroundColor = .clear
         win.hasShadow = true
         win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        win.isReleasedWhenClosed = false // 生命周期由静态数组管理，不走 close() 自动释放
+        win.isReleasedWhenClosed = false
 
-        let content = PinContentView(frame: NSRect(origin: .zero, size: rect.size))
+        let content = PinContentView(frame: NSRect(origin: .zero, size: safeRect.size))
         self.window = win
         self.contentView = content
         content.controller = self
         win.contentView = content
-        win.initialFirstResponder = content // Esc keyDown 走视图响应链
+        win.initialFirstResponder = content
     }
 
     private func showWindow() {
         window.makeKeyAndOrderFront(nil)
     }
 
-    // MARK: - 成组视觉（PinMagnetRegistry 驱动）
+    // MARK: - 成组标志（窗体尺寸零跳变；统一磨砂玻璃托盘由 PinMagnetRegistry 维护）
 
-    /// 成组：窗体外扩 9pt（白垫 8 + 描边 1）；摘组：收回。
-    /// 图像始终画在内缩 9pt 的矩形里 ⇒ 成组/摘组图像全局位置零跳变。
     func setInGroup(_ value: Bool) {
         guard inGroup != value else { return }
         inGroup = value
-        let pad = Self.groupPadTotal
-        let frame = window.frame
-        let next = value
-            ? frame.insetBy(dx: -pad, dy: -pad)
-            : frame.insetBy(dx: pad, dy: pad)
-        window.setFrame(next, display: true)
         contentView.needsDisplay = true
     }
 
-    /// 组拖/框拖用：显式落位（registry 直接驱动成员窗体）
+    /// 组拖/滑入动画用：显式落位
     func setFrameOrigin(_ origin: CGPoint) {
         window.setFrameOrigin(origin)
     }
 
-    // MARK: - 手动拖动 + 磁吸
+    // MARK: - 手动拖动（1:1 自由跟随 + 纯视觉预览 + 松手滑入）
 
-    /// mouseDown：记录 grabOffset（照抄原 ⌥拖模式）。
-    /// ⌘按下 = 组刚体拖（所在组全体，含吸附）；⌥按下 = 拆组拖。
     func beginDrag(groupDrag: Bool, detach: Bool = false) {
+        SnapGlideAnimator.shared.cancel()
         let frame = window.frame
         let mouse = NSEvent.mouseLocation
         var state = DragState(
             grabOffset: CGPoint(x: mouse.x - frame.minX, y: frame.maxY - mouse.y),
             originalFrame: frame,
             groupDrag: groupDrag && PinMagnetRegistry.shared.groupID(for: self) != nil,
-            detach: detach,
-            snapped: nil,
+            forceDetach: detach,
+            snapOutcome: nil,
+            snapPartner: nil,
             members: []
         )
-        // reviewer 补丁：detach 不在按下时立即执行——⌥+单击（无拖动）不该拆组；
-        // 延迟到 dragMoved 首帧（超过 3pt 才算真拖动）再提交
         if detach {
-            state.pendingDetach = true
+            state.pendingForceDetach = true
         }
         if state.groupDrag {
             let members = PinMagnetRegistry.shared.groupMembers(of: self)
             state.members = members.map { ($0, $0.windowFrame) }
         }
         drag = state
+        NSApp.activate()
         window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(contentView)
     }
 
-    /// mouseDragged：新 frame = 光标 - grabOffset → MagnetEngine 吸附预览 → 落位。
-    /// - Parameter candidateOrigin: 显式候选原点（--selftest-magnet 用；nil = 跟随光标）
+    /// mouseDragged：1:1 自由落位 + 视觉吸附预览（绝不在拖动中锁死或劫持窗口位置）
     func dragMoved(candidateOrigin explicit: CGPoint? = nil) {
         guard var state = drag else { return }
         let frame = window.frame
-        // ⌥ 拆组首帧提交：位移超过 3pt 才算真拖动（⌥单击不拆组）
-        if state.pendingDetach {
-            let moved = hypot(
-                frame.minX - state.originalFrame.minX,
-                frame.minY - state.originalFrame.minY
-            )
-            if moved > 3 {
-                state.pendingDetach = false
-                state.detach = true
-                PinMagnetRegistry.shared.detach(self)
-                showHUD("已移出拼贴组")
-            }
-        }
         let origin: CGPoint
         if let explicit {
             origin = explicit
@@ -205,70 +245,56 @@ final class PinWindowController {
             )
         }
 
+        if state.pendingForceDetach {
+            let moved = hypot(origin.x - state.originalFrame.minX, origin.y - state.originalFrame.minY)
+            if moved > 3 {
+                state.pendingForceDetach = false
+                state.forceDetach = true
+                PinMagnetRegistry.shared.detach(self)
+                showHUD("已移出拼贴组")
+            }
+        }
+
         if state.groupDrag {
             dragGroupMoved(state: &state, selfOrigin: origin)
         } else {
             dragSoloMoved(state: &state, origin: origin)
         }
+        drag = state
     }
 
-    /// 单卡拖（含组内单卡重排）：移动盒 = 本卡外框。
-    /// 磁吸手感（任务 B）：落位 ease-out 缓动 + 分离阻力 + 重吸防抖（SnapFeel）。
-    /// 性能推演：snapCandidates O(n) + snap O(4n)，n≤10 时每帧 ≈40 个矩形运算，
-    /// 主线程逐帧无压力，无需节流/空间分桶（>10 再议）。
+    /// 单卡自由拖动：严格 1:1 跟随光标；进入吸附区时仅显示鬼影落位框与软对齐参考线
     private func dragSoloMoved(state: inout DragState, origin: CGPoint) {
         let candidate = CGRect(origin: origin, size: window.frame.size)
-        let padTotal = inGroup ? 0 : Self.groupPadTotal
-        let candidateOuter = candidate.insetBy(dx: -padTotal, dy: -padTotal)
+        window.setFrameOrigin(origin)
+
         let others = PinMagnetRegistry.shared.snapCandidates(
             excluding: [self],
-            ignoreGroupOf: state.detach ? self : nil
+            ignoreGroupOf: state.forceDetach ? self : nil
         )
-        let active = state.snapped.map { (PinMagnetRegistry.id(of: $0.partner), $0.edge) }
-        let now = CACurrentMediaTime()
+        let outcome = MagnetGroup.previewSnap(candidate: candidate, others: others)
+        updateSnapPreview(state: &state, outcome: outcome)
 
-        guard let outcome = MagnetGroup.snap(candidate: candidateOuter, others: others, active: active),
-              // 重吸防抖：刚分离 200ms 内同伙伴同边不重吸
-              !state.resnap.shouldSuppress(partnerID: outcome.partnerID, edge: outcome.edge, now: now)
-        else {
-            if let snapped = state.snapped {
-                Log.event(Self.logCategory, "collage.magnet.release", [:])
-                snapped.partner.contentView.setSnapGlow(false)
-                state.resnap.noteRelease(
-                    partnerID: PinMagnetRegistry.id(of: snapped.partner),
-                    edge: snapped.edge,
-                    now: now
-                )
-                state.snapped = nil
-                drag = state
-                contentView.setSnapGlow(false)
-                showHUD("已分离")
+        // 若单卡原本在拼贴组内：拖近同伴时托盘随动，拉远超过脱离阈值时托盘柔和变淡提示「松手即移出」
+        if let gid = PinMagnetRegistry.shared.groupID(for: self) {
+            let siblingFrames = PinMagnetRegistry.shared.groupMembers(of: self)
+                .filter { $0 !== self }
+                .map(\.windowFrame)
+            let isPullingAway = outcome == nil
+                && MagnetGroup.shouldDetach(cardFrame: candidate, otherFrames: siblingFrames)
+            if isPullingAway != state.detachingPreview {
+                state.detachingPreview = isPullingAway
+                PinMagnetRegistry.shared.setDetachingPreview(groupID: gid, isDetaching: isPullingAway)
             }
-            let rendered = state.easer.freeFrame(target: candidate.origin, now: now)
-            window.setFrameOrigin(rendered)
-            PinMagnetRegistry.shared.notifyLayoutChanged(self)
-            return
+            if !isPullingAway {
+                PinMagnetRegistry.shared.refreshLayout(groupID: gid)
+            } else if siblingFrames.count >= 2 {
+                PinMagnetRegistry.shared.refreshLayout(groupID: gid, excluding: self)
+            }
         }
-
-        let total = CGSize(
-            width: outcome.frame.minX - candidateOuter.minX,
-            height: outcome.frame.minY - candidateOuter.minY
-        )
-        // 分离阻力：拖出方向与吸附边相反时，跟随比从 1:1 渐变到 0.6:1
-        let resist = SnapFeel.resistOffset(candidate: candidateOuter, outcome: outcome)
-        let target = candidate.origin.offsetBy(total).offsetBy(resist)
-        let partner = PinMagnetRegistry.shared.pin(byID: outcome.partnerID)
-        let isNewSnap = state.snapped.map {
-            $0.partner !== partner || $0.edge != outcome.edge
-        } ?? true
-        let rendered = state.easer.snapFrame(target: target, newSnap: isNewSnap, now: now)
-        window.setFrameOrigin(rendered)
-        applySnapPreview(state: &state, outcome: outcome)
-        PinMagnetRegistry.shared.notifyLayoutChanged(self)
     }
 
-    /// ⌘组拖：所在组 union rect 整体平移（外框空间），吸附判定 = 整组包围盒。
-    /// 磁吸手感同单卡拖（SnapFeel：落位缓动 + 分离阻力 + 重吸防抖）。
+    /// ⌘ 组刚体拖动：整组 1:1 平移 + 外围吸附预览
     private func dragGroupMoved(state: inout DragState, selfOrigin: CGPoint) {
         guard !state.members.isEmpty else {
             dragSoloMoved(state: &state, origin: selfOrigin)
@@ -278,52 +304,14 @@ final class PinWindowController {
             width: selfOrigin.x - state.originalFrame.minX,
             height: selfOrigin.y - state.originalFrame.minY
         )
-        let startUnion = MagnetGroup.unionRect(state.members.map { $0.startFrame })
+        moveMembers(state, delta: selfDelta)
+
+        let startUnion = MagnetGroup.unionRect(state.members.map(\.startFrame))
         let candidate = startUnion.offsetBy(dx: selfDelta.width, dy: selfDelta.height)
-        let others = PinMagnetRegistry.shared.snapCandidates(excluding: state.members.map { $0.pin })
-        let active = state.snapped.map { (PinMagnetRegistry.id(of: $0.partner), $0.edge) }
-        let now = CACurrentMediaTime()
+        let others = PinMagnetRegistry.shared.snapCandidates(excluding: state.members.map(\.pin))
+        let outcome = MagnetGroup.previewSnap(candidate: candidate, others: others)
+        updateSnapPreview(state: &state, outcome: outcome)
 
-        guard let outcome = MagnetGroup.snap(candidate: candidate, others: others, active: active),
-              !state.resnap.shouldSuppress(partnerID: outcome.partnerID, edge: outcome.edge, now: now)
-        else {
-            if let snapped = state.snapped {
-                Log.event(Self.logCategory, "collage.magnet.release", [:])
-                snapped.partner.contentView.setSnapGlow(false)
-                state.resnap.noteRelease(
-                    partnerID: PinMagnetRegistry.id(of: snapped.partner),
-                    edge: snapped.edge,
-                    now: now
-                )
-                state.snapped = nil
-                drag = state
-                showHUD("已分离")
-            }
-            let rendered = state.easer.freeFrame(target: candidate.origin, now: now)
-            moveMembers(state, delta: CGSize(
-                width: rendered.x - startUnion.origin.x,
-                height: rendered.y - startUnion.origin.y
-            ))
-            PinMagnetRegistry.shared.notifyLayoutChanged(self)
-            return
-        }
-
-        // 分离阻力 + 落位缓动：union 空间算出渲染目标，成员按渲染 delta 落位
-        let resist = SnapFeel.resistOffset(candidate: candidate, outcome: outcome)
-        let target = candidate.origin.offsetBy(CGSize(
-            width: outcome.frame.minX - candidate.minX,
-            height: outcome.frame.minY - candidate.minY
-        )).offsetBy(resist)
-        let partner = PinMagnetRegistry.shared.pin(byID: outcome.partnerID)
-        let isNewSnap = state.snapped.map {
-            $0.partner !== partner || $0.edge != outcome.edge
-        } ?? true
-        let rendered = state.easer.snapFrame(target: target, newSnap: isNewSnap, now: now)
-        moveMembers(state, delta: CGSize(
-            width: rendered.x - startUnion.origin.x,
-            height: rendered.y - startUnion.origin.y
-        ))
-        applySnapPreview(state: &state, outcome: outcome)
         PinMagnetRegistry.shared.notifyLayoutChanged(self)
     }
 
@@ -333,34 +321,109 @@ final class PinWindowController {
         }
     }
 
-    /// 吸附预览反馈：目标卡发光 + 移动卡描边高亮（union 不提交，等 mouseUp）
-    private func applySnapPreview(state: inout DragState, outcome: MagnetSnapOutcome) {
-        let partner = PinMagnetRegistry.shared.pin(byID: outcome.partnerID)
-        if state.snapped?.partner !== partner || state.snapped?.edge != outcome.edge {
-            state.snapped?.partner.contentView.setSnapGlow(false)
-            partner?.contentView.setSnapGlow(true)
-            contentView.setSnapGlow(true)
-            showHUD("已吸附 · 松手成组")
+    /// 纯视觉预览更新：鬼影框 + 软对齐参考线 + 对方轻柔边框提示（零卡片位移）
+    private func updateSnapPreview(state: inout DragState, outcome: MagnetSnapOutcome?) {
+        guard let outcome,
+              let partner = PinMagnetRegistry.shared.pin(byID: outcome.partnerID)
+        else {
+            if let oldPartner = state.snapPartner {
+                oldPartner.contentView.setSnapGlow(false)
+            }
+            if state.snapOutcome != nil {
+                SnapPreviewOverlay.shared.hide()
+            }
+            state.snapOutcome = nil
+            state.snapPartner = nil
+            return
         }
-        state.snapped = partner.map { ($0, outcome.edge) }
-        drag = state
+
+        if state.snapPartner !== partner {
+            state.snapPartner?.contentView.setSnapGlow(false)
+            partner.contentView.setSnapGlow(true)
+        }
+        state.snapOutcome = outcome
+        state.snapPartner = partner
+        SnapPreviewOverlay.shared.show(outcome: outcome)
     }
 
-    /// mouseUp：吸附生效 → UnionGroup（collage.magnet.snap）；否则保持落位
+    /// mouseUp：
+    /// - 若有吸附预览 → 顺滑滑入落位（~160ms）并提交成组 / 组内重排；
+    /// - 若无预览且单卡被拉离原组 >44pt → 自然移出拼贴组；
+    /// - 若仍在组附近自由微调 → 保持同组，磨砂玻璃托盘贴合新布局。
     func endDrag() {
         guard let state = drag else { return }
         drag = nil
-        state.snapped?.partner.contentView.setSnapGlow(false)
+
+        SnapPreviewOverlay.shared.hide()
+        state.snapPartner?.contentView.setSnapGlow(false)
         contentView.setSnapGlow(false)
-        if let snap = state.snapped {
+
+        if let gid = PinMagnetRegistry.shared.groupID(for: self), state.detachingPreview {
+            PinMagnetRegistry.shared.setDetachingPreview(groupID: gid, isDetaching: false)
+        }
+
+        if let outcome = state.snapOutcome, let partner = state.snapPartner,
+           Self.live.contains(where: { $0 === partner }) {
             Log.event(Self.logCategory, "collage.magnet.snap", [
-                "edge": snap.edge.rawValue,
-                "partner": PinMagnetRegistry.id(of: snap.partner),
+                "edge": outcome.edge.rawValue,
+                "align": outcome.alignKind?.rawValue ?? "free",
+                "partner": PinMagnetRegistry.id(of: partner),
                 "groupDrag": "\(state.groupDrag)",
             ])
-            PinMagnetRegistry.shared.union(self, snap.partner)
+
+            let glideItems: [(pin: PinWindowController, from: CGPoint, to: CGPoint)]
+            if state.groupDrag && !state.members.isEmpty {
+                let currentUnion = MagnetGroup.unionRect(state.members.map { $0.pin.windowFrame })
+                let delta = CGSize(
+                    width: outcome.frame.minX - currentUnion.minX,
+                    height: outcome.frame.minY - currentUnion.minY
+                )
+                glideItems = state.members.map { member in
+                    let cur = member.pin.windowFrame.origin
+                    return (member.pin, cur, cur.offsetBy(delta))
+                }
+            } else {
+                glideItems = [(self, window.frame.origin, outcome.frame.origin)]
+            }
+
+            let isGroupDrag = state.groupDrag
+            SnapGlideAnimator.shared.glide(
+                items: glideItems,
+                onStep: { [weak self] in
+                    guard let self else { return }
+                    if let gid = PinMagnetRegistry.shared.groupID(for: self) {
+                        PinMagnetRegistry.shared.refreshLayout(groupID: gid)
+                    }
+                },
+                onComplete: { [weak self, weak partner] in
+                    guard let self, let partner,
+                          Self.live.contains(where: { $0 === self }),
+                          Self.live.contains(where: { $0 === partner })
+                    else { return }
+                    // 单卡直拖跨越到另一张孤立卡/另一组时，先从原组自然剥离，再与新伙伴成组（避免误合并整组）
+                    if !isGroupDrag,
+                       let myGID = PinMagnetRegistry.shared.groupID(for: self),
+                       PinMagnetRegistry.shared.groupID(for: partner) != myGID {
+                        PinMagnetRegistry.shared.detach(self)
+                    }
+                    PinMagnetRegistry.shared.union(self, partner)
+                }
+            )
+            return
         }
-        if state.groupDrag, let gid = PinMagnetRegistry.shared.groupID(for: self) {
+
+        // 无吸附预览：单卡若已拖离原组足够远，松手即自然脱离；否则留在原组刷新托盘
+        if !state.groupDrag, let gid = PinMagnetRegistry.shared.groupID(for: self) {
+            let siblingFrames = PinMagnetRegistry.shared.groupMembers(of: self)
+                .filter { $0 !== self }
+                .map(\.windowFrame)
+            if MagnetGroup.shouldDetach(cardFrame: window.frame, otherFrames: siblingFrames) {
+                PinMagnetRegistry.shared.detach(self)
+                showHUD("已移出拼贴组")
+            } else {
+                PinMagnetRegistry.shared.refreshLayout(groupID: gid)
+            }
+        } else if state.groupDrag, let gid = PinMagnetRegistry.shared.groupID(for: self) {
             PinMagnetRegistry.shared.refreshLayout(groupID: gid)
         }
     }
@@ -368,23 +431,33 @@ final class PinWindowController {
     // MARK: - 缩放（滚轮 / 双击复位，光标锚点）
 
     func handleScroll(_ event: NSEvent, anchor: CGPoint) {
+        guard event.momentumPhase.isEmpty else { return }
         let deltaY = event.scrollingDeltaY
         guard deltaY != 0 else { return }
         if event.modifierFlags.contains(.option) {
-            let newAlpha = min(max(alpha + deltaY * Self.alphaSensitivity, Self.minAlpha), Self.maxAlpha)
+            let step = event.hasPreciseScrollingDeltas ? deltaY * 0.004 : deltaY * Self.alphaSensitivity
+            let newAlpha = min(max(alpha + step, Self.minAlpha), Self.maxAlpha)
             guard newAlpha != alpha else { return }
             alpha = newAlpha
             window.alphaValue = alpha
             showHUD("α \(Int(round(alpha * 100)))%")
             Log.event(Self.logCategory, "pin.alpha", ["alpha": "\(Int(round(alpha * 100)))"])
         } else {
-            applyZoom(factor: 1 + deltaY * Self.zoomSensitivity, anchor: anchor)
+            let factor: CGFloat
+            if event.hasPreciseScrollingDeltas {
+                let clamped = min(max(deltaY, -40), 40)
+                factor = pow(1.008, clamped)
+            } else {
+                let clamped = min(max(deltaY, -5), 5)
+                factor = pow(1.12, clamped)
+            }
+            applyZoom(factor: factor, anchor: anchor)
         }
     }
 
-    /// factor 缩放（自动夹取 10%–500%），锚点 viewPoint 为视图内坐标（Y-down）
     func applyZoom(factor: CGFloat, anchor viewPoint: CGPoint) {
-        let newScale = min(max(scale * factor, Self.minScale), Self.maxScale)
+        guard factor > 0 else { return }
+        let newScale = min(max(scale * factor, Self.minScale), effectiveMaxScale)
         guard abs(newScale - scale) > 0.0001 else { return }
         reframe(scale: newScale, anchor: viewPoint)
         scale = newScale
@@ -394,7 +467,20 @@ final class PinWindowController {
         PinMagnetRegistry.shared.notifyLayoutChanged(self)
     }
 
-    /// 双击 / 菜单复位到 100%
+    func toggleDoubleClickZoom(anchor: CGPoint) {
+        if nativeScaleFactor > 1.25 && abs(scale - 1.0) < 0.08 {
+            let target = min(nativeScaleFactor, effectiveMaxScale)
+            reframe(scale: target, anchor: anchor)
+            scale = target
+            contentView.needsDisplay = true
+            showHUD("1:1")
+            Log.event(Self.logCategory, "pin.zoom", ["scale": "\(Int(round(scale * 100)))", "mode": "native"])
+            PinMagnetRegistry.shared.notifyLayoutChanged(self)
+        } else {
+            resetZoom(anchor: anchor)
+        }
+    }
+
     func resetZoom(anchor: CGPoint) {
         guard abs(scale - 1) > 0.0001 else { return }
         reframe(scale: 1, anchor: anchor)
@@ -405,57 +491,101 @@ final class PinWindowController {
         PinMagnetRegistry.shared.notifyLayoutChanged(self)
     }
 
-    /// 核心锚点数学：缩放前后光标下的图像点保持不动。
-    /// 锚点 q（100% 图像坐标）= v / scale；新视图坐标 v' = q × newScale；
-    /// 平移窗口使 v' 落在原光标全局位置上（全局 Y-up ↔ 视图 Y-down 换算见内）。
-    /// 成组时窗体比图像每侧多 9pt 垫：锚点/落位全部按图像矩形计算，垫保持 9pt 不缩放。
     private func reframe(scale newScale: CGFloat, anchor viewPoint: CGPoint) {
         guard let win = contentView.window,
               scale > 0, baseRect.width > 0, baseRect.height > 0 else { return }
-        let pad = inGroup ? Self.groupPadTotal : 0
         let v = viewPoint
 
-        // 锚点在 100% 图像里的坐标（图像相对窗体内缩 pad）
-        let anchorInBaseX = (v.x - pad) / scale
-        let anchorInBaseY = (v.y - pad) / scale
+        let anchorInBaseX = v.x / scale
+        let anchorInBaseY = v.y / scale
 
         let frame = win.frame
-        // 光标全局位置（Y-up）：窗口左上角 + (v.x, -v.y)
         let cursorGlobalX = frame.minX + v.x
         let cursorGlobalY = frame.maxY - v.y
 
         let imgWidth = baseRect.width * newScale
         let imgHeight = baseRect.height * newScale
-        // 新图像矩形左上角（全局，Y-up）：锚点新视图坐标反向推
         let imgLeft = cursorGlobalX - anchorInBaseX * newScale
         let imgTop = cursorGlobalY + anchorInBaseY * newScale
         win.setFrame(
             CGRect(
-                x: imgLeft - pad,
-                y: imgTop - pad - imgHeight,
-                width: imgWidth + pad * 2,
-                height: imgHeight + pad * 2
+                x: imgLeft,
+                y: imgTop - imgHeight,
+                width: imgWidth,
+                height: imgHeight
             ),
             display: true
         )
     }
 
+    // MARK: - 重叠对比透明度（50% ↔ 100%）
+
+    var isCompareOpacityActive: Bool { abs(alpha - 0.5) < 0.04 }
+
+    func toggleCompareOpacity() {
+        if isCompareOpacityActive {
+            setOpacity(1.0, hudText: "100%", animated: true)
+        } else {
+            setOpacity(0.5, hudText: "对比 50%", animated: true)
+        }
+        Log.event(Self.logCategory, "pin.compareOpacity", ["alpha": String(format: "%.2f", alpha)])
+    }
+
+    func resetOpacity() {
+        let needsChange = abs(alpha - 1.0) > 0.001
+        setOpacity(1.0, hudText: "100%", animated: needsChange)
+        if needsChange {
+            Log.event(Self.logCategory, "pin.compareOpacity", ["alpha": String(format: "%.2f", alpha)])
+        }
+    }
+
+    private func setOpacity(_ targetAlpha: CGFloat, hudText: String, animated: Bool) {
+        let clamped = min(max(targetAlpha, Self.minAlpha), Self.maxAlpha)
+        alpha = clamped
+        if animated && !DesignTokens.Motion.reduceMotion {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.14
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                window.animator().alphaValue = clamped
+            }
+        } else {
+            window.alphaValue = clamped
+        }
+        showHUD(hudText)
+    }
+
     // MARK: - 右键菜单动作
 
     func copyImageToPasteboard() {
-        let ok = ClipboardWriter.writeImage(image) // 复用 Clipboard 模块：PNG+TIFF 双格式
+        let ok = ClipboardWriter.writeImage(image)
         Log.event(Self.logCategory, "pin.copy", ["ok": "\(ok)"])
     }
 
-    // MARK: - 自测钩子（--selftest-magnet：不注入真实事件，显式驱动拖动状态机）
+    func ungroupCurrentGroup() {
+        guard let gid = PinMagnetRegistry.shared.groupID(for: self) else { return }
+        PinMagnetRegistry.shared.dissolveGroup(groupID: gid)
+    }
 
-    /// 吸附预览是否生效（selftest 断言用）
-    var selfTestSnapped: Bool { drag?.snapped != nil }
+    func closeCurrentGroup() {
+        if let gid = PinMagnetRegistry.shared.groupID(for: self) {
+            PinMagnetRegistry.shared.closeGroup(groupID: gid)
+        } else {
+            close()
+        }
+    }
+
+    // MARK: - 自测钩子
+
+    var selfTestSnapped: Bool { drag?.snapOutcome != nil }
 
     // MARK: - 关闭
 
     func close() {
-        drag = nil
+        if drag != nil {
+            SnapPreviewOverlay.shared.hide(immediate: true)
+            drag?.snapPartner?.contentView.setSnapGlow(false)
+            drag = nil
+        }
         hudHideTask?.cancel()
         hudHideTask = nil
         window.orderOut(nil)
@@ -466,11 +596,13 @@ final class PinWindowController {
 
     private static func remove(_ controller: PinWindowController) {
         live.removeAll { $0 === controller }
+        if live.isEmpty {
+            areAllPinsHidden = false
+        }
     }
 
     // MARK: - HUD 淡出
 
-    /// HUD 显示（internal：PinContentView 拖拽悬停提示同文件跨类型调用）
     func showHUD(_ text: String) {
         contentView.showHUD(text: text)
         hudHideTask?.cancel()
@@ -482,14 +614,16 @@ final class PinWindowController {
     }
 
     private func fadeHUDOut() {
-        // 退场：fade + 下沉 2pt（审查：读数「沉回图片里」；翻转坐标 y+2 = 视觉向下）
         let hud = contentView.hud
         let sinkFrame = hud.frame
+        let reduce = DesignTokens.Motion.reduceMotion
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.hudFadeDuration
-            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            context.duration = DesignTokens.Motion.fadeDuration
+            context.timingFunction = DesignTokens.Motion.easeOutStrong
             hud.animator().alphaValue = 0
-            hud.animator().setFrameOrigin(CGPoint(x: sinkFrame.minX, y: sinkFrame.minY + 2))
+            if !reduce {
+                hud.animator().setFrameOrigin(CGPoint(x: sinkFrame.minX, y: sinkFrame.minY + 2))
+            }
         }
     }
 }

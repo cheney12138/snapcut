@@ -47,6 +47,14 @@ public protocol ClipboardWriting {
 public protocol HistoryRecording {
     /// 记录一次导出（复制/保存/贴图/OCR 原图都算）
     func record(_ image: CGImage)
+    /// 记录一次导出并附带元数据（应用名/窗口标题/原始底图/可编辑矢量标注层）
+    func record(_ image: CGImage, metadata: HistoryCaptureMetadata?)
+}
+
+public extension HistoryRecording {
+    func record(_ image: CGImage, metadata: HistoryCaptureMetadata?) {
+        record(image)
+    }
 }
 
 // MARK: - OCR
@@ -55,6 +63,23 @@ public protocol HistoryRecording {
 public protocol TextRecognizing: Sendable {
     /// 识别图中文字，按阅读顺序拼接；未识别到返回空串
     func recognize(_ image: CGImage) async throws -> String
+    /// 结构化识别图中文字、二维码与 Markdown 表格
+    func recognizeStructured(_ image: CGImage) async throws -> StructuredOCRResult
+    /// 检测图中全部敏感信息（邮箱/手机/API Key/JWT/密钥参数/IP/身份证）的精确归一化坐标框（Y-down）
+    func detectSensitiveRegions(_ image: CGImage) async throws -> [DetectedSensitiveRegion]
+}
+
+public extension TextRecognizing {
+    func recognizeStructured(_ image: CGImage) async throws -> StructuredOCRResult {
+        let text = try await recognize(image)
+        return StructuredOCRResult(
+            plainText: text,
+            qrCodes: [],
+            markdownTable: nil,
+            tableRowCount: 0,
+            tableColumnCount: 0
+        )
+    }
 }
 
 // MARK: - 全局热键

@@ -1,219 +1,119 @@
-# Changelog
+# Snapcut Changelog
 
-## 2026-11-14 — 视觉收口轮（工具栏重做 / 状态栏图标 / 提示条）
-
-### 🕳️ 病例
-
-**坑 26：工具栏做成了文字按钮，跟设计真源（HTML 原型）完全不是一个东西**
-- 现象：用户实拍对比原型 —— 原型是 SF Symbols 图标 + 玻璃胶囊，实机是「箭头 矩形 文字…」文字标签
-- 根因：原型定稿后没做「设计值 → AppKit 实现值」的对照表，凭印象写控件
-- 修复：按 `.toolbar/.tb-btn/.tb-colors/.tb-widths/.tb-primary` 逐条移植（尺寸、圆角、透明度、阴影、hover 位移）
-- 纪律：**任何界面元素落地前先列 CSS 值对照表**，交付时附对照表 + 真机截图
-
-**坑 27：编辑器长提示条压住工具栏按钮（"对齐在哪"）**
-- 现象：`Snapcut · 框选完成，可直接标注…` 黑色长条盖在工具栏上，按钮被挡
-- 根因：提示条与工具栏各自定位，没有互斥规则；原型 scene 03 根本没有这条提示
-- 修复：删除长提示（快捷键教学归设置面板/首启引导）
-
-**坑 28：状态栏图标"消失"——其实是菜单栏拥挤被系统挤到不可见区**
-- 诊断：`tray.icon.created img=20x20 visible=true` 正常，但 `button.window.frame = x:1690 y:1095 w:38`
-  （屏幕 1728 宽）⇒ 和时钟区重叠，即被系统判为放不下而隐藏
-- 试过无效：`autosaveName`、`behavior = .removalAllowed`、`withLength: 24`（frame 仍 38-40）、
-  +1.2s 重断言 `isVisible = true`
-- 结论：macOS 菜单栏空间不足时应用无法强制占位；产品兜底 = 检测隐藏 + 一次性 toast 告知
-  「⌘⇧A 仍可用」
-
-### ✅ 同时完成
-- 复制反馈 toast（原型右下角卡片：缩略图 + 已复制到剪贴板 + W × H · PNG，2s 淡出，不抢焦点）
-- 尺寸角标改原型样式（`452 × 323 @2x` 黑胶囊 11pt semibold）
-- 快速保存 ⌘⌥S（免面板直落设置目录，文件名规则走设置）
-- 选区 Shift 锁 1:1、取色器 C 键（hex 写剪贴板）
+本文件记录 Snapcut 的所有重要功能演进、体验打磨与缺陷修复，按时间倒序归档，便于回溯决策脉络与定位代码改动。  
+规划中的下一阶段需求与代码级任务拆解见：[docs/07-v0.3-roadmap-design.md](docs/07-v0.3-roadmap-design.md)。
 
 ---
 
-## 2026-11-14 — 功能面扩张（Snow Shot 对标）+ 六边形架构
+## [Unreleased] — 2026-11-20 ~ 2026-11-21（v0.2 体验精修与架构收口）
 
-### ✅ 完成
-- **读 Snow Shot 源码**（C++/Qt/Rust）提炼 5 份功能规格（docs/research/01~05，全带 file:line 证据）
-- **核心功能约束**（docs/04）：8 项能力覆盖 80% 场景 + 接口契约 + 验收标准
-- **F2 全屏 / 窗口截图**：⌘⇧S 全屏、悬停命中窗口高亮（蓝描边 + 白底深字角标）、单击整窗、双击全屏
-- **先冻结再选区**（Snow Shot 主流程）：拍完所有显示器（~82ms）才上覆盖层 ⇒ 覆盖层结构上不可能入图；
-  松手用冻结帧本地裁剪，零延迟进编辑态
-- **选区可反复调整**：8 向手柄改尺寸、空格整体移动、方向键 1pt/Shift 10pt 微调；
-  改完从冻结帧重裁底图 + 标注平移（钉在屏幕原位置）
-- **放大镜取色**：11×11 源像素 @12×，中心像素描边 + 坐标/色值，离线采样冻结帧
-- **历史记录 / OCR 取字 / 贴图 Pin**：三个并行子模块（1065 行），按端口接线；
-  工具栏「取字 O」「贴图 P」，任何导出都写历史，托盘历史子菜单
-- **设置面板**：通用/快捷键/关于三个 tab，设置真正生效（热键解析、历史上限、默认动作）
-- **六边形架构**：Core（Domain/Ports/Shared）/ Adapters / UI / App 分层 + 7 个端口 +
-  `scripts/check-architecture.sh`（make dev 强制，破坏即失败）
+### 新增功能（Added）
+- **M4 · 贴图工作台 & 结构化取字（完成 `T4.1`–`T4.4`）**
+  - **贴图全局隐藏/唤回（Boss Key `⌥⌘P`）**：新增 `PinWindowController.toggleAllVisibility()` 与 `PinMagnetRegistry.setAllGroupPanelsHidden(_:)`，一键隐藏/原位恢复全部桌面贴图、拼贴磨砂玻璃托盘与顶栏（完整保留分组、坐标与透明度），同步接入全局热键 `⌥⌘P` 及托盘菜单入口。
+  - **拼贴顶栏一键复制拼图**：在 `GroupBorderPanel` 顶栏新增「复制」快捷按钮（`doc.on.doc`），复用 `PinAssembleEngine.compose` 一步合成写入剪贴板与历史记录并弹出可点开重编的 Toast，不销毁桌面拼贴组。
+  - **贴图 50% 重叠对比模式**：新增 `PinWindowController.toggleCompareOpacity()` / `resetOpacity()`，支持右键菜单「对比模式 50% (D)」及快捷键 `D` / `5` 瞬切 50%↔100% 透明度、`0` 复位 100%（带 HUD 反馈）。
+  - **取字结构化识别（二维码直达 + Markdown 表格复制）**：新增纯 Core `StructuredOCR`（安全协议 URL 校验 + 几何列聚类 GFM Markdown 表格识别，7/7 单测通过）；`TextRecognizer.recognizeStructured` 单次并发执行文本 OCR 与 QR 码检测；`OCRResultPanel` 自动展示二维码动作条（打开链接 / 复制二维码，纯二维码截图紧凑无空正文）与底部「复制 Markdown 表格」按钮。
+  - 涉及文件：`Sources/Core/Domain/StructuredOCR.swift`、`Sources/Core/Ports/Ports.swift`、`Sources/Adapters/PortConformances.swift`、`Sources/Adapters/OCR/TextRecognizer.swift`、`Sources/Adapters/OCR/OCRResultPanel.swift`、`Sources/Adapters/Pin/PinWindowController.swift`、`Sources/Adapters/Pin/PinMagnetRegistry.swift`、`Sources/Adapters/Pin/GroupBorderPanel.swift`、`Sources/Adapters/Pin/PinContentView.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/CollageEditor/CollageEditorWindowController.swift`、`Sources/UI/Tray/TrayMenu.swift`、`Sources/UI/Tray/StatusItemController.swift`、`Sources/App/AppCoordinator.swift`
+- **M3 · 克制的一键画框美化（Smart Backdrop，完成 `T3.1`–`T3.4`）**
+  - 新增纯 Core `BackdropStyle` 模型与 `BackdropLayout` 画布几何引擎（6 套 Apple 风格克制预设：浅雾灰/柔白/深曜石/暖霞/森海/冰蓝，3 档边距 24/40/64pt，`自动`/`16:9`/`4:3` 精确居中，偏好记忆且新截图默认关闭不打扰极速裸截图；独立单测通过）。
+  - 扩展 `CGRenderer` 新增边缘主色采样均衡（`detectEdgeColor` + `effectiveBalanceInset`）与 1x/2x Retina 无锯齿画框渲染管线（`renderWithBackdrop`：线性渐变底 + 双层 Apple 柔影 + 连续圆角裁切 + 0.5pt 发丝边，预览与导出共用同一几何与绘制路径）。
+  - 编辑器工具栏新增 `sparkles.rectangle.stack` 画框美化按钮与快捷键 `B` 瞬切，并仅在开启时于主栏上方轻浮展示 `.clear` Liquid Glass 单行微调胶囊 `SmartBackdropPillPanel`（色板圆点 / 边距 / 比例 / 均衡留白开关，智能避让智能打码胶囊），标注交互仍在原图坐标零偏移工作且所见即所得导出。
+  - 涉及文件：`Sources/Core/Domain/BackdropStyle.swift`、`Sources/UI/Annotate/CGRenderer.swift`、`Sources/UI/Editor/TBIcon.swift`、`Sources/UI/Editor/ToolbarPanel.swift`、`Sources/UI/Editor/EditorSession.swift`、`Sources/UI/Overlay/OverlayWindow.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/CollageEditor/CollageEditorWindowController.swift`
+- **M2 · 视觉记忆库 & 可反悔矢量重编（Visual Memory，完成 `T2.1`–`T2.5`）**
+  - 扩展纯 Core `AnnotationModel` 与全部 7 种 `Shape` 支持 `Codable`/`Sendable` 往返无损序列化，并在 `AnnotationStore` 新增 `restore(annotations:)` 逐条重建撤销栈；新增纯 Core `HistoryRecord`、`EditableSessionPayload`、`HistoryCaptureMetadata` 与 `HistorySearch`（多词 AND 过滤 + 相关度/时间排序 + 命中摘要提取，独立单测通过）。
+  - 升级 `HistoryStore`：完整兼容存量 30 条旧历史索引，最近 20 条带标注导出自动保存 `<id>.base.png` + `<id>.annotations.json` 可重编 sidecar；新增低优先级串行后台 Vision OCR 索引队列与启动后低优先级存量补齐（不抢占前台截屏与启动 CPU）。
+  - 新增明暗自适应 Liquid Glass 速搜浮窗 `HistorySpotlightPanel`（默认全局热键 `⌥⌘V` 及托盘入口）：3 列缩略图流、可重编角标、命中文本强调高亮与全键盘导航（`↑↓←→` 选卡、`↩` 复制原图、`⌘E` 重新编辑、`⌘P` 贴图、`⌘C` 复制识别文字、`Esc` 退出并归还焦点）。
+  - 实现非破坏性矢量重编：点击刚复制的 Toast 或从视觉记忆按 `⌘E` 重开时自动按比例还原干净底图与全部矢量标注层，支持直接 `⌘Z` 逐条撤销与继续追加。
+  - 设置窗口「通用 → 历史」新增「后台自动识别历史文字」开关，「快捷键 → 全局热键」新增「视觉记忆搜索」自定义录制与全量热键冲突检测（即时重绑生效）。
+  - 涉及文件：`Sources/Core/Domain/AnnotationModel.swift`、`Sources/Core/Domain/HistoryRecord.swift`、`Sources/Core/Domain/AppSettings.swift`、`Sources/Core/Ports/Ports.swift`、`Sources/Adapters/History/HistoryStore.swift`、`Sources/UI/History/HistorySpotlightPanel.swift`、`Sources/UI/Editor/EditorSession.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/Settings/SettingsWindowController.swift`、`Sources/UI/Tray/TrayMenu.swift`、`Sources/UI/Tray/StatusItemController.swift`、`Sources/App/AppCoordinator.swift`
+- **M1 · 智能一键脱敏（Auto-Redact，完成 `T1.1`–`T1.4`）**
+  - 新增纯 Core 本地敏感信息检测引擎 `SensitiveTextDetector`（覆盖邮箱、中国/国际手机号、OpenAI/Anthropic/GitHub/AWS/阿里云/腾讯云/Slack API Key、Bearer Token、JWT、URL/配置密钥值、IPv4 地址与 18 位身份证号，排除 `127.0.0.1` / `0.0.0.0` 及占位示例，重叠自动去重；独立 7/7 单测通过）。
+  - 扩展 `TextRecognizing` 端口与 `TextRecognizer.detectSensitiveRegions`：本地离线 Vision OCR 关闭语言纠错以原样保留密钥串，通过 `candidate.boundingBox(for:)` 精准定位词级包围盒，不误盖同行正常文字。
+  - 扩展 `AnnotationStore` 批处理提交 `addBatch(_:)` 与单项点消 `removeAutoRedacted(at:)`：一次 `⌘Z` 整体撤销整轮自动脱敏，也支持在马赛克工具下悬停虚线高亮 + 单击取消某处误遮（同样可 `⌘Z` 恢复）。
+  - 新增仅在选中马赛克工具时于其上方轻浮出现的 Liquid Glass 胶囊 `✦ 智能打码 ⇧M`（亦可在编辑态任意时刻按 `⇧M` 直接触发），命中后短暂闪现轻蓝轮廓并弹出顶部结果提示，不入导出图。
+  - 涉及文件：`Sources/Core/Domain/SensitiveTextDetector.swift`、`Sources/Core/Ports/Ports.swift`、`Sources/Adapters/OCR/TextRecognizer.swift`、`Sources/Adapters/PortConformances.swift`、`Sources/Core/Domain/AnnotationModel.swift`、`Sources/UI/Editor/ToolbarPanel.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/Overlay/OverlayWindow.swift`、`Sources/UI/CollageEditor/CollageEditorWindowController.swift`
+- **开机自动启动设置项（原生登录项）**
+  - 新增基于 macOS `SMAppService.mainApp` 的登录项适配器，以系统真实登录项状态为唯一真相源；若处于 `.requiresApproval` 则展示一键跳转「系统设置 → 登录项」。
+  - 在设置窗口「通用」页顶部新增「启动 · 登录时自动启动」卡片，并为设置页补齐透明 `NSScrollView` 顶部对齐滚动容器。
+  - 涉及文件：`Sources/Adapters/Settings/LaunchAtLoginManager.swift`、`Sources/UI/Settings/SettingsWindowController.swift`
+- **贴图与拼贴交互重构（松手吸附 + 柔和智能对齐 + 磨砂玻璃托盘）**
+  - 彻底移除拖中位置劫持与磁滞死区：单卡拖动全程 1:1 自由跟随；靠近他卡进入吸附区仅展示不拦截鼠标的纯视觉鬼影框与参考线，松手后 `160ms easeOutStrong` 顺滑滑入成组。
+  - 新增柔和边/中线对齐（上/下/中 Y、左/右/中 X 仅在 `≤16pt` 内轻吸对齐并显示参考线，用户刻意错位时不强行拉齐）。
+  - 组内单卡直接拖离超过 `44pt` 自动自然脱离组（托盘柔淡提示），不再强依赖 `⌥+拖`。
+  - 取消单卡 9pt 不透明白垫与成组尺寸跳变，改为底层统一 `.popover` 通透磨砂玻璃托盘（`GroupBackdropPanel`，透明度 `0.72` + 独立 `0.5pt` 发丝边框）+ 顶部悬浮玻璃胶囊（`已拼贴 · N 张 | 合并拼图 | 拆分 | ×`），支持 `Esc` 关闭整组。
+  - 点击「合并拼图」改为原位无缝进入一体化无边框 Apple 编辑器（替代旧版暗色标题栏 `CollageEditorWindowController`）。
+  - 涉及文件：`Sources/Core/Domain/MagnetGroup.swift`、`Sources/Adapters/Pin/SnapFeel.swift`、`Sources/Adapters/Pin/GroupBorderPanel.swift`、`Sources/Adapters/Pin/PinMagnetRegistry.swift`、`Sources/Adapters/Pin/PinWindowController.swift`、`Sources/Adapters/Pin/PinContentView.swift`、`Sources/Adapters/Pin/PinAssembleEngine.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/App/AppCoordinator.swift`
+- **单屏聚焦唤起 & 边缘触发全屏**
+  - 唤起区域截图时仅锁定鼠标当前所在显示器（不再打扰另一块外接/内建屏），且默认不自动框选全屏，仅当鼠标贴近屏幕边缘时平滑变形进入整屏预览。
+  - 涉及文件：`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/Overlay/OverlayWindow.swift`
 
-### 🕳️ 本轮病例（新坑）
+### 视觉与交互优化（Changed）
+- **唤起窗口多屏居中、视觉记忆面板快捷键自定义、托盘精简与延时倒计时去白角**
+  - 新增 `DisplayRegistry.screenAtMouse()` / `centerOrigin(for:on:)`：`HistorySpotlightPanel`、`SettingsWindowController`、`CountdownHUD` 与 `OnboardingWindow` 统一在光标当前所在显示器上正居中唤起。
+  - `AppSettings` 新增 `spotlightHotkeys`（`copyImage` / `reopenEdit` / `pin` / `copyOCR`），设置窗口「快捷键」页新增「视觉记忆面板（搜索浮窗内生效）」分组支持自定义录入与冲突校验（支持 `Return` 与 `F1`–`F12`），`HistorySpotlightPanel` 底部键帽提示、右键菜单与按键分发实时同步用户自定义配置。
+  - 移除托盘菜单中与视觉记忆面板重复的「历史记录」30 条文本子菜单，保留更丰富的「搜索视觉记忆」入口。
+  - 重构 `CountdownHUD` 为 `DesignTokens.Mat.liquidGlass` + `OuterShadowView`（`hasShadow = false`），彻底消除延时倒计时卡片圆角四周残留的白色直角伪影，改用明暗自适应文本色保证白底/暗底皆清晰可读。
+  - 视觉记忆面板升级为**高晶液态玻璃**（`DesignTokens.Mat.crystalGlassTint` `α=0.42` 对齐工具栏通透度并锁定 `.aqua` 明亮质感，去除所有外沿白线，纯靠 `OuterShadowView` 双层投影与原生玻璃折射切分明暗背景，卡片改用清透纯白晶面衬底）；底部快捷键键帽徽章（`SpotlightKbdCapsule`）、快捷操作按钮与条数徽标保持不透明实底胶囊（`α=0.96~0.98` + 高对比深墨字色），保证底层文字不透字干扰阅读。
+  - **补全真实「截图音效」实现**：新增 `CaptureSoundPlayer` 优先加载 macOS 原生系统截图快门音 `Screen Capture.aif`（回落 `Grab.aif` / `Tink`），在区域/全屏/滚动/拼贴的复制、保存、快速保存与贴图导出完成时刻读取 `AppSettings.playCaptureSound` 播控，在设置开启开关时同时触发一次试听反馈。
+  - **滚动截图引擎升级为 `SCStream` 60fps 连续流（根治高速滚动「滚动过快」断层）**：
+    - 重构 [ScrollCaptureController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/Scroll/ScrollCaptureController.swift) 放弃早期的 `SCScreenshotManager.captureImage` 120ms 串行轮询（实测仅 ~7fps），改用 ScreenCaptureKit **`SCStream` 60fps 连续视频流**（GPU 侧按 `sourceRect` 直接裁剪、进程级排除自身浮层、`CVPixelBuffer` sRGB 零阻塞拷贝），静止时 0 推帧 0 功耗，滑动瞬间跑满 60fps，允许的滑动速度上限提升约 8 倍。
+    - [OverlayController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayController.swift) 将单槽 `scrollPendingFrame` 升级为有界 FIFO 队列（上限 `24` 帧）承接高速甩屏突发帧、在 `finishScrollCapture` 收尾时先排空尾部缓冲帧再合成，并为 60fps 边界撞墙自动收尾新增 `0.32s + ≥4 帧` 时间门控防误触。
+    - 修复长图/独立编辑器双指缩放时工具栏随非居中缩放锚点不断向左/侧方漂移的问题：`zoomStandaloneSelection(to:)` 缩放与平移过程中保持工具栏稳妥锚定不动，同时 `ToolbarPanel.originBelow` 对跨屏超大画布改用可视交集中心定位。
+  - **工具栏排版与连续线宽回归（滚动截图移至取字前 + 无极粗细滑杆）**：
+    - 将「滚动截图」（`206`）从标注工具区移至工具栏后段「取字（OCR）」按钮正前方，`AppSettings.defaultToolbarOrder` / `toolbarOrderSafe()` 与设置页「工具栏排序」同步精简为纯标注工具 `1–7`。
+    - 将线宽控件由细/中/粗 3 档圆点重构为自定义苹果风格连续无极滑杆 `TBStrokeSlider`（下限保持 `2.0pt` 对齐原「细」档，连续调节上限至 `10.0pt`，支持点击跳转、顺滑拖拽与滚轮精细微调并实时浮显 `线宽 X.X pt`），序号徽标 `CGRenderer.drawSequenceBadge` 同步改为连续线宽缩放映射。
+  - **工具栏与悬浮浮层彻底告别深浅变化与闪烁并恢复 `1/2/3/4` 滑移动效**：
+    - 移除 `ToolbarPanel` 根据截屏背景亮度实时切换 `.aqua`/`.darkAqua` 的逻辑；针对 macOS 26 原生 `NSGlassEffectView` 内部硬编码 `CABackdropLayer.tracksLuma = 1` 引起的跨 App（Antigravity → CatPaw IDE）首帧闪跳，改用基于 `.aqua` `.menu` 澄澈模糊 + `.continuous` 超椭圆 9-slice 蒙版 + 微白晶透提亮（`tintAlpha: 0.08`）的 `DesignTokens.Mat.fixedLightCrystalBlur`，并将工具栏及附属胶囊交互前景置入同级 `.aqua` 前景宿主，兼顾高通透晶体质感、零闪烁、零图标反色。
+    - 排查发现系统「减弱动态效果」开启时 `TBSelectionIndicatorView` 与 `playSelectPop()` 屏蔽了所有工具切滑动效：现将工具栏内微小选中滑移胶囊（`toolPill` / `colorRing` / `strokePill`）与微弹反馈解耦于全局 `reduceMotion`，并提升浅色态 `toolPill` 对比度（`α=0.20 / 0.34`），`1/2/3/4` 切换工具的物理弹簧滑移动效全面恢复。
+  - 涉及文件：`Sources/Core/Domain/HotkeySpec.swift`、`Sources/Core/Domain/AppSettings.swift`、`Sources/UI/DesignTokens.swift`、`Sources/UI/Platform/DisplayRegistry.swift`、`Sources/UI/History/HistorySpotlightPanel.swift`、`Sources/UI/Settings/SettingsWindowController.swift`、`Sources/App/AppCoordinator.swift`、`Sources/UI/Tray/TrayMenu.swift`、`Sources/UI/Tray/StatusItemController.swift`、`Sources/UI/Notification/CountdownHUD.swift`、`Sources/UI/Export/CaptureSoundPlayer.swift`、`Sources/UI/Export/ExportCoordinator.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/Overlay/OverlayWindow.swift`、`Sources/UI/Editor/ToolbarPanel.swift`、`Sources/UI/CollageEditor/CollageEditorWindowController.swift`
+- **工具栏与悬浮胶囊 Liquid Glass 光学悬浮升级（紧贴接触影 + 柔和抬升影 + 稳定主题锁定）**
+  - 移除人造黑色边框线与遮罩底色层，保持 `.clear` 原生液态玻璃的纯粹光学通透感，不靠画线强化边框；适度提升 `floatingGlassTint`（亮/暗 `α=0.42`）让通透玻璃本体与浅灰遮罩清晰拉开层次。
+  - 修复 AppKit `NSViewBackingLayer` 在 `addSubview` 时按 `NSView.shadow == nil` 强制将 `layer.shadowOpacity` 清零导致投影完全失效的根因：新增 `OuterShadowView`，改由独立子 `CALayer` 承载阴影并覆盖全窗口外围留白区，以 `RoundedRectangle(style: .continuous)` `.evenOdd` 蒙版把玻璃圆角内部 100% 镂空。
+  - 双层真实光学阴影参数：**紧贴接触影**（`radius 1.2pt / offset(0, -0.5) / 亮 α=0.34 暗 α=0.54`）紧贴 `.continuous` 边缘形成物理接触微缝，**柔和抬升影**（`radius 8.5pt / offset(0, -3) / 内收 1.5×1pt / 亮 α=0.18 暗 α=0.34`）收拢在底部托起玻璃，避免阴影向顶缘与两侧过度扩散，圆角零多余灰边、内部 100% 纯净不染黑。
+  - 修复主题明暗跳变：在进入编辑态时对原始未压暗屏幕冻结帧做 `8×8` 快速亮度采样，一次性锁定本次会话的 `appearance`（浅色画面锁 `.aqua`、深色画面锁 `.darkAqua`），消除 `OverlayWindow` 半透明压暗把浅色页面推到 `CABackdropLayer.tracksLuma` 50% 阈值附近导致的深浅主题反复横跳。
+  - 涉及文件：`Sources/UI/DesignTokens.swift`、`Sources/UI/Editor/ToolbarPanel.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/Overlay/OverlayWindow.swift`、`Sources/Adapters/Pin/GroupBorderPanel.swift`
+- **macOS 26 原生 Liquid Glass 玻璃态重构与工具栏三档尺寸（`NSGlassEffectView`）**
+  - 在 `DesignTokens.Mat` 新增 `liquidGlass(cornerRadius:style:tintColor:fallbackMaterial:)` 与 `floatingGlassTint`：macOS 26+ 使用原生 `NSGlassEffectView` 的 **`.clear` 清透液态玻璃** + 极淡明暗自适应微着色，并移除非激活浮窗上的 `contentView.layer.transform` 缩放（解决 `.regular` 在 `nonactivatingPanel` 下退化为不透明实色雾面的问题）；macOS 15 自动回退 `AdaptiveGlassView`。
+  - 新增 `AppSettings.ToolbarSize` 三档尺寸设置：**紧凑（`30pt` 按钮 / `44pt` 高）· 标准（默认，`36pt` 按钮 / `50pt` 高）· 大号（`42pt` 按钮 / `58pt` 高）**，在设置窗口「通用 → 截图」提供分段开关，修改后通过 `invalidateToolbar()` 下次唤起即时生效（无需重启）。
+  - 同步升级主工具栏 `ToolbarPanel`、马赛克上下文胶囊 `SmartRedactPillPanel`、文字浮动字号条 `FontSizeBarView`、拼贴顶栏 `GroupBorderPanel` 与拼贴磨砂玻璃托盘 `GroupBackdropPanel` 为 `.clear` 原生液态玻璃。
+  - 涉及文件：`Sources/Core/Domain/AppSettings.swift`、`Sources/UI/DesignTokens.swift`、`Sources/UI/Editor/ToolbarPanel.swift`、`Sources/UI/Overlay/OverlayWindow.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/Adapters/Pin/GroupBorderPanel.swift`、`Sources/UI/Settings/SettingsWindowController.swift`、`Sources/App/AppCoordinator.swift`
+- **全产品 Apple Liquid Glass 质感与动效体系**
+  - 引入 `AdaptiveGlassView`（缓存 9-slice `maskImage` 消除磨砂圆角白块、自适应 0.5pt 发丝边、对称顶缘镜面高光）、`TactilePress` 按压触觉反馈与 `Motion.easeOutStrong` 曲线，清除全仓拖沓 `.easeIn` 退场动画。
+  - 工具栏 16 枚手绘位图全面替换为原生 Apple SF Symbols；线宽滑块升级为 Apple Markup 风格 3 档圆点（`2/4/6pt`）；新增工具/颜色/粗细 3 组弹性滑动选中指示器；修正 macOS 26 `NSButton.alignmentRectInsets` 导致的蓝底选中块竖向拉高问题。
+  - 涉及文件：`Sources/UI/DesignTokens.swift`、`Sources/UI/Editor/TBIcon.swift`、`Sources/UI/Editor/ToolbarPanel.swift`、`Sources/UI/Notification/CaptureToast.swift`、`Sources/UI/Scroll/ScrollCaptureViews.swift`、`Sources/UI/Overlay/FrozenSampler.swift`
+- **取字（OCR）浮层重做**
+  - 窗口层级升至 `.screenSaver + 3` 并精准避让工具栏可视区域（单行矮选区顺排工具栏下方或选区上方，高选区底缘避开工具栏），支持拖拽标题栏挪开对照原文；重构卡片排版、舒适行距与局部选词复制逻辑。
+  - 涉及文件：`Sources/Adapters/OCR/OCRResultPanel.swift`、`Sources/UI/Editor/ToolbarPanel.swift`、`Sources/UI/Overlay/OverlayController.swift`
+- **序号与文字标注视觉升级**
+  - 序号徽章改为联动 3 档粗细（`24 / 28 / 32pt`）的 Apple / CleanShot 风格圆标（外白隔离环 + 向下柔影 + 微渐变 + `SF Pro Rounded Bold` 基于 `useGlyphPathBounds` 精确光学居中）。
+  - 文字工具浮动字号条改为 `30pt` Liquid Glass 胶囊（`12 · 14 · 17 · 21` + 弹性滑块）；输入框支持自适应宽高、柔和对比衬底、虚线语义边框、实时同步工具栏改色与零基线跳动落盘；落盘文字增加克制可读性微影。
+  - 涉及文件：`Sources/UI/Annotate/CGRenderer.swift`、`Sources/UI/Overlay/OverlayWindow.swift`、`Sources/UI/Editor/ToolbarPanel.swift`
 
-**坑 17：SCStreamConfiguration 默认输出 1920×1080 ⇒ 截图模糊（用户实报"截完变模糊/有蒙层"）**
-- 根因：SCStreamConfiguration.width/height 默认 1920/1080（SCStream.h 头文件实锤），整屏被降采样
-- 加深坑：CGDisplayPixelsWide 在缩放模式返回"当前模式像素"(1728) 而非面板物理像素(3456)
-- 修复：`config.width = screen.frame.width * backingScale`
-- 验证：导出 1400×400 vs screencapture 同区域，平均亮度差 0.0103、显著差异 1.26%
-
-**坑 18：编辑器预览底图竖向颠倒**
-- 根因：CGContext.draw 假设 Y-up，而 isFlipped 视图上下文是 Y-down ⇒ 底图二次翻转
-- 修复：局部 translate+scale(1,-1) 镜像后再 draw，且用像素尺寸矩形（NSImage.draw 会按 point 尺寸重采样 ⇒ 模糊）
-
-**坑 19：无鼠标点击的入口（⌘⇧S）App 不激活 ⇒ Enter/Esc 全丢**
-- 现象：全屏截图进编辑态后键盘彻底失效（frontmost 仍是别的 App）
-- 根因：区域路径靠真实点击激活，掩盖了 NSApp.activate 在 Carbon 热键回调里可能被忽略
-- 修复：ensureActivation() 每 60ms 重试（最多 3 次，含 NSRunningApplication.activate）
-
-**坑 20：拖手柄调整选区后 App 失去激活 ⇒ 编辑器"僵死"**
-- 修复：reclaimKeyboard()（activate + makeKey + makeFirstResponder + 端口级 ensureActivation）
-
-**坑 21：NSColor.labelColor 在 dark appearance 下解析成白色 ⇒ 白底胶囊里画白字不可读**
-- 修复：角标固定 `NSColor(calibratedWhite: 0.12, alpha: 1)`
-
-**坑 22：改用「点击时 popUp 菜单」后 buildMenu() 调用丢失 ⇒ 托盘点击毫无反应、历史菜单永远空**
-- 现象：状态栏图标点了没反应；selfTestDumpHistoryMenu 静默返回（historyMenu == nil）
-- 教训：替换 `item.menu = buildMenu()` 这类"顺带调用"时，必须显式保留副作用
-
-**坑 23：OCR 结果面板 .floating 被覆盖层（.screenSaver）压住 ⇒ 用户完全看不到识别结果**
-- 修复：同级 .screenSaver + orderFrontRegardless + makeKey
-
-**坑 24：多实例（worktree 构建）同时运行 ⇒ unified log 混流 + Carbon 热键被抢，验证结论全错**
-- 现象：明明逻辑对，Enter 就是不生效；日志里冒出没见过的事件（settings.window.open）
-- 纪律：每次真机验证前 `pkill -9 -f Snapcut`，并 `ps aux | grep Snapcut` 确认只剩一个实例
-
-**坑 26：标注层画进了「图像翻转 gstate」⇒ 矩形画了但屏幕零像素（用户实报「画不出任何东西」）**
-- 病例：`shape.commit`/`editor.draw count=1` 日志全在，但选区内像素级扫红 = 0。
-  drawEditor 把 CGRenderer.render 放在「为 Y-up 位图准备的绝对坐标翻转 CTM」里，
-  而标注几何是选区局部坐标 → 画出来必然被 clip 裁光
-- 修复：标注层移出图像翻转 gstate，独立 gstate（clip 选区 + 平移原点），视图原生 Y-down CTM 直画
-
-**坑 27：unionRect 增量迭代语义漂移 ⇒ 拖 150pt 只画出 75pt 宽**
-- 病例：每次 mouseDragged 拿「上一帧 rect」再算 `abs(point - (minX+w))`，w 变了之后
-  算出的宽越来越偏。修成 `rectFromPoints`（起点锚定，两点定形）
-
-**坑 28：CGEvent 注入残留 Shift flag ⇒ e2e 选区被 1:1 锁成正方形（200×200）**
-- 病例：keyDown 注入后 hid modifier state 残留，后续 mouseDragged 全带 .shift →
-  选区锁 1:1。e2e 脚本所有鼠标事件必须显式 `flags = []`
-
-**坑 29：字典字面量重复 key ⇒ mouseDragged 运行时 trap，事件流「神秘消失」**
-- 病例：补丁套补丁把 viewId 写了两遍，`Dictionary.init(dictionaryLiteral:)` 断言崩溃，
-  表现为「window 收到事件、view 一条日志没有、进程无声消失」。诊断日志本身引入的崩溃，
-  crash report（Dictionary literal + mouseDragged 栈）定位
-
-**坑 30：bundle id `dev.snapcut.app` 被系统记死 ⇒ SwiftUI 启动即 exit(0) / NSStatusItem 永远隐藏**
-- 病例链（对照实验全做齐）：
-  ① 手写 NSStatusItem 永远停 x=1690 虚拟停车位（onScreen=false），20 行最小 App 复现
-  ② killall ControlCenter、全新 autosaveName、新 autosaveName + isVisible 重试：全无效
-  ③ SwiftUI MenuBarExtra 测试 App（同机）正常显示 → 托盘路径切 MenuBarExtra
-  ④ 同二进制换 plist bundleId → 存活 + 图标显示；不换 → run loop 直接退出 exit(0)
-- 根因：NSStatusItem 时代几十次 pkill-9 + 快速启停，把 LS/TCC/CC 的 per-app 状态写坏
-  （坑 4 的 LS 损坏换 id 病例二次复发，这次更彻底）
-- 修复：bundle id 换 `dev.snapcut.app2` + 托盘切 SwiftUI MenuBarExtra（glance 同款路径），
-  NSMenu 保留在 StatusItemController 服务 ⌥⌘H 光标兜底
-- 代价：TCC 屏幕录制权限需重新授权一次（onboarding 会引导）
-- 实测：亮部文字（`cd ./snapcut && python3 - <<'PYEOF'（+88 Lines）`）一字不差；
-  暗历史行出现 `Hppwooraznacoronared` 这类误读
-- 试过无效：反相、放大 2x、automaticallyDetectsLanguage —— 无改善
-- 结论：Vision 已知特性，暂记为限制（不是管线问题，已用同区域 screencapture 对照排除）
-
-### 📌 架构与纪律增补
-- 新代码端口优先：先定义 Core/Ports，再写 Adapters，UI 只拿端口
-- 并行子任务用 worktree 隔离；**worker 不会自动 commit**，主会话需从 worktree 目录搬运文件
-- 子任务契约里要显式给 LogCategory 现有 case，否则 agent 会造垫片（已在并入时清理）
+### 性能与缺陷修复（Fixed）
+- **视觉记忆库（`HistorySpotlightPanel`）搜索框宽度塌缩、无光标与外阴影缺失修复**
+  - 修复搜索框 `trailingAnchor` 误用 `lessThanOrEqualTo` 导致空文本时宽度塌缩至 `~10pt`（占位符不可见、输入中文被裁切、右侧点击无法命中输入框）的问题：改为 `equalTo` 铺满整栏并降低水平拥挤优先级，右侧徽标与清除按钮收拢进自适应 `NSStackView`。
+  - 移除 `SpotlightPanelWindow` 冗余 `.nonactivatingPanel` 标记，改用 `NSApp.activate(ignoringOtherApps: true)` + 次 tick 焦点兜底 + 整栏点击聚焦与 `iBeam` 光标，并显式设置高亮插入点光标色；同时接入 `OuterShadowView`（`Spec.spotlight`）为视觉记忆浮窗补齐 `.continuous` 镂空双层阴影。
+  - 涉及文件：`Sources/UI/History/HistorySpotlightPanel.swift`、`Sources/UI/DesignTokens.swift`
+- **滚动长图与贴图缩放拉伸模糊**
+  - 重写 `PinWindow.constrainFrameRect`、新增 WindowServer `14400px` 位图安全上限与等比缩放几何；独立外源图（Toast 重开/长图/拼图）支持等比 8 手柄缩放、光标锚点滚轮/捏合缩放与双击 `适配 ↔ 1:1`。
+  - 涉及文件：`Sources/Core/Domain/AnnotationModel.swift`、`Sources/Core/Domain/SelectionGeometry.swift`、`Sources/UI/Editor/EditorSession.swift`、`Sources/Adapters/Pin/PinWindow.swift`、`Sources/Adapters/Pin/PinWindowController.swift`、`Sources/UI/Overlay/OverlayWindow.swift`
+- **重启后首次热键唤起卡顿 & Esc 关不掉**
+  - 新增会话级 Carbon `Esc` 热键接管、禁用后台 App Nap（`ProcessInfo.beginActivity`）、缓存已授权 TCC 结果、离屏预热并按 `displayID` 池化复用 `OverlayWindow`、后移 `NSApp.activate()` 避免冷启动 ViewBridge 阻塞截帧、冻结底图改为 GPU `CALayer` 托管。
+  - 涉及文件：`Sources/Adapters/Permission/TCCPermission.swift`、`Sources/Adapters/Capture/SCKCapture.swift`、`Sources/Adapters/Hotkey/CarbonHotKeyCenter.swift`、`Sources/App/AppCoordinator.swift`、`Sources/App/AppDelegate.swift`、`Sources/UI/Overlay/OverlayController.swift`、`Sources/UI/Overlay/OverlayWindow.swift`
+- **移动/缩放选区框时背后文字轻微变形**
+  - 移除拖动选框期间 `liveFrozenCrop()` 逐帧 CPU 裁剪与 `.none` 最近邻重采样，改由蒙层 `.clear` 挖空直接透出底层绝对静止的 GPU `frozenBackdropView`（过滤改为 `.linear`），并保持标注/边框/手柄全程稳定显示。
+  - 涉及文件：`Sources/UI/Overlay/OverlayWindow.swift`
+- **工具栏数字快捷键与视觉顺序错位（按 `2→3` 跳到第 4 项）**
+  - 改为按 `toolbarOrderSafe()` 从左到右动态映射 `1–7`，并同步 Tooltip 快捷键编号。
+  - 涉及文件：`Sources/UI/Editor/EditorKeyRouter.swift`、`Sources/UI/Editor/ToolbarPanel.swift`
+- **文字工具回车落盘后 `⌘Z` 无法撤销**
+  - 在 `OverlayView` 重写 `performKeyEquivalent(with:)` 优先接管编辑器 `⌘` 组合热键，避免被 `NSTextField` 激活过的系统菜单 `Edit → Undo` 吞键；提交时优先读取 `fieldEditor.string` 并显式 `endEditing(for:)` 稳妥归还焦点。
+  - 涉及文件：`Sources/UI/Overlay/OverlayWindow.swift`
 
 ---
 
-## 2026-11-14 — v0.1 开发首日（M0 骨架 + v0.1 区域截图闭环）
+## [0.2.0-wip] — 2026-11-14 ~ 2026-11-19（基础闭环与滚动引擎）
 
-### ✅ 完成
-- M0：xcodegen 工程（project.yml 唯一源）、Makefile、os.Logger 结构化日志、托盘、⌘⇧A 全局热键（Carbon，免辅助功能权限）
-- v0.1：区域截图闭环（覆盖层蒙层/橡皮筋选区/尺寸角标 → ScreenCaptureKit 截屏 → 像素裁剪 → PNG+TIFF 剪贴板 / 原生保存面板）
-- 贴身拖拽源浮窗 Pattern（anchor-following drag-source overlay，照 glance 的 pattern 文档实现）
-- 状态栏图标 + AppIcon（蓝底白括号，代码绘制唯一真源）
-- AGENTS.md（实机纪律 / TCC 纪律 / 图标管线 / bundle ID 纪律）
-
-### 🕳️ 当天踩坑记录（全部进了 AGENTS.md 防再踩）
-
-**坑 1：qlmanage 转 SVG → 100% 纯白不透明 PNG（排障 ~1h）**
-- 现象：菜单栏图标不可见
-- 根因：qlmanage 渲染 SVG 产物是全白不透明图（0 个黑色笔画像素），template 渲染下 = 看不见
-- 修复：IconFactory 代码绘制（NSBitmapImageRep 显式位图上下文），SVG 只作设计参考
-- 教训：外部工具转换的像素产物必须先做像素级验证再上屏
-
-**坑 2：启动即 CGRequestScreenCaptureAccess → 每次启动弹 TCC 授权窗（用户被烦到）**
-- 根因：把"会弹窗的申请 API"写进了启动路径
-- 修复：preflight 只查不弹（CGPreflight 不弹窗）；CGRequest 只留给用户主动触发的引导流程
-- 出处：Glance 2026-09-19 同款病例，没提前看它的代码，重踩
-
-**坑 3：ad-hoc 签名 → TCC 授权每次构建后失效重弹**
-- 根因：ad-hoc 签名 cdhash 每次构建都变，TCC 视为新 App
-- 修复：构建固定 Apple Development 证书（Makefile SIGN_ID）
-
-**坑 4：bundle ID `com.snapcut.app` 在 LS/TCC 库中损坏 → 状态栏图标零渲染（排障 ~2h，最贵的一坑）**
-- 现象：tray.icon.created 日志正常，菜单栏却无任何像素；二进制、图标绘制、代码全对
-- 定位：换 bundle ID 对照实验——同一二进制装最小 bundle（com.poc.status）图标正常；只改
-  CFBundleIdentifier 为 com.snapcut.app 立即消失；换成 com.snapcut.desktop 恢复
-- 根因：坑 2+坑 3 的叠加伤害（几十次 TCC 弹窗反复授权/撤销 + 签名反复变更）把该
-  bundle ID 的系统注册记录搞脏（macOS 26）
-- 修复：换 bundle ID `com.snapcut.desktop`
-- 教训：① 开发第一版就把签名身份和 bundle ID 定死；② "系统说没问题但现象不对"时，
-  先做最小对照实验排除系统状态，再怀疑代码
-- 排障方法论：像素簇计数会被时钟秒数/天气小组件/录屏指示器污染，不可信；
-  可信的是 on/off 像素 diff（排除小组件区）+ 换 bundle 对照实验
-
-**坑 5：xcassets/actool 在本工程中静默不产出（AppIcon 打不进 bundle）**
-- 现象：pbxproj 有 Resources 阶段引用，构建却从不调 actool，Assets.car 不存在
-- 修复：弃用 xcassets 路线，走经典 CFBundleIconFile + AppIcon.icns（iconutil 生成），
-  resources copy 阶段工作正常
-- 教训：最小可行链路 > 时髦链路；xcassets 排障成本高时直接退回 icns
-
-**坑 6（小）：调试用例把用户带进"实例空窗期"**
-- 用户 18:27:48 退出实例、18:27:52 新实例才起来，中间拍的菜单栏截图当然没图标
-- 教训：对照实验要钉死"进程活着"的前提（pgrep + 日志时间戳对齐）
-
-## 2026-11-14（晚）— v0.2 标注编辑器 + 滚动截图 + 设计原型（并行开发）
-
-### ✅ 完成
-- **v0.2 标注编辑器**：选区松手即冻结底图 → 玻璃工具栏（6 工具：箭头/矩形/文字/马赛克/序号/高亮，
-  热键 1-6 直选，5 色 3 粗细，undo/redo）→ Enter 复制/⌘S 保存/Esc 取消/双击复制。
-  **工具栏永不入图**（底图在工具栏出现前冻结——需求「截图时隐藏工具栏」的架构级解法），H 键隐藏工具栏。
-- **滚动截图（v0.6 提前）**：S 键进入 → 手动滚动 + 400ms 抓帧 → Enter 拼接 → 导出；
-  静止画面退化输出首帧（产品承诺：不卡死、明确回退）。
-- **设计原型**（DeepSeek 设计 agent 并行）：`~/work/project/html-pages/snapcut-design/index.html`
-  Apple 玻璃质感 8 场景交互原型 + 7 张自验截图。
-- **e2e 自动化验证体系**：CGEvent 注入真实键盘/鼠标/滚动事件 + ScrollHost 滚动宿主窗口，
-  全链路无人值守验证（不是 mock，全部真实管线）。
-
-### 🕳️ 踩坑记录
-
-**坑 7：make dev 构建失败仍显示 "ready"（rsync 无保护）**
-- xcodebuild 失败 → tail 吞掉错误行 → rsync 把旧产物复制出去 → 屏幕上跑旧代码
-- 修复：tee 完整日志 + grep BUILD SUCCEEDED 挡板；**新二进制用 strings 验证特征字符串**
-
-**坑 8：编辑态键盘丢失（appActive=false + keyWin=nil）**
-- 病例：ToolbarPanel 创建后 App 失活，无激活态窗口无法成为 key → Enter/Esc 全丢
-- 修复：editor.enter 后 activate + makeKeyAndOrderFront + makeFirstResponder（延后一个 runloop tick）
-
-**坑 9：SCK 返回分辨率与 NSScreen 物理像素不匹配（BetterDisplay/虚拟分辨率）**
-- 病例：3456×2234 物理的屏，SCK 整屏图实测 1920×1080（不是 nominal 也不是 exact 能救的）
-- 根因：backingScale 假设在虚拟分辨率模式下失效
-- 修复：CoordinateConverter 一律用「实际图尺寸 ÷ 屏幕 point 尺寸」实测比例；EditorSession.scale 同理
-
-**坑 10：滚动事件被覆盖层挡住（产品级 bug，不是测试问题）**
-- 病例：滚动模式下用户滚鼠标 → 事件给 key window（我们的覆盖层）→ 底下内容不动 → 永远拼接失败
-- 修复：scrollMode 时覆盖层 ignoresMouseEvents=true（事件穿透）
-
-**坑 11：滚动收尾键盘收不到（焦点在别的 App）**
-- 病例：滚动时焦点回到被滚动 App，Enter 普通键路径失效
-- 修复：Enter/Esc 用系统级 Carbon 热键动态注册（会话期注册/结束注销）
-
-**坑 12：CarbonHotKeyCenter 多实例（-9866 + 派发表查错实例）**
-- 病例：滚动热键 new 了第二个实例 → InstallEventHandler 重复安装报 -9866，
-  且事件派发查的是第一个实例的表 → 热键注册成功但永远不触发
-- 修复：单例化（CarbonHotKeyCenter.shared）
-
-**坑 13：Stitcher 默认容差在真实滚动帧上过严**
-- 病例：真实帧（抗锯齿+滚动条+子像素位移）在正确对齐处行差 17-23，默认 threshold 16 + 2% 不匹配率直接误判
-- 修复：threshold 24 + 10%（合成图与真实帧双验证）；同时修掉合成负向用例的伪对齐
- （行纯色页面在整数 seed 下只是行相位偏移——seed=7 ⇒ 伪重叠；改为反转色页）
+- 完成六边形架构搭建（`Core/Domain`、`Core/Ports`、`Adapters`、`UI`）与固定证书签名流程。
+- 实现区域/全屏/延时截图、7 种标注工具、Vision 本地 OCR、贴图 Pin、历史记录、自定义快捷键与工具栏排序、首次权限引导卡、Toast 点击重开编辑。
+- 完成流式增量滚动截图拼接引擎（`Stitcher` + `TileMotionEstimator` + `ScrollCaptureController`）与 12 项回归单测。

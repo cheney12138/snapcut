@@ -136,6 +136,12 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
             onToolChange: { [weak self] in self?.editorView?.needsDisplay = true },
             onAction: { [weak self] action in self?.toolbarAction(action) }
         )
+        toolbar.updateBackdropStyle(session.backdropStyle)
+        toolbar.onBackdropStyleChange = { [weak self] newStyle in
+            guard let self else { return }
+            self.session.backdropStyle = newStyle
+            self.editorView?.needsDisplay = true
+        }
         // 贴窗顶（合成窗场景；place(below:) 语义不适合标题窗）
         toolbar.place(aboveGlobal: window.frame)
         toolbar.orderFrontRegardless()
@@ -172,8 +178,17 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
             runOCR()
         case .pin:
             pinComposite()
-        case .scroll:
-            // 滚动截图是截图编辑器专属语义，拼贴编辑器无此动作（按钮不出现在此场景）
+        case .toggleBackdrop:
+            session.backdropStyle.enabled.toggle()
+            toolbar?.updateBackdropStyle(session.backdropStyle)
+            editorView?.needsDisplay = true
+            Log.event(.editor, "backdrop.toggle", [
+                "enabled": "\(session.backdropStyle.enabled)",
+                "preset": session.backdropStyle.preset.rawValue,
+                "host": "collage",
+            ])
+        case .scroll, .autoRedact:
+            // 滚动截图与自动脱敏快捷胶囊由截图主编辑器承载
             break
         }
     }
@@ -206,6 +221,7 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
         switch mode {
         case .copy:
             AppCoordinatorShared.deps?.clipboard.writeImage(image)
+            CaptureSoundPlayer.play()
             let settings = AppCoordinatorShared.coordinator?.settings ?? .defaultSettings
             if settings.showCopyNotification {
                 CaptureToast.show(image: image)
@@ -245,8 +261,10 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
         let screenRect = window.convertToScreen(view.convert(view.bounds, to: nil))
         // reviewer 补丁：pin 契约是 rect.size × backingScale == 像素尺寸——
         // 显示可能整体缩小（displayScale<1），按图像 point 尺寸落位才 1:1
-        let rect = CGRect(origin: screenRect.origin, size: imagePtSize)
+        let pinSize = session.currentBackdropLayout(for: imagePtSize)?.canvasSize ?? imagePtSize
+        let rect = CGRect(origin: screenRect.origin, size: pinSize)
         AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: rect)
+        CaptureSoundPlayer.play()
         Log.event(.pin, "collage.editor.pin", [
             "pxW": "\(image.width)", "pxH": "\(image.height)",
         ])
@@ -263,9 +281,20 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
         let rect = window.frame
         let screen = window.screen ?? NSScreen.main ?? NSScreen()
         Task { @MainActor in
-            let text = (try? await deps.textRecognizer.recognize(image)) ?? ""
-            OCRResultPanel.present(text: text, nearGlobalRect: rect, on: screen)
-            Log.event(.ocr, "ocr.present", ["chars": "\(text.count)"])
+            let result = (try? await deps.textRecognizer.recognizeStructured(image))
+                ?? StructuredOCRResult(
+                    plainText: "",
+                    qrCodes: [],
+                    markdownTable: nil,
+                    tableRowCount: 0,
+                    tableColumnCount: 0
+                )
+            OCRResultPanel.present(result: result, nearGlobalRect: rect, on: screen)
+            Log.event(.ocr, "ocr.present", [
+                "chars": "\(result.plainText.count)",
+                "qrs": "\(result.qrCodes.count)",
+                "table": result.markdownTable != nil ? "\(result.tableRowCount)x\(result.tableColumnCount)" : "none",
+            ])
         }
     }
 
@@ -327,19 +356,73 @@ final class CollageEditorContentView: NSView {
 
     // MARK: - 坐标换算
 
+    private struct PreviewTransform {
+        let layout: BackdropLayout?
+        let scale: CGFloat
+        let backdropRect: CGRect
+        let cardRect: CGRect
+        let imageRect: CGRect
+    }
+
+    private func currentPreviewTransform() -> PreviewTransform {
+        let ptSize = controller?.imagePtSize ?? bounds.size
+        guard let layout = session?.currentBackdropLayout(for: ptSize),
+              layout.canvasSize.width > 0,
+              layout.canvasSize.height > 0 else {
+            return PreviewTransform(
+                layout: nil,
+                scale: displayScale,
+                backdropRect: bounds,
+                cardRect: bounds,
+                imageRect: CGRect(x: 0, y: 0, width: ptSize.width * displayScale, height: ptSize.height * displayScale)
+            )
+        }
+        let fitScale = min(bounds.width / layout.canvasSize.width, bounds.height / layout.canvasSize.height)
+        let canvasW = layout.canvasSize.width * fitScale
+        let canvasH = layout.canvasSize.height * fitScale
+        let originX = (bounds.width - canvasW) * 0.5
+        let originY = (bounds.height - canvasH) * 0.5
+        func scaled(_ r: CGRect) -> CGRect {
+            CGRect(
+                x: originX + r.minX * fitScale,
+                y: originY + r.minY * fitScale,
+                width: r.width * fitScale,
+                height: r.height * fitScale
+            )
+        }
+        return PreviewTransform(
+            layout: layout,
+            scale: fitScale,
+            backdropRect: CGRect(x: originX, y: originY, width: canvasW, height: canvasH),
+            cardRect: scaled(layout.cardRect),
+            imageRect: scaled(layout.imageRect)
+        )
+    }
+
     /// 视图本地（Y-down，显示 points）→ 标注几何（图像本地 Y-down point）
     private func localToAnnotation(_ p: CGPoint) -> CGPoint {
-        CGPoint(x: p.x / displayScale, y: p.y / displayScale)
+        let t = currentPreviewTransform()
+        return CGPoint(
+            x: (p.x - t.imageRect.minX) / t.scale,
+            y: (p.y - t.imageRect.minY) / t.scale
+        )
     }
 
     private func annotationToLocal(_ p: CGPoint) -> CGPoint {
-        CGPoint(x: p.x * displayScale, y: p.y * displayScale)
+        let t = currentPreviewTransform()
+        return CGPoint(
+            x: t.imageRect.minX + p.x * t.scale,
+            y: t.imageRect.minY + p.y * t.scale
+        )
     }
 
     private func annotationRect(_ r: CGRect) -> CGRect {
-        CGRect(
-            x: r.minX / displayScale, y: r.minY / displayScale,
-            width: r.width / displayScale, height: r.height / displayScale
+        let t = currentPreviewTransform()
+        return CGRect(
+            x: (r.minX - t.imageRect.minX) / t.scale,
+            y: (r.minY - t.imageRect.minY) / t.scale,
+            width: r.width / t.scale,
+            height: r.height / t.scale
         )
     }
 
@@ -585,6 +668,12 @@ final class CollageEditorContentView: NSView {
             if textField != nil { commitTextFieldIfNeeded(); return }
             controller?.toolbarAction(.done)
         default:
+            if textField == nil,
+               Int(event.keyCode) == kVK_ANSI_B,
+               event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
+                controller?.toolbarAction(.toggleBackdrop)
+                return
+            }
             if textField == nil, let tool = EditorKeyRouter.tool(for: Int(event.keyCode)) {
                 controller?.keyActions.selectTool(tool)
                 return
@@ -598,9 +687,7 @@ final class CollageEditorContentView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard let session, let ctx = NSGraphicsContext.current?.cgContext else { return }
         let ptSize = controller?.imagePtSize ?? bounds.size
-
-        ctx.saveGState()
-        ctx.scaleBy(x: displayScale, y: displayScale)
+        let preview = currentPreviewTransform()
 
         let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
 
@@ -615,6 +702,69 @@ final class CollageEditorContentView: NSView {
                 base: session.baseImage, annotations: annotations, scale: session.scale
             )
             : session.baseImage
+
+        if let layout = preview.layout {
+            ctx.setFillColor(NSColor.black.withAlphaComponent(0.24).cgColor)
+            ctx.fill(bounds)
+
+            CGRenderer.drawBackdropBackground(
+                style: session.backdropStyle,
+                in: preview.backdropRect,
+                context: ctx,
+                contextIsYDown: true
+            )
+            let cardRadius = layout.cornerRadius * preview.scale
+            let cushion = layout.balanceInset > 0 ? session.backdropEdgeColor() : nil
+            CGRenderer.drawBackdropCardChrome(
+                cardRect: preview.cardRect,
+                cornerRadius: cardRadius,
+                isDarkBackdrop: session.backdropStyle.preset.isDark,
+                cushionColor: cushion,
+                context: ctx,
+                contextIsYDown: true
+            )
+
+            let cardPath = CGPath(
+                roundedRect: preview.cardRect,
+                cornerWidth: cardRadius,
+                cornerHeight: cardRadius,
+                transform: nil
+            )
+            ctx.saveGState()
+            ctx.addPath(cardPath)
+            ctx.clip()
+
+            ctx.saveGState()
+            ctx.translateBy(x: preview.imageRect.minX, y: preview.imageRect.maxY)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.translateBy(x: -preview.imageRect.minX, y: -preview.imageRect.minY)
+            ctx.interpolationQuality = .high
+            ctx.draw(baseForDraw, in: preview.imageRect)
+            ctx.restoreGState()
+
+            ctx.saveGState()
+            ctx.clip(to: preview.imageRect)
+            ctx.translateBy(x: preview.imageRect.minX, y: preview.imageRect.minY)
+            ctx.scaleBy(x: preview.scale, y: preview.scale)
+            CGRenderer.render(
+                annotations: annotations, in: ptSize, context: ctx, contextIsYDown: true
+            )
+            ctx.restoreGState()
+
+            ctx.restoreGState()
+
+            CGRenderer.drawBackdropCardHairline(
+                cardRect: preview.cardRect,
+                cornerRadius: cardRadius,
+                isDarkBackdrop: session.backdropStyle.preset.isDark,
+                lineWidth: 0.5,
+                context: ctx
+            )
+            return
+        }
+
+        ctx.saveGState()
+        ctx.scaleBy(x: displayScale, y: displayScale)
 
         // 2. 底图：像素精确 1:1（Y-down 上下文需镜像一次再 draw）
         ctx.saveGState()

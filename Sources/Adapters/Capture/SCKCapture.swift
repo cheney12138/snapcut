@@ -27,6 +27,20 @@ enum CaptureError: LocalizedError, Equatable {
 actor SCKCapture {
     static let shared = SCKCapture()
 
+    /// 启动后静默预热 SCShareableContent + SCScreenshotManager 首帧 GPU/Metal 管线：
+    /// 拍一张 64×64 微缩帧即可提前完成 WindowServer 握手与着色器编译，把重启后首次 F1 从 ~1s 压到 ~35ms
+    func warmup() async {
+        guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
+              let display = content.displays.first else { return }
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let config = SCStreamConfiguration()
+        config.width = 64
+        config.height = 64
+        config.showsCursor = false
+        config.captureResolution = .nominal
+        _ = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+    }
+
     func captureDisplay(displayID: CGDirectDisplayID) async throws -> CGImage {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {

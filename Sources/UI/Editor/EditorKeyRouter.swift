@@ -98,17 +98,30 @@ enum EditorKeyRouter {
         return flags
     }
 
-    /// 热键 1-6 直选工具（R6）
+    /// 当前工具栏从左到右的标注工具序列（与 ToolbarPanel 显示顺序严格一致）
+    static func orderedToolbarTools() -> [EditorSession.Tool] {
+        let order = (AppCoordinatorShared.coordinator?.settings ?? .defaultSettings).toolbarOrderSafe()
+        return order.compactMap { raw -> EditorSession.Tool? in
+            guard raw != 206, let tool = EditorSession.Tool(rawValue: raw), tool != .none else { return nil }
+            return tool
+        }
+    }
+
+    /// 返回指定工具对应的数字快捷键（1…7，按当前工具栏从左到右位置动态绑定）
+    static func shortcutNumber(for tool: EditorSession.Tool) -> Int? {
+        guard let idx = orderedToolbarTools().firstIndex(of: tool) else { return nil }
+        return idx + 1
+    }
+
+    /// 热键 1-7 直选工具：严格按工具栏从左到右的视觉顺序映射（1 箭头 / 2 矩形 / 3 椭圆 / 4 文字 / 5 马赛克 / 6 序号 / 7 高亮）
     static func tool(for keyCode: Int) -> EditorSession.Tool? {
-        let map: [Int: EditorSession.Tool] = [
-            kVK_ANSI_1: .arrow,
-            kVK_ANSI_2: .rect,
-            kVK_ANSI_3: .text,
-            kVK_ANSI_4: .mosaic,
-            kVK_ANSI_5: .sequence,
-            kVK_ANSI_6: .highlight,
-            kVK_ANSI_7: .ellipse,
+        let keyOrder = [
+            kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4,
+            kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7,
         ]
-        return map[keyCode]
+        guard let slot = keyOrder.firstIndex(of: keyCode) else { return nil }
+        let tools = orderedToolbarTools()
+        guard slot < tools.count else { return nil }
+        return tools[slot]
     }
 }

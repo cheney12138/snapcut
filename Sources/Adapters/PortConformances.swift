@@ -84,10 +84,18 @@ final class ScreenPermissionAdapter: ScreenPermissionChecking {
 
 extension HistoryStore: HistoryRecording {}
 
-/// Vision OCR 适配器：领域只看到 `recognize(_:) async throws -> String`
+/// Vision OCR 适配器：领域只看到 `recognize(_:)`、`recognizeStructured(_:)` 与 `detectSensitiveRegions(_:)`
 struct VisionTextRecognizerAdapter: TextRecognizing {
     func recognize(_ image: CGImage) async throws -> String {
         try await TextRecognizer.recognize(image)
+    }
+
+    func recognizeStructured(_ image: CGImage) async throws -> StructuredOCRResult {
+        try await TextRecognizer.recognizeStructured(image)
+    }
+
+    func detectSensitiveRegions(_ image: CGImage) async throws -> [DetectedSensitiveRegion] {
+        try await TextRecognizer.detectSensitiveRegions(image)
     }
 }
 

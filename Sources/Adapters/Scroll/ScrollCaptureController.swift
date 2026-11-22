@@ -1,29 +1,27 @@
 import AppKit
 import CoreGraphics
-import ScreenCaptureKit
+import CoreMedia
+import CoreVideo
+@preconcurrency import ScreenCaptureKit
 
-/// 滚动截图采集控制器（手动滚动模式）
+/// 滚动截图采集控制器（ScreenCaptureKit `SCStream` 60fps 连续流引擎）
 ///
-/// 使用方式：`start(region:)` 后用户自己滚动内容，控制器每 ~400ms 抓一帧并通过
-/// `onFrame` 回调交付；`stop()` 结束采集，随后把帧序列交给 `Stitcher` 拼接。
-///
-/// 自动滚动模式（CGEventPost 合成 scrollWheel 事件驱动页面滚动）暂未实现，
-/// 见下方 `startAutoScroll` 的 TODO 占位。
-///
-/// 线程语义：本类为 `@MainActor` 隔离；`start` / `stop` 必须在主线程调用；
-/// `onFrame` 回调同样保证在主线程（MainActor）执行，回调内拿到的是只读 CGImage，
-/// 可安全转交后台队列做拼接等重活。
+/// 相比早期的 `SCScreenshotManager.captureImage` 120ms 轮询（实际 ~7fps）：
+/// - 采用系统合成器直推的 `SCStream` 连续视频流，最高 **60 fps**（16.7ms/帧）且静止时 **0 推帧 / 0 CPU**；
+/// - 通过 `excludingApplications` 按当前进程 PID 彻底排除 Snapcut 自身浮层（OverlayWindow / 光晕框 / HUD）；
+/// - `sourceRect` 直接让 WindowServer 在 GPU 侧完成区域裁剪，`CVPixelBuffer` (`IOSurface`) 转 `CGImage` 仅耗时 `<1ms`，
+///   高速惯性甩动也能保持充足帧间重叠，彻底告别「滚动速度过快」。
 @MainActor
 final class ScrollCaptureController {
 
     // MARK: - 配置
 
     struct Config {
-        /// 抓帧间隔（秒）。手动滚动模式下 ~400ms 足以保证相邻帧重叠
-        // 0.12s（病例 2026-11-16：0.4s 间隔快滚一屏 > 间隔 → 帧间无重叠全丢，
-        // HUD 恒 1 帧）。0.12s 内用户滚不完整屏，相邻帧必有重叠可拼接
-        var captureInterval: TimeInterval = 0.12
-        /// 最小帧高（像素）：低于此值的帧（如空窗口）直接丢弃
+        /// 目标上限帧率（默认 60fps；ScreenCaptureKit 仅在画面变化时回调，静止不消耗）
+        var targetFPS: Int = 60
+        /// 缓冲队列深度（官方建议 ≤ 8）
+        var queueDepth: Int = 6
+        /// 最小帧高（像素）：低于此值的异常帧直接丢弃
         var minFrameHeight: Int = 8
     }
 
@@ -48,15 +46,19 @@ final class ScrollCaptureController {
 
     // MARK: - 状态
 
-    /// 帧回调：每抓到一帧在主线程调用一次
+    /// 帧回调：每收到一帧有效画面变化在主线程调用一次
     var onFrame: ((CGImage) -> Void)?
     /// 停止回调（用户 stop 或异常终止），在主线程调用
-    var onStop: ((Int) -> Void)? // 参数为本次采集累计交付的帧数
+    var onStop: ((Int) -> Void)?
+    /// 流启动或运行期异常回调（主线程）
+    var onError: ((Error) -> Void)?
 
     private(set) var isRunning = false
-    private var task: Task<Void, Never>?
+    private var startTask: Task<Void, Never>?
+    private var sessionGeneration = 0
     private var deliveredFrameCount = 0
-
+    private let streamBox = ScrollStreamBox()
+    private let streamQueue = DispatchQueue(label: "app.snapcut.scroll.stream", qos: .userInteractive)
     private let config: Config
 
     init(config: Config = Config()) {
@@ -64,58 +66,87 @@ final class ScrollCaptureController {
     }
 
     deinit {
-        task?.cancel()
+        startTask?.cancel()
+        let box = streamBox
+        Task { await box.stop() }
     }
 
     // MARK: - 开始 / 停止
 
-    /// 开始对指定区域（AppKit 全局坐标，point）做定时抓帧采集。
-    ///
-    /// - Throws: 区域不在屏幕上 / 已在运行 / 找不到显示器。
-    /// 线程语义：必须在主线程调用；内部立刻返回，抓帧循环运行在后台 Task 中。
+    /// 开始对指定区域（AppKit 全局坐标，point）启动 60fps `SCStream` 连续采集。
     func start(region: CGRect) throws {
         guard !isRunning else { throw ScrollCaptureError.alreadyRunning }
         guard let screen = Self.screen(containing: region) else {
-            throw ScrollCaptureController.ScrollCaptureError.regionOffScreen
+            throw ScrollCaptureError.regionOffScreen
         }
         guard let displayID = Self.displayID(of: screen) else {
             throw ScrollCaptureError.displayNotFound
         }
+
+        let screenFrame = screen.frame
         let scale = screen.backingScaleFactor
-        let interval = config.captureInterval
+        let fps = max(1, min(120, config.targetFPS))
+        let queueDepth = max(2, min(8, config.queueDepth))
+        let minHeight = config.minFrameHeight
+
+        sessionGeneration &+= 1
+        let generation = sessionGeneration
         isRunning = true
         deliveredFrameCount = 0
+
         Log.event(.scroll, "scroll.sampler.start", [
+            "engine": "SCStream",
             "region": "\(Int(region.width))x\(Int(region.height))",
-            "display": "\(displayID)", "interval": "\(interval)",
+            "display": "\(displayID)",
+            "maxFPS": "\(fps)",
         ])
 
-        task = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    let frame = try await ScrollFrameGrabber.capture(
-                        region: region, displayID: displayID, scale: scale)
-                    if let self, frame.height >= self.config.minFrameHeight {
+        let box = streamBox
+        let queue = streamQueue
+        startTask = Task { [weak self] in
+            do {
+                try await box.start(
+                    generation: generation,
+                    region: region,
+                    displayID: displayID,
+                    screenFrame: screenFrame,
+                    scale: scale,
+                    fps: fps,
+                    queueDepth: queueDepth,
+                    minFrameHeight: minHeight,
+                    streamQueue: queue,
+                    onFrame: { [weak self] image in
+                        guard let self, self.isRunning, self.sessionGeneration == generation else { return }
                         self.deliveredFrameCount += 1
-                        self.onFrame?(frame)
+                        self.onFrame?(image)
+                    },
+                    onError: { [weak self] error in
+                        guard let self, self.isRunning, self.sessionGeneration == generation else { return }
+                        Log.error(.scroll, "scroll.stream.error", ["err": "\(error.localizedDescription)"])
+                        self.onError?(error)
                     }
-                } catch {
-                    // 单帧失败（权限抖动 / 显示器热插拔等）打日志继续重试，不中断采集
-                    Log.error(.scroll, "scroll.frame.grab.fail", ["err": "\(error.localizedDescription)"])
-                }
-                try? await Task.sleep(for: .seconds(interval))
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, !Task.isCancelled, self.isRunning, self.sessionGeneration == generation else { return }
+                Log.error(.scroll, "scroll.stream.startFail", ["err": "\(error.localizedDescription)"])
+                self.isRunning = false
+                self.onError?(error)
             }
         }
     }
 
-    /// 停止采集。已抓到的帧仍会通过 `onFrame` 交付完在途的一帧（若有），
-    /// 随后触发 `onStop(累计帧数)`。
-    /// 线程语义：必须在主线程调用；幂等（未运行时调用无副作用）。
+    /// 停止采集，终止 `SCStream` 与启动任务，随后触发 `onStop(累计帧数)`。
     func stop() {
         guard isRunning else { return }
-        task?.cancel()
-        task = nil
+        sessionGeneration &+= 1
+        startTask?.cancel()
+        startTask = nil
         isRunning = false
+
+        let box = streamBox
+        Task { await box.stop() }
         Log.event(.scroll, "scroll.sampler.stop", ["delivered": "\(deliveredFrameCount)"])
         onStop?(deliveredFrameCount)
     }
@@ -134,103 +165,224 @@ final class ScrollCaptureController {
             as? CGDirectDisplayID else { return nil }
         return id
     }
-
-    // MARK: - 自动滚动（TODO 占位，暂不实现）
-
-    /// TODO(auto-scroll): 自动滚动模式 —— 通过 CGEventPost 合成 scrollWheel 事件
-    /// 驱动目标窗口匀速滚动（先点击窗口获得焦点，再按固定像素步长发事件），
-    /// 抓帧节奏与滚动步长联动以保证相邻帧重叠可控。
-    /// 需要辅助功能权限（AXIsProcessTrusted）；实现时复用本类的抓帧循环，
-    /// 仅把「用户手滚」换成「事件驱动滚动」。
-    // func startAutoScroll(region: CGRect, pixelsPerTick: Int) throws { ... }
 }
 
-// MARK: - 精简抓帧器（集成占位）
+// MARK: - SCStream 生命周期隔离 Actor
 
-/// ScrollFrameGrabber：本模块自带的精简抓帧实现（SCShareableContent +
-/// SCScreenshotManager 整屏截图 + 像素裁剪）。
-///
-/// ⚠️ 集成时删除本类型，改用 internal/capture 模块的 CaptureService /
-/// SCKCapture（坐标换算统一走 CoordinateConverter），避免两套截屏入口并存。
-///
-/// 线程语义：`capture` 为 async；SCShareableContent / SCScreenshotManager 的
-/// 异步接口自带并发安全，本类型无共享可变状态，可多任务并发调用。
-enum ScrollFrameGrabber {
-    /// 采样排除的自有浮层 windowID（HUD/滚动光晕窗等——OverlayController 注册）
-    nonisolated(unsafe) static var excludedWindowIDs: Set<CGWindowID> = []
+private actor ScrollStreamBox {
+    private var activeStream: SCStream?
+    private var activeOutput: ScrollStreamOutput?
+    private var currentGeneration = 0
 
-    /// 抓取区域截图：整屏 SCK 截图 → 按 scale 裁剪到像素区域。
-    /// region 为 AppKit 全局点坐标；displayID 为目标显示器。
-    static func capture(
-        region: CGRect, displayID: CGDirectDisplayID, scale: CGFloat
-    ) async throws -> CGImage {
+    func start(
+        generation: Int,
+        region: CGRect,
+        displayID: CGDirectDisplayID,
+        screenFrame: CGRect,
+        scale: CGFloat,
+        fps: Int,
+        queueDepth: Int,
+        minFrameHeight: Int,
+        streamQueue: DispatchQueue,
+        onFrame: @escaping @MainActor (CGImage) -> Void,
+        onError: @escaping @MainActor (Error) -> Void
+    ) async throws {
+        await stop()
+        currentGeneration = generation
+
         let content = try await SCShareableContent.excludingDesktopWindows(
-            false, onScreenWindowsOnly: true)
+            false, onScreenWindowsOnly: true
+        )
+        try Task.checkCancellation()
+        guard currentGeneration == generation else { return }
+
         guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
             throw ScrollCaptureController.ScrollCaptureError.displayNotFound
         }
-        // HUD/组框等自有浮层不进采样（用户病例 2026-11-16「HUD 进了截图」）：
-        // 按 windowID 排除（ScrollCaptureController.hudWindowIDs 注册）
-        let excluded = content.windows.filter { window in
-            Self.excludedWindowIDs.contains(window.windowID)
+
+        // 进程级排除 Snapcut 自身所有窗口（OverlayWindow / 光晕框 / HUD），从合成层杜绝入镜
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let excludedApps = content.applications.filter { $0.processID == ownPID }
+        let filter: SCContentFilter
+        if !excludedApps.isEmpty {
+            filter = SCContentFilter(
+                display: display, excludingApplications: excludedApps, exceptingWindows: []
+            )
+        } else {
+            let ownWindows = content.windows.filter { $0.owningApplication?.processID == ownPID }
+            filter = SCContentFilter(display: display, excludingWindows: ownWindows)
         }
-        let filter = SCContentFilter(display: display, excludingWindows: excluded)
+
         let config = SCStreamConfiguration()
-        // ⚠️ 默认 .nominal 会返回降采样图（逻辑分辨率），坐标按物理像素裁剪就会越界
-        // （病例：屏幕下方选区 pxH=80 而非 500）。.exact = 显示器原生像素。
         config.captureResolution = .best
-        // 限定源区域（病例 2026-11-16 采样提速）：0.12s 间隔下每帧整屏截图
-        // （4K×2 屏）不可持续——sourceRect 只截选区，输出尺寸 = 选区物理像素，
-        // 采集耗时从 ~90ms/帧（整屏）降到 ~15ms/帧（选区）
-        let physical = NSScreen.screens.first {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
-        }
-        let frame = physical?.frame ?? CGRect(x: 0, y: 0, width: 1728, height: 1117)
-        let scaleF = physical?.backingScaleFactor ?? 2
-        // SCStream 的 sourceRect 坐标：相对 display frame、Y-down（顶部对齐）
-        let sourceRect = CGRect(
-            x: region.minX - frame.minX,
-            y: frame.maxY - region.maxY,
+        config.sourceRect = CGRect(
+            x: region.minX - screenFrame.minX,
+            y: screenFrame.maxY - region.maxY,
             width: region.width,
             height: region.height
         )
-        config.sourceRect = sourceRect
-        config.width = Int(region.width * scaleF)
-        config.height = Int(region.height * scaleF)
+        config.width = max(1, Int(region.width * scale))
+        config.height = max(1, Int(region.height * scale))
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        config.queueDepth = queueDepth
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = false
         config.scalesToFit = false
-        let full = try await SCScreenshotManager.captureImage(
-            contentFilter: filter, configuration: config)
 
-        // sourceRect 生效（图尺寸 == 选区像素）直出
-        let expectedW = Int(region.width * scaleF)
-        let expectedH = Int(region.height * scaleF)
-        if full.width == expectedW && full.height == expectedH {
+        Log.event(.scroll, "scroll.filter.cached", [
+            "display": "\(displayID)",
+            "excludedApps": "\(excludedApps.count)",
+            "px": "\(config.width)x\(config.height)",
+            "maxFPS": "\(fps)",
+        ])
+
+        let output = ScrollStreamOutput(
+            expectedWidth: config.width,
+            expectedHeight: config.height,
+            minFrameHeight: minFrameHeight,
+            region: region,
+            screenFrame: screenFrame,
+            onFrame: onFrame,
+            onError: onError
+        )
+        let stream = SCStream(filter: filter, configuration: config, delegate: output)
+        try stream.addStreamOutput(output, type: .screen, sampleHandlerQueue: streamQueue)
+        try await stream.startCapture()
+
+        if Task.isCancelled || currentGeneration != generation {
+            try? await stream.stopCapture()
+            return
+        }
+        activeStream = stream
+        activeOutput = output
+    }
+
+    func stop() async {
+        currentGeneration &+= 1
+        let stream = activeStream
+        activeStream = nil
+        activeOutput = nil
+        if let stream {
+            try? await stream.stopCapture()
+        }
+    }
+}
+
+// MARK: - SCStream 高速帧接收器（IOSurface 零阻塞拷贝 → sRGB CGImage）
+
+private final class ScrollStreamOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    private let expectedWidth: Int
+    private let expectedHeight: Int
+    private let minFrameHeight: Int
+    private let region: CGRect
+    private let screenFrame: CGRect
+    private let colorSpace: CGColorSpace
+    private let onFrame: @MainActor (CGImage) -> Void
+    private let onError: @MainActor (Error) -> Void
+
+    init(
+        expectedWidth: Int,
+        expectedHeight: Int,
+        minFrameHeight: Int,
+        region: CGRect,
+        screenFrame: CGRect,
+        onFrame: @escaping @MainActor (CGImage) -> Void,
+        onError: @escaping @MainActor (Error) -> Void
+    ) {
+        self.expectedWidth = expectedWidth
+        self.expectedHeight = expectedHeight
+        self.minFrameHeight = minFrameHeight
+        self.region = region
+        self.screenFrame = screenFrame
+        self.colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        self.onFrame = onFrame
+        self.onError = onError
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of type: SCStreamOutputType
+    ) {
+        guard type == .screen, CMSampleBufferIsValid(sampleBuffer) else { return }
+
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+            as? [[SCStreamFrameInfo: Any]],
+           let statusRaw = attachments.first?[.status] as? Int,
+           let status = SCFrameStatus(rawValue: statusRaw),
+           status != .complete {
+            return
+        }
+
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard let image = makeCGImage(from: pixelBuffer), image.height >= minFrameHeight else { return }
+
+        let deliver = onFrame
+        Task { @MainActor in
+            deliver(image)
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        let notify = onError
+        Task { @MainActor in
+            notify(error)
+        }
+    }
+
+    private func makeCGImage(from pixelBuffer: CVPixelBuffer) -> CGImage? {
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard width > 0, height > 0, bytesPerRow >= width * 4 else { return nil }
+
+        // 立刻拷贝并解锁 IOSurface，避免占住 SCStream queueDepth 环形缓冲
+        let pixelData = Data(bytes: baseAddress, count: bytesPerRow * height)
+        guard let provider = CGDataProvider(data: pixelData as CFData) else { return nil }
+
+        let bitmapInfo = CGBitmapInfo(
+            rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        )
+        guard let full = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo,
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ) else {
+            return nil
+        }
+
+        if full.width == expectedWidth && full.height == expectedHeight {
             return full
         }
-        // 防御回退：SCK 忽略 sourceRect / 输出降采样（BetterDisplay 虚拟分辨率
-        // 病例）——按实测比例从整屏图裁剪
-        guard frame.width > 0, frame.height > 0 else {
-            throw ScrollCaptureController.ScrollCaptureError.regionOffScreen
-        }
-        let scaleX = CGFloat(full.width) / frame.width
-        let scaleY = CGFloat(full.height) / frame.height
+
+        guard screenFrame.width > 0, screenFrame.height > 0 else { return full }
+        let scaleX = CGFloat(full.width) / screenFrame.width
+        let scaleY = CGFloat(full.height) / screenFrame.height
         let pxRect = CGRect(
-            x: (region.minX - frame.minX) * scaleX,
-            y: (frame.maxY - region.maxY) * scaleY,
+            x: (region.minX - screenFrame.minX) * scaleX,
+            y: (screenFrame.maxY - region.maxY) * scaleY,
             width: region.width * scaleX,
             height: region.height * scaleY
         ).integral
         guard pxRect.width > 0, pxRect.height > 0,
               let cropped = full.cropping(to: pxRect) else {
-            throw ScrollCaptureController.ScrollCaptureError.regionOffScreen
+            return nil
         }
         return cropped
-    }
-
-    /// displayID 辅助（与 ScrollCaptureController 保持一致的取法）
-    private static func displayID(of screen: NSScreen) -> CGDirectDisplayID? {
-        screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
-            as? CGDirectDisplayID
     }
 }

@@ -64,63 +64,77 @@ final class CountdownHUD {
     }
 
     private func buildPanel() {
-        let size = NSSize(width: 168, height: 132)
+        let cardSize = NSSize(width: 168, height: 132)
+        let margin: CGFloat = 20
+        let cornerRadius: CGFloat = 18
+        let totalSize = NSSize(width: cardSize.width + margin * 2, height: cardSize.height + margin * 2)
+
         let panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: size),
+            contentRect: NSRect(origin: .zero, size: totalSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         panel.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 2)
+        panel.appearance = NSAppearance(named: .aqua)
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        // 禁用 borderless NSVisualEffectView 的系统 hasShadow（白色直角伪影根因），统一走 OuterShadowView
+        panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
-        let card = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
-        card.material = .hudWindow
-        card.blendingMode = .behindWindow
-        card.state = .active
-        card.wantsLayer = true
-        card.layer?.cornerRadius = 18
-        card.layer?.masksToBounds = true
-        card.layer?.borderWidth = 0.5
-        card.layer?.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
-        card.layer?.backgroundColor = NSColor(srgbRed: 0.149, green: 0.149, blue: 0.169, alpha: 0.62).cgColor
+        let outer = NSView(frame: NSRect(origin: .zero, size: totalSize))
+        outer.wantsLayer = true
 
+        let shadowHost = OuterShadowView(spec: .pill, margin: margin, cornerRadius: cornerRadius)
+        shadowHost.frame = outer.bounds
+        shadowHost.autoresizingMask = [.width, .height]
+        outer.addSubview(shadowHost)
+
+        let cardRect = NSRect(x: margin, y: margin, width: cardSize.width, height: cardSize.height)
+        let glassSurface = DesignTokens.Mat.liquidGlass(
+            cornerRadius: cornerRadius,
+            style: .clear,
+            tintColor: DesignTokens.Mat.floatingGlassTint,
+            fallbackMaterial: DesignTokens.Mat.hud
+        )
+        glassSurface.hostView.frame = cardRect
+        outer.addSubview(glassSurface.hostView)
+
+        let container = NSView(frame: cardRect)
+        container.wantsLayer = true
+        container.appearance = NSAppearance(named: .aqua)
+        outer.addSubview(container)
         let number = NSTextField(labelWithString: "3")
-        number.font = .systemFont(ofSize: 64, weight: .semibold)
+        number.font = .monospacedDigitSystemFont(ofSize: 64, weight: .semibold)
         number.alignment = .center
-        number.textColor = .white
-        number.frame = NSRect(x: 0, y: 34, width: size.width, height: 76)
-        card.addSubview(number)
+        number.textColor = DesignTokens.label1
+        number.frame = NSRect(x: 0, y: 36, width: cardSize.width, height: 76)
+        container.addSubview(number)
 
         let hint = NSTextField(labelWithString: "按 Esc 取消")
-        hint.font = .systemFont(ofSize: 11)
+        hint.font = .systemFont(ofSize: 11.5, weight: .medium)
         hint.alignment = .center
-        hint.textColor = NSColor.white.withAlphaComponent(0.55)
-        hint.frame = NSRect(x: 0, y: 16, width: size.width, height: 16)
-        card.addSubview(hint)
+        hint.textColor = DesignTokens.label2
+        hint.frame = NSRect(x: 0, y: 16, width: cardSize.width, height: 16)
+        container.addSubview(hint)
 
-        panel.contentView = card
+        panel.contentView = outer
+        outer.layoutSubtreeIfNeeded()
+        shadowHost.refreshGeometry()
         self.panel = panel
         self.label = number
 
-        // 位置：鼠标所在屏，居中偏上
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
-        if let visible = screen?.visibleFrame {
-            panel.setFrameOrigin(CGPoint(
-                x: visible.midX - size.width / 2,
-                y: visible.midY + 80
-            ))
-        }
+        // 位置：光标所在显示器正居中
+        let origin = DisplayRegistry.centerOrigin(for: cardSize)
+        panel.setFrameOrigin(CGPoint(x: origin.x - margin, y: origin.y - margin))
         panel.alphaValue = 0
         panel.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.18
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
             self.panel?.animator().alphaValue = 1
         }
     }

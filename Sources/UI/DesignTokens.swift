@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 /// 设计 Token 单一真源（施工图：tokens.md / 视觉真源：snapcut-design-redesign/index.html）
 ///
@@ -129,24 +130,144 @@ enum DesignTokens {
         /// 窗的常规材质，三件套（满铺 effectView + isOpaque=false + clear）下稳定。
         static let window: NSVisualEffectView.Material = .sidebar
 
-        /// 统一玻璃容器配方：三档材质 + blendingMode(.behindWindow) + active +
-        /// 圆角 + 0.5pt stroke 描边。钉暗由窗口 appearance 负责（本函数不碰 appearance）。
+        /// 缓存的 9-slice 圆角蒙版图（Apple 官方 NSVisualEffectView.maskImage 方案）：
+        /// 严格把 WindowServer 磨砂层裁在连续圆角内，彻底消除 macOS 亮/暗色下的四角白块与晕边。
+        private static var maskCache: [Int: NSImage] = [:]
+
+        static func roundedMaskImage(cornerRadius r: CGFloat) -> NSImage {
+            let key = Int((r * 10).rounded())
+            if let cached = maskCache[key] { return cached }
+            // `.continuous` 超椭圆拐角过渡略大于圆半径（约 1.52×r），9-slice cap 取 ceil(1.6×r) 保证边角零拉伸
+            let cap = max(r, ceil(r * 1.6))
+            let side = max(4, cap * 2 + 2)
+            let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+                if let cg = NSGraphicsContext.current?.cgContext {
+                    cg.addPath(continuousRoundedPath(in: rect, cornerRadius: r))
+                    cg.setFillColor(NSColor.black.cgColor)
+                    cg.fillPath()
+                }
+                return true
+            }
+            image.capInsets = NSEdgeInsets(top: cap, left: cap, bottom: cap, right: cap)
+            image.resizingMode = .stretch
+            maskCache[key] = image
+            return image
+        }
+
+        /// 统一玻璃容器配方（macOS 15 回退材质）：三档材质 + blendingMode(.behindWindow) + active +
+        /// maskImage 精确圆角裁剪 + 明暗自适应 0.5pt stroke 描边。
         static func glass(
             material: NSVisualEffectView.Material,
             cornerRadius: CGFloat,
             strokeWidth: CGFloat = 0.5,
             strokeColor: NSColor? = nil
         ) -> NSVisualEffectView {
-            let v = NSVisualEffectView()
+            let v = AdaptiveGlassView(
+                cornerRadius: cornerRadius,
+                strokeWidth: strokeWidth,
+                dynamicStrokeColor: strokeColor ?? DesignTokens.stroke
+            )
             v.material = material
             v.blendingMode = .behindWindow
             v.state = .active
-            v.wantsLayer = true
-            v.layer?.cornerRadius = cornerRadius
-            v.layer?.masksToBounds = true
-            v.layer?.borderWidth = strokeWidth
-            v.layer?.borderColor = (strokeColor ?? DesignTokens.stroke).cgColor
             return v
+        }
+
+        /// macOS 26 原生 Liquid Glass 风格档位
+        enum LiquidGlassStyle {
+            /// 标准液态玻璃（工具栏、悬浮胶囊、控件栏：光学折射 + 高可读对比）
+            case regular
+            /// 通透液态玻璃（拼贴托盘、画布衬底：极清透玻璃质感 + 真实边缘折射）
+            case clear
+        }
+
+        /// 原生液态玻璃容器包装：
+        /// - macOS 26+ 使用系统原生 `NSGlassEffectView`，并严格把所有子视图放进 `contentView`
+        ///   （Apple 官方要求：直接 addSubview 到 NSGlassEffectView 无法保证 z-order）；
+        /// - macOS 15 自动回落 `AdaptiveGlassView`（NSVisualEffectView），保持双版本兼容。
+        struct LiquidGlassSurface {
+            let hostView: NSView
+            let contentContainer: NSView
+            let isNativeLiquidGlass: Bool
+        }
+
+        /// 悬浮控件用通透液态玻璃微着色（搭配 `NSGlassEffectView.style = .clear`）：
+        /// 不画边框黑线，靠适度提亮/加深玻璃体与「紧贴接触影 + 柔和抬升影」自然切分玻璃与背景。
+        static let floatingGlassTint = NSColor(name: "dt.floatingGlassTint") { ap in
+            ap.isDark ? NSColor(srgbRed: 0.09, green: 0.09, blue: 0.12, alpha: 0.42)
+                      : NSColor(srgbRed: 1.0, green: 1.0, blue: 1.0, alpha: 0.48)
+        }
+
+        /// 高晶液态玻璃微着色（视觉记忆浮窗等大面积内容面板专用：纯白晶透微着 `0.42`，对齐工具栏通透度）
+        static let crystalGlassTint = NSColor(srgbRed: 1.0, green: 1.0, blue: 1.0, alpha: 0.42)
+
+        static func liquidGlass(
+            cornerRadius: CGFloat,
+            style: LiquidGlassStyle = .clear,
+            tintColor: NSColor? = nil,
+            fallbackMaterial: NSVisualEffectView.Material = .hudWindow
+        ) -> LiquidGlassSurface {
+            if #available(macOS 26.0, *) {
+                let glass = NSGlassEffectView()
+                glass.cornerRadius = cornerRadius
+                glass.style = (style == .clear) ? .clear : .regular
+                glass.tintColor = tintColor
+                let inner = NSView()
+                inner.wantsLayer = true
+                glass.contentView = inner
+                return LiquidGlassSurface(
+                    hostView: glass,
+                    contentContainer: inner,
+                    isNativeLiquidGlass: true
+                )
+            }
+            let fallback = glass(material: fallbackMaterial, cornerRadius: cornerRadius)
+            return LiquidGlassSurface(
+                hostView: fallback,
+                contentContainer: fallback,
+                isNativeLiquidGlass: false
+            )
+        }
+
+        /// 恒定浅色高晶玻璃容器（`.aqua` `.menu` 澄澈模糊 + `.continuous` 9-slice 裁切 + 纯白晶透提亮，无任何边框黑线）：
+        /// - 相比 `.hudWindow`，`.menu` 在 `.aqua` 下通透度更高、更接近高晶玻璃观感；
+        /// - 相比 macOS 26 原生 `NSGlassEffectView`（内部硬编码 `CABackdropLayer.tracksLuma = 1` 会在切到深色 IDE 时首帧闪跳），
+        ///   本实现完全不含 `tracksLuma`，深浅背景切屏时 100% 稳定零闪烁，同时由 `OuterShadowView` 双层阴影自然托起。
+        static func fixedLightCrystalBlur(
+            cornerRadius: CGFloat,
+            tintAlpha: CGFloat = 0.08
+        ) -> LiquidGlassSurface {
+            let glassView = AdaptiveGlassView(
+                cornerRadius: cornerRadius,
+                strokeWidth: 0,
+                dynamicStrokeColor: .clear
+            )
+            glassView.appearance = NSAppearance(named: .aqua)
+            glassView.material = .menu
+            glassView.blendingMode = .behindWindow
+            glassView.state = .active
+
+            if tintAlpha > 0 {
+                let veil = NSView(frame: glassView.bounds)
+                veil.autoresizingMask = [.width, .height]
+                veil.wantsLayer = true
+                veil.layer?.backgroundColor = NSColor(srgbRed: 1.0, green: 1.0, blue: 1.0, alpha: tintAlpha).cgColor
+                glassView.addSubview(veil)
+            }
+
+            return LiquidGlassSurface(
+                hostView: glassView,
+                contentContainer: glassView,
+                isNativeLiquidGlass: false
+            )
+        }
+
+        /// 生成与 `NSGlassEffectView` 内部 `CASDFElementLayer` 完全一致的 `.continuous` 连续曲率超椭圆路径
+        static func continuousRoundedPath(in rect: CGRect, cornerRadius: CGFloat) -> CGPath {
+            let r = min(cornerRadius, min(rect.width, rect.height) / 2)
+            return RoundedRectangle(cornerRadius: max(0, r), style: .continuous)
+                .path(in: rect)
+                .cgPath
         }
     }
 
@@ -154,40 +275,43 @@ enum DesignTokens {
 
     @MainActor
     enum Inset {
-        /// inset.hi：顶缘 1pt 白 .10（亮色 .65）渐隐高光
-        static let hiAlpha: (CGFloat, CGFloat) = (0.10, 0.65)
-        /// inset.hi.strong：accent 实心控件顶缘白 .16
-        static let strongAlpha: CGFloat = 0.16
+        /// inset.hi：顶缘 1pt 镜面高光（暗 .14 / 亮 .55）
+        static let hiAlpha: (CGFloat, CGFloat) = (0.14, 0.55)
+        /// inset.hi.strong：accent 实心控件顶缘白 .18
+        static let strongAlpha: CGFloat = 0.18
 
-        /// 给圆角容器加顶缘内高光：1pt 高渐变层（两端用 CAGradientLayer 渐隐），
-        /// 需在 wantsLayer + masksToBounds 的容器内添加（贴描边下沿）。
+        /// 给圆角容器加对称顶缘镜面高光：1pt 高渐变层在左右圆角处柔缓淡出，模拟 Apple 玻璃顶缘受光。
         static func installHighlight(on container: NSView, alpha: CGFloat, topInset: CGFloat = 0.5) {
             let g = CAGradientLayer()
-            g.frame = CGRect(x: 0, y: topInset, width: container.bounds.width, height: 1)
-            g.autoresizingMask = [.layerWidthSizable]
+            let yPos = container.isFlipped ? topInset : max(0, container.bounds.height - topInset - 1)
+            g.frame = CGRect(x: 0, y: yPos, width: container.bounds.width, height: 1)
+            g.autoresizingMask = container.isFlipped
+                ? [.layerWidthSizable]
+                : [.layerWidthSizable, .layerMinYMargin]
             g.colors = [
+                NSColor.white.withAlphaComponent(0).cgColor,
                 NSColor.white.withAlphaComponent(alpha).cgColor,
-                NSColor.white.withAlphaComponent(alpha * 0.35).cgColor,
+                NSColor.white.withAlphaComponent(alpha).cgColor,
                 NSColor.white.withAlphaComponent(0).cgColor,
             ]
             g.startPoint = CGPoint(x: 0, y: 0.5)
             g.endPoint = CGPoint(x: 1, y: 0.5)
-            g.locations = [0, 0.18, 1]
+            g.locations = [0, 0.12, 0.88, 1]
             container.layer?.addSublayer(g)
         }
     }
 
-    // MARK: - 3. 投影（克制，贴近 NSWindow 系统阴影；AppKit y 向下 ⇒ CSS offset 取负）
+    // MARK: - 3. 投影（Apple 双层光学投影：贴边接触影 + 柔散环境影）
 
     @MainActor
     enum Shadow {
-        /// shadow.float：单层 0 18 44 −20 .30（「高而淡」，贴合系统浮窗单层影）
-        /// 轻盈感审查：双层 r15/α.50 + r32/α.55 叠加合成峰值 ≈.7+，比系统浮窗还沉 → 砍单层
+        /// shadow.float：双层光学影（贴边接触影 r4/y-1/α.14 + 环境浮起影 r24/y-10/α.22）
         static let float = [
-            LayerShadow(radius: 44, offset: CGSize(width: 0, height: -18), alpha: 0.30, spread: 20),
+            LayerShadow(radius: 4, offset: CGSize(width: 0, height: -1), alpha: 0.14, spread: 0),
+            LayerShadow(radius: 24, offset: CGSize(width: 0, height: -10), alpha: 0.22, spread: 4),
         ]
-        /// shadow.card：0 6 16 −8 .28（单层，层级低于 float；卡片类浮层复用）
-        static let card = LayerShadow(radius: 16, offset: CGSize(width: 0, height: -6), alpha: 0.28, spread: 8)
+        /// shadow.card：卡片浮层投影（单层紧凑柔影）
+        static let card = LayerShadow(radius: 16, offset: CGSize(width: 0, height: -6), alpha: 0.24, spread: 4)
         /// shadow.knob：滑杆旋钮 0 1 3 .45
         static let knob = LayerShadow(radius: 3, offset: CGSize(width: 0, height: -1), alpha: 0.45, spread: 0)
 
@@ -283,55 +407,125 @@ enum DesignTokens {
         static let sliderHeight: CGFloat = 20
     }
 
-    // MARK: - 8. 动效
+    // MARK: - 8. 动效（Emil Design Engineering & Apple Craft 标准：绝不对 UI 用 ease-in）
 
     enum Motion {
-        /// motion.spring：0.22s cubic-bezier(.34,1.3,.5,1)（CaptureToast 手感，全产品统一）
+        /// 强缓出曲线 cubic-bezier(0.23, 1, 0.32, 1) — 入场/退场/微反馈统一首选，起步即响应
+        nonisolated(unsafe) static let easeOutStrong = CAMediaTimingFunction(controlPoints: 0.23, 1.0, 0.32, 1.0)
+        /// 强缓入缓出曲线 cubic-bezier(0.77, 0, 0.175, 1) — 屏内位移/形变专用
+        nonisolated(unsafe) static let easeInOutStrong = CAMediaTimingFunction(controlPoints: 0.77, 0.0, 0.175, 1.0)
+        /// 克制的临界阻尼曲线 cubic-bezier(0.22, 1, 0.36, 1) — 工具栏/浮层落位干脆利落，无廉价橡胶回弹
+        nonisolated(unsafe) static let springTimingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.0, 0.36, 1.0)
+
+        /// 系统减少动态效果偏好（开启时去掉位移/缩放，仅保留克制淡入淡出）
+        @MainActor static var reduceMotion: Bool {
+            NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        }
+
+        /// motion.spring：0.22s 临界阻尼入场
         static let springDuration: TimeInterval = 0.22
-        static let springControlPoints: (Float, Float, Float, Float) = (0.34, 1.3, 0.5, 1)
-        /// motion.fade：0.20s 退场淡出
-        static let fadeDuration: TimeInterval = 0.20
+        static let springControlPoints: (Float, Float, Float, Float) = (0.22, 1.0, 0.36, 1.0)
+        /// 按钮按压触觉反馈：120ms ease-out + scale(0.97)
+        static let pressDuration: TimeInterval = 0.12
+        static let pressScale: CGFloat = 0.97
+        /// motion.fade：0.16s 退场淡出
+        static let fadeDuration: TimeInterval = 0.16
         /// motion.pulse：1.6s ease-in-out 往复（光晕 α .35↔.70），滚动采集边缘光晕
         static let pulseDuration: CFTimeInterval = 1.6
         static let pulseAlphaMin: Float = 0.35
         static let pulseAlphaMax: Float = 0.70
-        /// hover 反馈 0.15s（不再上移）
-        static let hoverDuration: CFTimeInterval = 0.15
+        /// hover 反馈 0.14s
+        static let hoverDuration: CFTimeInterval = 0.14
 
-        /// motion.enter：0.26s spring + rise 10pt + scale .97→1 + fade（贴边浮层入场：
-        /// 工具栏/HUD/toast/文字件；入场 = fade + rise + scale 三件套）
-        static let enterDuration: TimeInterval = 0.26
-        static let enterRise: CGFloat = 10
+        /// motion.enter：0.22s strong ease-out + rise 8pt + scale .97→1 + fade
+        static let enterDuration: TimeInterval = 0.22
+        static let enterRise: CGFloat = 8
         static let enterScale: CGFloat = 0.97
-        /// motion.enter.center：0.28s spring + rise 10pt + scale .96→1（居中卡入场：引导卡）
-        static let enterCenterDuration: TimeInterval = 0.28
+        /// motion.enter.center：0.24s strong ease-out + rise 8pt + scale .96→1（引导卡）
+        static let enterCenterDuration: TimeInterval = 0.24
         static let enterCenterScale: CGFloat = 0.96
-        /// motion.exit：0.16s ease-in + sink 4pt + scale→.97 + fade（一切退场；
-        /// 杜绝 orderOut 直切。toast 下滑 6pt / 引导卡下沉 6pt 用同 token 另调 sink）
-        static let exitDuration: TimeInterval = 0.16
+        /// motion.exit：0.14s ease-out + sink 4pt + scale→.97 + fade（绝不用 ease-in 拖慢收尾）
+        static let exitDuration: TimeInterval = 0.14
         static let exitSink: CGFloat = 4
         static let exitScale: CGFloat = 0.97
-        /// motion.crossfade：0.15s ease-out（内容态/页面切换：设置 tab、HUD 三态）
+        /// motion.crossfade：0.15s ease-out（内容态/页面切换）
         static let crossfadeDuration: TimeInterval = 0.15
-
-        /// 统一 spring timing（NSAnimationContext / CATransaction 共用）
-        nonisolated(unsafe) static let springTimingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.3, 0.5, 1)
     }
 
     // MARK: - 工具栏规格（§9 场景速查）
 
     enum Toolbar {
-        static let height: CGFloat = 56
-        static let padding: CGFloat = 10
-        static let groupGap: CGFloat = 8
-        /// 组间 hairline 两侧各 4（叠加 stack 8 ⇒ 线到内容 12）
-        static let separatorMargin: CGFloat = 4
+        /// 按用户选择的工具栏尺寸档位派生的完整几何度量（遵守 macOS 26 Liquid Glass 同心圆角规范）
+        struct Metrics {
+            let buttonSide: CGFloat
+            let iconPointSize: CGFloat
+            let paddingH: CGFloat
+            let paddingV: CGFloat
+            let groupGap: CGFloat
+            let separatorHeight: CGFloat
+            let separatorMargin: CGFloat
+            let dotSide: CGFloat
+            let dotGap: CGFloat
+            let strokeButtonSide: CGFloat
+            let strokeDotScale: CGFloat
+
+            var height: CGFloat { buttonSide + paddingV * 2 }
+            var cornerRadius: CGFloat {
+                switch buttonSide {
+                case ..<33: return 12
+                case ..<39: return 14
+                default: return 16
+                }
+            }
+            var innerPillRadius: CGFloat {
+                switch buttonSide {
+                case ..<33: return 7
+                case ..<39: return 8.5
+                default: return 10
+                }
+            }
+
+            static func forSize(_ size: AppSettings.ToolbarSize) -> Metrics {
+                switch size {
+                case .compact:
+                    return Metrics(
+                        buttonSide: 30, iconPointSize: 15.5,
+                        paddingH: 10, paddingV: 7, groupGap: 4,
+                        separatorHeight: 18, separatorMargin: 4,
+                        dotSide: 13, dotGap: 4,
+                        strokeButtonSide: 24, strokeDotScale: 1.0
+                    )
+                case .regular:
+                    return Metrics(
+                        buttonSide: 36, iconPointSize: 17.5,
+                        paddingH: 12, paddingV: 7, groupGap: 5,
+                        separatorHeight: 20, separatorMargin: 5,
+                        dotSide: 15, dotGap: 5,
+                        strokeButtonSide: 28, strokeDotScale: 1.15
+                    )
+                case .large:
+                    return Metrics(
+                        buttonSide: 42, iconPointSize: 20.0,
+                        paddingH: 14, paddingV: 8, groupGap: 6,
+                        separatorHeight: 24, separatorMargin: 6,
+                        dotSide: 17, dotGap: 6,
+                        strokeButtonSide: 32, strokeDotScale: 1.3
+                    )
+                }
+            }
+        }
+
+        static let height: CGFloat = 50
+        static let padding: CGFloat = 7
+        static let groupGap: CGFloat = 5
+        /// 组间 hairline 两侧各 5
+        static let separatorMargin: CGFloat = 5
         static let separatorHeight: CGFloat = 20
-        static let iconIdleAlpha: CGFloat = 0.85
+        static let iconIdleAlpha: CGFloat = 0.88
         static let iconDisabledAlpha: CGFloat = 0.28
-        static let dotSide: CGFloat = 14
-        static let dotGap: CGFloat = 6
-        static let copyButtonSide: CGFloat = 32   // 2026-11-17 重设计：与工具按钮同步 32（全条一致）
+        static let dotSide: CGFloat = 15
+        static let dotGap: CGFloat = 5
+        static let copyButtonSide: CGFloat = 36
         static let tooltipFontSize: CGFloat = 10.5
     }
 
@@ -438,6 +632,235 @@ enum DesignTokens {
         // 拼帧超时上限（病例：3840×2098 两帧 compose 卡 10s 后才 fail——超时
         // 直接回退单帧+恢复原选区，不让用户在无反馈的收尾期干等）
         static let composeTimeout: TimeInterval = 3
+    }
+}
+
+// MARK: - 双层光学阴影宿主视图（紧贴接触影 + 柔和抬升影）
+
+/// 为透明液态玻璃面板提供「紧贴接触影 + 柔和抬升影」：
+///
+/// - 使用独立子 `CALayer` 承载阴影（绕开 AppKit 对 `NSView.layer.shadowOpacity` 在 `addSubview` 时强制清零的坑）；
+/// - 宿主覆盖含投影留白在内的整张外框，在宿主层挂载覆盖全边界的 `.evenOdd` 蒙版把玻璃圆角内部 100% 镂空，
+///   使用 `RoundedRectangle(style: .continuous)` 精确对齐 `NSGlassEffectView` 的 `.continuous` 圆角曲率。
+@MainActor
+final class OuterShadowView: NSView {
+    struct Spec {
+        let contactRadius: CGFloat
+        let contactOffset: CGSize
+        let contactLightAlpha: CGFloat
+        let contactDarkAlpha: CGFloat
+        let ambientRadius: CGFloat
+        let ambientOffset: CGSize
+        let ambientInset: CGSize
+        let ambientLightAlpha: CGFloat
+        let ambientDarkAlpha: CGFloat
+
+        static let toolbar = Spec(
+            contactRadius: 1.2,
+            contactOffset: CGSize(width: 0, height: -0.5),
+            contactLightAlpha: 0.34,
+            contactDarkAlpha: 0.54,
+            ambientRadius: 8.5,
+            ambientOffset: CGSize(width: 0, height: -3.0),
+            ambientInset: CGSize(width: 1.5, height: 1.0),
+            ambientLightAlpha: 0.18,
+            ambientDarkAlpha: 0.34
+        )
+
+        static let pill = Spec(
+            contactRadius: 1.1,
+            contactOffset: CGSize(width: 0, height: -0.5),
+            contactLightAlpha: 0.32,
+            contactDarkAlpha: 0.52,
+            ambientRadius: 6.5,
+            ambientOffset: CGSize(width: 0, height: -2.5),
+            ambientInset: CGSize(width: 1.0, height: 0.8),
+            ambientLightAlpha: 0.17,
+            ambientDarkAlpha: 0.32
+        )
+
+        static let spotlight = Spec(
+            contactRadius: 1.3,
+            contactOffset: CGSize(width: 0, height: -0.5),
+            contactLightAlpha: 0.32,
+            contactDarkAlpha: 0.54,
+            ambientRadius: 12,
+            ambientOffset: CGSize(width: 0, height: -5),
+            ambientInset: CGSize(width: 2.0, height: 1.5),
+            ambientLightAlpha: 0.20,
+            ambientDarkAlpha: 0.38
+        )
+    }
+
+    private let spec: Spec
+    private let margin: CGFloat
+    private let cornerRadius: CGFloat
+    private let ambientLayer = CALayer()
+    private let contactLayer = CALayer()
+    private let cutoutMask = CAShapeLayer()
+
+    init(spec: Spec, margin: CGFloat, cornerRadius: CGFloat) {
+        self.spec = spec
+        self.margin = margin
+        self.cornerRadius = cornerRadius
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = false
+
+        for l in [ambientLayer, contactLayer] {
+            l.backgroundColor = NSColor.clear.cgColor
+            l.shadowOpacity = 1
+            layer?.addSublayer(l)
+        }
+        ambientLayer.shadowRadius = spec.ambientRadius
+        ambientLayer.shadowOffset = spec.ambientOffset
+        contactLayer.shadowRadius = spec.contactRadius
+        contactLayer.shadowOffset = spec.contactOffset
+
+        cutoutMask.fillRule = .evenOdd
+        layer?.mask = cutoutMask
+        refreshAppearanceColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("OuterShadowView 只走代码创建") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        refreshGeometry()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshAppearanceColors()
+    }
+
+    func refreshGeometry() {
+        let panelRect = bounds.insetBy(dx: margin, dy: margin)
+        guard panelRect.width > 2, panelRect.height > 2 else { return }
+
+        let localPillRect = CGRect(origin: .zero, size: panelRect.size)
+        let localPillPath = DesignTokens.Mat.continuousRoundedPath(in: localPillRect, cornerRadius: cornerRadius)
+        let ambientRect = localPillRect.insetBy(dx: spec.ambientInset.width, dy: spec.ambientInset.height)
+        let ambientCorner = max(1, cornerRadius - max(spec.ambientInset.width, spec.ambientInset.height))
+        let ambientPath = DesignTokens.Mat.continuousRoundedPath(in: ambientRect, cornerRadius: ambientCorner)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        contactLayer.frame = panelRect
+        contactLayer.shadowPath = localPillPath
+        ambientLayer.frame = panelRect
+        ambientLayer.shadowPath = ambientPath
+
+        let maskPath = CGMutablePath()
+        maskPath.addRect(bounds)
+        maskPath.addPath(DesignTokens.Mat.continuousRoundedPath(in: panelRect, cornerRadius: cornerRadius))
+        cutoutMask.frame = bounds
+        cutoutMask.path = maskPath
+
+        CATransaction.commit()
+    }
+
+    private func refreshAppearanceColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let isDark = effectiveAppearance.isDark
+            let contactAlpha = isDark ? spec.contactDarkAlpha : spec.contactLightAlpha
+            let ambientAlpha = isDark ? spec.ambientDarkAlpha : spec.ambientLightAlpha
+            contactLayer.shadowColor = NSColor.black.withAlphaComponent(contactAlpha).cgColor
+            ambientLayer.shadowColor = NSColor.black.withAlphaComponent(ambientAlpha).cgColor
+        }
+    }
+}
+
+// MARK: - 自适应圆角玻璃视图（自动应用 maskImage 消四角白边 + 跟随系统明暗刷新描边与顶缘镜面高光）
+
+@MainActor
+final class AdaptiveGlassView: NSVisualEffectView {
+    private let cornerRadius: CGFloat
+    private let strokeWidth: CGFloat
+    private let dynamicStrokeColor: NSColor
+    private let specularLayer = CAGradientLayer()
+
+    init(cornerRadius: CGFloat, strokeWidth: CGFloat, dynamicStrokeColor: NSColor) {
+        self.cornerRadius = cornerRadius
+        self.strokeWidth = strokeWidth
+        self.dynamicStrokeColor = dynamicStrokeColor
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = cornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.borderWidth = strokeWidth
+        maskImage = DesignTokens.Mat.roundedMaskImage(cornerRadius: cornerRadius)
+
+        if strokeWidth > 0 {
+            specularLayer.startPoint = CGPoint(x: 0, y: 0.5)
+            specularLayer.endPoint = CGPoint(x: 1, y: 0.5)
+            specularLayer.locations = [0, 0.12, 0.88, 1]
+            layer?.addSublayer(specularLayer)
+        }
+        refreshAppearanceColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("AdaptiveGlassView 只走代码创建") }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let yPos = isFlipped ? 0.5 : max(0, bounds.height - 1.5)
+        specularLayer.frame = CGRect(x: 0, y: yPos, width: bounds.width, height: 1)
+        CATransaction.commit()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshAppearanceColors()
+    }
+
+    func refreshAppearanceColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let isDark = effectiveAppearance.isDark
+            layer?.borderColor = dynamicStrokeColor.cgColor
+            let hiAlpha = isDark ? DesignTokens.Inset.hiAlpha.0 : DesignTokens.Inset.hiAlpha.1
+            specularLayer.colors = [
+                NSColor.white.withAlphaComponent(0).cgColor,
+                NSColor.white.withAlphaComponent(hiAlpha).cgColor,
+                NSColor.white.withAlphaComponent(hiAlpha).cgColor,
+                NSColor.white.withAlphaComponent(0).cgColor,
+            ]
+        }
+    }
+}
+
+// MARK: - 按钮居中缩放按压反馈辅助（Emil Craft：scale(0.97) 120ms ease-out）
+
+@MainActor
+enum TactilePress {
+    /// 以视图中心为锚点施加缩放动画（不破坏 AppKit 默认 (0,0) anchorPoint 的 frame 布局）
+    static func animate(view: NSView, pressed: Bool, scale: CGFloat = DesignTokens.Motion.pressScale) {
+        guard !DesignTokens.Motion.reduceMotion, let layer = view.layer else { return }
+        let b = view.bounds
+        guard b.width > 0, b.height > 0 else { return }
+        let target: CATransform3D
+        if pressed {
+            var t = CATransform3DIdentity
+            t = CATransform3DTranslate(t, b.midX, b.midY, 0)
+            t = CATransform3DScale(t, scale, scale, 1)
+            t = CATransform3DTranslate(t, -b.midX, -b.midY, 0)
+            target = t
+        } else {
+            target = CATransform3DIdentity
+        }
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(DesignTokens.Motion.pressDuration)
+        CATransaction.setAnimationTimingFunction(DesignTokens.Motion.easeOutStrong)
+        layer.transform = target
+        CATransaction.commit()
     }
 }
 

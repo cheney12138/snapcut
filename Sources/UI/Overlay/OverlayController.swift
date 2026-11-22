@@ -25,6 +25,8 @@ final class OverlayController {
     }
 
     private var windows: [OverlayWindow] = []
+    /// 屏幕级 OverlayWindow 复用池（按 displayID 缓存；彻底消除重启后首次建窗及每次 F1 重建 33MB 4K backing-store 的开销）
+    private var windowPool: [CGDirectDisplayID: OverlayWindow] = [:]
     private var completion: ((Result) -> Void)?
     private var selectionScreen: NSScreen?
     private var selectionRectGlobal: CGRect?
@@ -36,6 +38,8 @@ final class OverlayController {
     private var previousAppPID: Int?
     /// 编辑会话（编辑态非空）
     private(set) var editorSession: EditorSession?
+    /// 最近一次编辑态导出快照（在 end() 清空 editorSession 前保存，供上层读写可重编矢量层）
+    private(set) var lastExportSnapshot: EditableExportSnapshot?
     private var toolbar: ToolbarPanel?
     /// 冻结帧（每显示器一张，截图时刻的静态画面）
     ///
@@ -45,26 +49,39 @@ final class OverlayController {
     /// ③ 选区调整/重拍/放大镜/取色全部离线可做；④ 松手进编辑态变零延迟（本地裁剪）。
     private(set) var frozenImages: [CGDirectDisplayID: CGImage] = [:]
 
-    /// 滚动截图会话（编辑态 S / 工具栏按钮触发；非空时覆盖层显示采集 HUD）
-    private(set) var scrollFrames: [CGImage] = []
+    /// 滚动截图会话（编辑态 S / 工具栏按钮触发；串行流式增量拼接）
     private var scrollController: ScrollCaptureController?
     private var scrollSelectionRect: CGRect?
     private var scrollScreen: NSScreen?
-    /// 采集 HUD（档 1 玻璃面板：呼吸点 + tabular 帧数 + 44×3 进度条）
+    /// 采集 HUD（档 1 玻璃面板：呼吸点 + 等宽屏数/像素读数 + 状态提示）
     private var scrollHUD: ScrollCaptureHUDPanel?
-    /// 到底判定：连续两次采样无新增内容（§9 场景 06）
-    private var scrollNoProgressCount = 0
     private var scrollBottomDetected = false
     private var scrollBottomWork: DispatchWorkItem?
-    /// 拼接进度（最新帧净贡献占比，驱动 HUD 进度条）
-    private var scrollProgress: CGFloat = 0
-    /// 参考帧缓冲 = 最后一帧入拼接序列的帧（静止判定 / 区域生长的重叠检测基准）。
-    /// ⚠️ 必须与「上一交付帧」区分：慢滚/滚动中停顿的交付帧与上一帧近似但与参
-    /// 考帧有净贡献——拿上一交付帧做基准会把慢滚全部误判静止丢帧（病例：用户
-    /// 滚动 11s 只有 2 帧，交 delivered=3 计 frames=2）。仅在入列时更新。
-    private var scrollRefBuffer: PixelBuffer?
-    /// ref 的原 CGImage（tile-NCC 位移估计需要像素图,PixelBuffer 只存行签名）
-    private var scrollRefImage: CGImage?
+    /// 双向真实触底/触顶检测（通过全局 scrollWheel 监听区分「主动继续滚却撞墙不增长」与「中途停下来看屏」）：
+    /// 中途停顿无滚轮输入时绝不自动结束；无论是从上往下滚到底，还是从下往上滚到顶，只要撞墙即自动合成
+    private var scrollWheelMonitor: Any?
+    private var scrollWheelLocalMonitor: Any?
+    private var scrollWheelEverReceived = false
+    private var scrollDownSign: CGFloat = -1
+    private var scrollDownSignCalibrated = false
+    private var lastScrollEventDeltaY: CGFloat = 0
+    private var lastDownScrollTime: CFAbsoluteTime = 0
+    private var lastUpScrollTime: CFAbsoluteTime = 0
+    private var scrollDownEventsSinceGrowth = 0
+    private var scrollUpEventsSinceGrowth = 0
+    private var boundaryWallStaticFrames = 0
+    private var boundaryWallStartTime: CFAbsoluteTime?
+    private var scrollViewportHeightPx = 1
+    private var scrollInContainedRegion = false
+    /// 串行流式增量拼接管线（actor 隔离，保证严格按采集顺序处理）
+    private var scrollPipeline: ScrollStitchPipeline?
+    private var scrollFrameInFlight = false
+    /// 60fps 突发甩屏防丢帧队列（上限 24 帧，彻底避免高速惯性滚动丢掉中间重叠帧）
+    private var scrollFrameQueue: [CGImage] = []
+    private static let maxBufferedScrollFrames = 24
+    private var scrollSessionToken = 0
+    private var scrollAcceptedCount = 0
+    private var scrollStitchedHeightPx = 0
     /// 「滚动过快」HUD 提示的回落 work（1.2s）
     private var scrollDroppedHintWork: DispatchWorkItem?
     /// compose 期 Esc 连按计数（3 次 = 强制取消逃生）
@@ -74,16 +91,14 @@ final class OverlayController {
     /// 本次采集是否观测到过真实滚动（净贡献 > 0）：到底自动合成的前置条件——
     /// 从未滚动就静止 ≠ 到底（用户在读屏定位），不能自动合成
     private var scrollEverScrolled = false
-
-    /// 进入滚动采集时的原选区（grow 之前）：拼接失败回退单帧时恢复它，
-    /// 而不是保留 grow 后的选区（病例：grow 扩到全屏 → compose 失败 →
-    /// enter.fromScroll pxH=2098 pxW=3840 全屏选区，另一屏也被框住）
     private var scrollInitialSelection: CGRect?
-    /// 滚动会话专用热键（采集态焦点在别的 App，普通 keyDown 收不到——e2e 实测病例）
-    /// ⚠️ 终止键 = settings.editorHotkeys["scroll"]（默认 s）+ Enter；取消 = Esc
+    /// 会话级 Carbon Esc 拦截：在 HIToolbox/WindowServer 层直接接管 Esc，
+    /// 彻底不依赖 macOS 14+ 协作激活（NSApp.isActive / keyWindow）是否放行，
+    /// 重启后首次唤起 0ms 也能一按 Esc 立刻关闭，且绝不漏给底层 App。
+    private var overlayEscHotKey: UInt32?
+    /// 滚动会话专用热键（终止键 = settings.editorHotkeys["scroll"] + Enter；Esc 由会话级 overlayEscHotKey 统一路由）
     private var scrollFinishHotKey: UInt32?
     private var scrollFinishReturnHotKey: UInt32?
-    private var scrollCancelHotKey: UInt32?
     /// 收尾拼接进行中（stop 之后 → 合成结果回填编辑器之前的异步窗口期）：
     /// 此期间编辑器键全部吞掉（OverlayView.keyDown 检查）——editorSession 还挂着
     /// 旧单帧底图，Enter→done / Esc→cancel 会把会话销毁，合成结果将无处回填
@@ -93,46 +108,172 @@ final class OverlayController {
 
     // MARK: - 会话
 
-    /// 从外源图片重开编辑器（toast 点击「打开截图继续编辑」入口）：
-    /// 不拍屏（图已有）——建光标屏 overlay 窗、selection=图适配屏的显示矩形、
-    /// 直接进编辑态。原尺寸保留（导出时按 session.scale 还原像素）。
-    func openEditor(image: CGImage, completion: @escaping (Result) -> Void) {
+    /// 启动后离屏静默预热（绝不抢前台焦点）：
+    /// 1. 预建可复用 ToolbarPanel；
+    /// 2. 预建当前鼠标所在屏的 OverlayWindow（orderOut 不显示，消除首次 4K backing-store 分配）；
+    /// 3. 轻触输入源/CoreGraphics 像素管线，提前在后台完成冷元数据加载。
+    func warmup() {
+        if toolbar == nil {
+            toolbar = ToolbarPanel()
+        }
+        if let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })
+            ?? NSScreen.main ?? NSScreen.screens.first {
+            _ = acquireOverlayWindow(for: screen)
+        }
+        // 轻量触发输入源元数据加载（不激活 App、不抢焦点），缓解重启首次 key 窗时的 IMK 冷加载阻塞
+        _ = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
+    }
+
+    private func acquireOverlayWindow(for screen: NSScreen) -> OverlayWindow {
+        if let displayID = DisplayRegistry.displayID(of: screen) {
+            if let pooled = windowPool[displayID] {
+                pooled.prepareForReuse(screen: screen)
+                return pooled
+            }
+            let win = OverlayWindow(screen: screen, controller: self)
+            windowPool[displayID] = win
+            return win
+        }
+        return OverlayWindow(screen: screen, controller: self)
+    }
+
+    /// 设置中修改了工具栏大小或按钮排序后立即失效缓存工具栏，下次按 F1 即刻生效（无需重启）
+    func invalidateToolbar() {
+        toolbar?.hideTooltip()
+        toolbar?.orderOut(nil)
+        toolbar = nil
+    }
+
+    private func registerOverlayEscapeHotKey() {
+        guard overlayEscHotKey == nil else { return }
+        overlayEscHotKey = CarbonHotKeyCenter.shared.register(
+            keyCode: kVK_Escape, modifiers: []
+        ) { [weak self] in
+            self?.handleSessionEscape()
+        }
+    }
+
+    private func unregisterOverlayEscapeHotKey() {
+        CarbonHotKeyCenter.shared.unregister(overlayEscHotKey)
+        overlayEscHotKey = nil
+    }
+
+    /// 会话级 Esc 统一路由（优先级：拼接逃生 > 滚动取消 > OCR 浮层 > 文字输入 > 退出截图会话）
+    private func handleSessionEscape() {
+        if isScrollComposing {
+            scrollEscForceCount += 1
+            Log.event(.scroll, "scroll.composing.ignoreKey", [
+                "key": "esc", "force": "\(scrollEscForceCount)/3",
+            ])
+            if scrollEscForceCount >= 3 {
+                teardownScrollSession()
+                perform(action: .cancel)
+            }
+            return
+        }
+        if scrollController != nil {
+            cancelScrollCapture()
+            return
+        }
+        if OCRResultPanel.isPresented {
+            OCRResultPanel.dismissIfPresented()
+            return
+        }
+        for window in windows {
+            if window.overlayView.cancelActiveTextEditingIfNeeded() {
+                return
+            }
+        }
+        perform(action: .cancel)
+    }
+
+    /// 从外源图片重开编辑器（toast 点击重开 / 拼贴合并后直接编辑共用）：
+    /// 不拍屏（图已有）——若传入原位 `preferredRect` 且完整落在可视区内，直接原位无缝切换为无边框 Apple 标注画布；
+    /// 否则按屏幕 backingScale 与可视区居中适配，并弹出一体化 Liquid Glass 工具栏（彻底告别笨重黑标题栏窗）。
+    func openEditor(
+        image: CGImage,
+        initialAnnotations: [AnnotationModel]? = nil,
+        savedCanvasSize: CGSize? = nil,
+        preferredScreen: NSScreen? = nil,
+        preferredRect: CGRect? = nil,
+        completion: @escaping (Result) -> Void
+    ) {
         self.completion = completion
+        lastExportSnapshot = nil
         overlaySessionEpoch += 1
         teardownScrollSession()
         editorSession = nil
-        toolbar?.dismiss()
-        toolbar = nil
+        toolbar?.hideTooltip()
+        toolbar?.orderOut(nil)
         dismissAll()
         frozenImages.removeAll()
         previousApp = NSWorkspace.shared.frontmostApplication
         previousAppPID = previousApp.map { Int($0.processIdentifier) }
+        registerOverlayEscapeHotKey()
         ensureActivation(reason: "toast.reopen")
-        NSApp.activate(ignoringOtherApps: true)
 
-        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
+        let screen = preferredScreen
+            ?? NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
             ?? NSScreen.main ?? NSScreen.screens.first
         guard let screen else { return }
-        // 图适配屏（80% 可视高度上限,宽同比例）
-        let maxH = screen.visibleFrame.height * 0.8
-        let maxW = screen.visibleFrame.width * 0.8
-        let scale = min(1, min(maxW / CGFloat(image.width), maxH / CGFloat(image.height)))
-        let w = CGFloat(image.width) * scale
-        let h = CGFloat(image.height) * scale
-        let selection = CGRect(
-            x: screen.frame.midX - w / 2, y: screen.frame.midY - h / 2,
-            width: w, height: h)
 
-        let window = OverlayWindow(screen: screen, controller: self)
+        // 按屏幕原生点尺寸适配可视区（留出下方工具栏空间），若传入 preferredRect 则优先原位无缝衔接
+        let visible = screen.visibleFrame
+        let backing = max(1, screen.backingScaleFactor)
+        let logicalW = CGFloat(image.width) / backing
+        let logicalH = CGFloat(image.height) / backing
+        let toolbarReserve = DesignTokens.Toolbar.height + 20
+        let maxW = visible.width * 0.88
+        let maxH = max(200, visible.height * 0.84 - toolbarReserve)
+        let fit = min(1.0, min(maxW / max(1, logicalW), maxH / max(1, logicalH)))
+        let w = max(80, (logicalW * fit).rounded())
+        let h = max(80, (logicalH * fit).rounded())
+
+        let selection: CGRect
+        if let pref = preferredRect {
+            let minX = visible.minX + 16
+            let maxX = max(minX, visible.maxX - w - 16)
+            let minY = visible.minY + toolbarReserve
+            let maxY = max(minY, visible.maxY - h - 16)
+            let x = min(max(pref.midX - w / 2, minX), maxX).rounded()
+            let y = min(max(pref.midY - h / 2, minY), maxY).rounded()
+            selection = CGRect(x: x, y: y, width: w, height: h)
+        } else {
+            let centerY = visible.midY + DesignTokens.Toolbar.height * 0.4
+            let minY = max(visible.minY + toolbarReserve, centerY - h / 2)
+            let clampedMinY = min(minY, visible.maxY - h - 16)
+            selection = CGRect(
+                x: (visible.midX - w / 2).rounded(),
+                y: clampedMinY.rounded(),
+                width: w,
+                height: h
+            )
+        }
+
+        let window = acquireOverlayWindow(for: screen)
         window.orderFrontRegardless()
         windows.append(window)
         window.makeKey()
-        didSelect(rect: selection, on: screen)
-        Log.event(.app, "toast.reopen.editor", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
+
+        selectionScreen = screen
+        selectionRectGlobal = selection
+        AppCoordinatorShared.didEnterConfirm()
+        enterEditor(base: image, selection: selection, screen: screen)
+        if let initialAnnotations, !initialAnnotations.isEmpty, let session = editorSession {
+            session.restoreAnnotations(initialAnnotations, savedCanvasSize: savedCanvasSize)
+            toolbar?.refreshSelectionState()
+            editorWindow()?.overlayView.needsDisplay = true
+            Log.event(.editor, "editor.restore.annotations", ["count": "\(initialAnnotations.count)"])
+        }
+        Log.event(.app, "toast.reopen.editor", [
+            "pxW": "\(image.width)", "pxH": "\(image.height)",
+            "ptW": "\(Int(w))", "ptH": "\(Int(h))",
+        ])
     }
 
     func begin(completion: @escaping (Result) -> Void, onShown: (() -> Void)? = nil) {
         self.completion = completion
+        lastExportSnapshot = nil
         overlaySessionEpoch += 1
         // 补丁 E（reviewer）：防御性清滚动残留（不依赖 coordinator state 门禁——
         // 缺失边①：任何绕过路径留下的吞键/采样/HUD 状态一律清零）
@@ -157,74 +298,49 @@ final class OverlayController {
             Log.event(.app, "focus.begin.record", ["pid": "-1", "bundle": "nil"])
         }
         editorSession = nil
-        toolbar?.dismiss()   // motion.exit；completion 持有面板至收窗
-        toolbar = nil
+        toolbar?.hideTooltip()
+        toolbar?.orderOut(nil)
         dismissAll()
         frozenImages.removeAll()
-        // 激活 App：保证覆盖层可靠接收键盘（Enter/Esc）与点击拖拽
-        // （点击激活竞争对未激活窗口不可靠；结束时 restoreFocus 归还）
-        ensureActivation(reason: "overlay.begin")
-        NSApp.activate(ignoringOtherApps: true)
+        // 立刻注册会话级 Carbon Esc 热键：即使 macOS 14+ 暂未授予激活态，Esc 也能 0ms 可靠退出
+        registerOverlayEscapeHotKey()
 
-        // 冻结优先：窗口先不上屏（此刻若有窗口会被自己拍进去），
-        // 全屏拍完再盖上去。单屏实测 ~90ms，符合「触发到冻结 ≤500ms」。
+        // 仅锁定鼠标当前所在屏幕（不覆盖另一块外接/内建屏，冻结耗时也减半）
+        // 注意：不再在 captureDisplay 之前同步调用 NSApp.activate()，消除首次冷启动 ViewBridgeAuxiliary 35ms 抢跑阻塞
+        let targetScreen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+
+        // 冻结优先：窗口先不上屏（此刻若有窗口会被自己拍进去），拍完立刻上屏（零 sleep 门闩）
+        let epoch = overlaySessionEpoch
         Task { [weak self] in
             guard let self else { return }
             let start = DispatchTime.now()
             var frames: [CGDirectDisplayID: CGImage] = [:]
-            await withTaskGroup(of: (CGDirectDisplayID, CGImage?).self) { group in
-                for screen in NSScreen.screens {
-                    guard let displayID = DisplayRegistry.displayID(of: screen) else { continue }
-                    group.addTask {
-                        do {
-                            let image = try await SCKCapture.shared.captureDisplay(displayID: displayID)
-                            return (displayID, image)
-                        } catch {
-                            Log.error(.capture, "freeze.fail", [
-                                "display": "\(displayID)", "err": "\(error)",
-                            ])
-                            return (displayID, nil)
-                        }
-                    }
-                }
-                for await (displayID, image) in group {
-                    if let image { frames[displayID] = image }
+            if let screen = targetScreen, let displayID = DisplayRegistry.displayID(of: screen) {
+                do {
+                    let image = try await SCKCapture.shared.captureDisplay(displayID: displayID)
+                    frames[displayID] = image
+                } catch {
+                    Log.error(.capture, "freeze.fail", [
+                        "display": "\(displayID)", "err": "\(error)",
+                    ])
                 }
             }
+            // 若用户在冻结几十毫秒内已按 Esc 取消，直接丢弃，绝不迟到弹窗
+            guard epoch == self.overlaySessionEpoch else { return }
             self.frozenImages = frames
             let freezeMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
             )
-            // 门闩 v3（用户「偶尔有延迟」）：窗先上屏（视觉即时），激活并行
-            // 补位——窗层起拖兜底（sendEvent beginDragIfNeeded）已让「激活
-            // 慢半拍」期间的鼠标事件也能框选；冻结期间最多等 200ms 激活
-            // 让 Esc/键盘也可用，超时放行不再拖显示
-            for _ in 0..<2 {
-                if NSApp.isActive { break }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            self.showOverlayWindows()
-            if !NSApp.isActive {
-                Task { @MainActor in
-                    var attempts = 0
-                    while !NSApp.isActive, attempts < 18 {
-                        // 每 100ms 重发 activate（用户终报「咔咔的」：单发
-                        // activate 被系统异步丢弃，主线程 runloop 上的重发
-                        // 最终被接受——3 秒不激活 = 干等不重试的空转）
-                        NSApp.activate(ignoringOtherApps: true)
-                        try? await Task.sleep(nanoseconds: 100_000_000)
-                        attempts += 1
-                    }
-                    if !NSApp.isActive {
-                        Log.error(.app, "overlay.open.activationTimeout", [:])
-                    }
-                }
+            if let screen = targetScreen {
+                self.showOverlayWindow(on: screen)
             }
             let elapsedMs = Int(
                 Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
             )
             Log.event(.overlay, "overlay.open", [
-                "screens": "\(NSScreen.screens.count)",
+                "screens": "1/\(NSScreen.screens.count)",
                 "ms": "\(elapsedMs)",
                 "freezeMs": "\(freezeMs)",
                 "frozen": "\(frames.count)",
@@ -233,33 +349,40 @@ final class OverlayController {
         }
     }
 
-    /// 上屏：每屏一窗，带冻结帧的窗直接把静态画面铺满（用户看到"屏幕定住"）
-    private func showOverlayWindows() {
-        // 光标屏先建先 key（病例 2026-11-16「面板出现在另一个屏幕」：双屏各
-        // 一窗是设计，但 key 窗按建窗顺序随机落屏——键盘事件/工具栏跟随全跟
-        // 错屏。光标在哪个屏，哪个屏的窗是 key）
-        let cursorScreen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
+    /// 已处于选区态时再次按下区域截图热键：
+    /// - 若光标已移至另一台显示器，自动切到光标当前屏重冻并展示；
+    /// - 若仍在当前屏，立刻把覆盖层提到最前并刷新光标位置、十字准星与放大镜。
+    func refocusOrSwitchScreenForCapture() {
+        guard editorSession == nil, scrollController == nil else { return }
+        let targetScreen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
             ?? NSScreen.main
             ?? NSScreen.screens.first
-        let ordered = NSScreen.screens.sorted { a, b in
-            if a == cursorScreen { return false }
-            if b == cursorScreen { return true }
-            return false
+        if let targetScreen, let existing = windows.first, existing.owningScreen != targetScreen,
+           let savedCompletion = completion {
+            Log.event(.overlay, "overlay.switchScreen")
+            begin(completion: savedCompletion)
+            return
         }
-        for screen in ordered {
-            let window = OverlayWindow(screen: screen, controller: self)
-            if let displayID = DisplayRegistry.displayID(of: screen),
-               let frozen = frozenImages[displayID] {
-                window.installFrozenImage(frozen)
-            }
-            window.orderFrontRegardless()
-            windows.append(window)
+        for win in windows {
+            win.orderFrontRegardless()
+            win.makeKey()
+            win.syncInitialCursor()
         }
-        // 光标屏的窗收 key（一次 makeKey，其他窗不抢——流畅）。
-        // 起拖兜底已挪到窗层 sendEvent（beginDragIfNeeded），无需上屏补位。
-        if let key = windows.first(where: { $0.screen == cursorScreen }) {
-            key.makeKey()
+        Log.event(.overlay, "overlay.refocus")
+    }
+
+    /// 上屏：仅在鼠标所在屏复用覆盖窗并挂载 GPU 冻结帧（其余屏幕完全不打扰）
+    private func showOverlayWindow(on targetScreen: NSScreen) {
+        let window = acquireOverlayWindow(for: targetScreen)
+        if let displayID = DisplayRegistry.displayID(of: targetScreen),
+           let frozen = frozenImages[displayID] {
+            window.installFrozenImage(frozen)
         }
+        window.orderFrontRegardless()
+        windows.append(window)
+        ensureActivation(reason: "overlay.show")
+        window.makeKey()
+        window.syncInitialCursor()
     }
 
     /// 从冻结帧本地裁剪（零延迟、零二次屏捕）
@@ -296,19 +419,19 @@ final class OverlayController {
 
     func end() {
         overlaySessionEpoch += 1
+        let endEpoch = overlaySessionEpoch
+        unregisterOverlayEscapeHotKey()
         dismissAll()
         editorSession = nil
-        toolbar?.dismiss()   // motion.exit；completion 持有面板至收窗
-        toolbar = nil
+        // 保留 toolbar 实例供下次 0ms 复用（仅执行退场隐藏，不再 nil 销毁重建）
+        toolbar?.dismiss()
         ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
         ocrCloseObserver = nil
         teardownScrollSession()
-        // 焦点归还延后 ~80ms（用户病例 2026-11-16：「Esc 不退出，反倒操作了
-        // 我的 TUI，会话 abort 了」）：cancel 同步 yieldActivation 时，触发
-        // cancel 的那次按键（keyUp/重投递）跨过焦点边界落进前一个 App——
-        // TUI 把半截 Esc 当输入执行。延后让按键完整落在已关闭的 overlay 上。
+        // 仅当 80ms 后未开启新截图会话时才归还焦点，杜绝快速 Esc→F1 场景旧回调抢走新会话焦点
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            self?.restoreFocusRobust()
+            guard let self, self.overlaySessionEpoch == endEpoch, self.windows.isEmpty else { return }
+            self.restoreFocusRobust()
         }
     }
 
@@ -363,25 +486,42 @@ final class OverlayController {
         }
     }
 
-    /// 无条件拆滚动会话资源（热键/HUD/采样器）；不影响编辑会话
+    /// 无条件拆滚动会话资源（热键/HUD/采样器/滚轮监听）；不影响编辑会话
     private func teardownScrollSession() {
         isScrollComposing = false
         scrollEscForceCount = 0
+        scrollSessionToken += 1
+        scrollFrameInFlight = false
+        scrollFrameQueue.removeAll()
+        scrollPipeline = nil
+        boundaryWallStaticFrames = 0
+        boundaryWallStartTime = nil
         unregisterScrollHotKeys()
+        removeScrollWheelMonitor()
         scrollBottomWork?.cancel()
         scrollBottomWork = nil
         scrollController?.stop()
         scrollController = nil
         scrollHUD?.hide()
         scrollHUD = nil
-        scrollFrames = []
-        scrollRefBuffer = nil
+        scrollAcceptedCount = 0
+        scrollStitchedHeightPx = 0
+        scrollViewportHeightPx = 1
         scrollDroppedHintWork?.cancel()
         scrollDroppedHintWork = nil
         scrollInitialSelection = nil
         scrollBottomDetected = false
-        scrollNoProgressCount = 0
-        scrollProgress = 0
+        scrollWheelEverReceived = false
+        scrollDownSign = -1
+        scrollDownSignCalibrated = false
+        lastScrollEventDeltaY = 0
+        lastDownScrollTime = 0
+        lastUpScrollTime = 0
+        scrollDownEventsSinceGrowth = 0
+        scrollUpEventsSinceGrowth = 0
+        boundaryWallStaticFrames = 0
+        scrollInContainedRegion = false
+        scrollEverScrolled = false
         // 焦点屏语义：滚动态只可能挂在 scrollScreen 上，其余屏窗口不换态
         // （防御：scrollScreen 为空时仍全量清扫，保证会话结束无残留）
         let focal = scrollScreen
@@ -390,20 +530,76 @@ final class OverlayController {
         }
     }
 
+    private func installScrollWheelMonitor() {
+        removeScrollWheelMonitor()
+        scrollWheelMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            let deltaY = event.scrollingDeltaY
+            guard abs(deltaY) >= 0.25 else { return }
+            MainActor.assumeIsolated {
+                self?.handleGlobalScrollWheel(deltaY: deltaY)
+            }
+        }
+        scrollWheelLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            let deltaY = event.scrollingDeltaY
+            if abs(deltaY) >= 0.25 {
+                MainActor.assumeIsolated {
+                    self?.handleGlobalScrollWheel(deltaY: deltaY)
+                }
+            }
+            return event
+        }
+    }
+
+    private func removeScrollWheelMonitor() {
+        if let monitor = scrollWheelMonitor {
+            NSEvent.removeMonitor(monitor)
+            scrollWheelMonitor = nil
+        }
+        if let local = scrollWheelLocalMonitor {
+            NSEvent.removeMonitor(local)
+            scrollWheelLocalMonitor = nil
+        }
+    }
+
+    /// 监听全局滚轮/触控板手势（支持双向：从上往下滑触底 & 从下往上滑触顶）：
+    /// 中途停下来看屏（无滚轮输入）绝不误判到底，随时允许按 Enter 结束。
+    private func handleGlobalScrollWheel(deltaY: CGFloat) {
+        guard scrollController != nil else { return }
+        if !scrollWheelEverReceived {
+            scrollWheelEverReceived = true
+            Log.event(.scroll, "scroll.wheel.first", ["deltaY": String(format: "%.2f", deltaY)])
+        }
+        lastScrollEventDeltaY = deltaY
+        let now = CFAbsoluteTimeGetCurrent()
+        let orientedDown = deltaY * scrollDownSign
+        if orientedDown > 0 {
+            lastDownScrollTime = now
+            scrollDownEventsSinceGrowth += 1
+            scrollUpEventsSinceGrowth = 0
+        } else if orientedDown < 0 {
+            lastUpScrollTime = now
+            scrollUpEventsSinceGrowth += 1
+            scrollDownEventsSinceGrowth = 0
+        }
+    }
+
     private func unregisterScrollHotKeys() {
         let center = CarbonHotKeyCenter.shared
         center.unregister(scrollFinishHotKey)
         center.unregister(scrollFinishReturnHotKey)
-        center.unregister(scrollCancelHotKey)
         scrollFinishHotKey = nil
         scrollFinishReturnHotKey = nil
-        scrollCancelHotKey = nil
     }
 
     private func dismissAll() {
         for window in windows {
             window.orderOut(nil)
-            window.close()
+            let isPooled = windowPool.values.contains { $0 === window }
+            if isPooled {
+                window.prepareForReuse(screen: window.owningScreen)
+            } else {
+                window.close()
+            }
         }
         windows.removeAll()
         selectionScreen = nil
@@ -480,10 +676,19 @@ final class OverlayController {
 
     // MARK: - 选区调整（编辑态拖手柄 / 方向键）
 
-    /// 选区变更：尺寸变了就按新选区从冻结帧重裁底图；纯移动只换全局坐标。
-    /// 标注按 `annotationOffset` 平移，保证它们"钉在屏幕原位置"。
+    /// 选区变更：
+    /// - 冻结桌面态：从冻结帧重裁底图，标注按 `annotationOffset` 平移「钉在屏幕原位置」；
+    /// - 独立外源图态（Toast 重开 / 长图编辑，frozenImages 为空）：等比缩放/平移视口，
+    ///   底图像素保持完整原图分辨率、既有标注随视口等比缩放，彻底杜绝 `selection.adjust.noFrozen` 与拉伸模糊。
     func adjustSelection(to newGlobal: CGRect, on screen: NSScreen, annotationOffset: CGSize) {
         guard let session = editorSession else { return }
+        if frozenImages.isEmpty {
+            session.applyViewportTransform(newSelection: newGlobal)
+            selectionRectGlobal = newGlobal
+            editorWindow()?.overlayView.needsDisplay = true
+            toolbar?.reposition(below: toolbarAnchorRectGlobal(for: session))
+            return
+        }
         let old = session.selectionGlobal
         let sizeUnchanged = abs(newGlobal.width - old.width) < 0.5
             && abs(newGlobal.height - old.height) < 0.5
@@ -503,8 +708,29 @@ final class OverlayController {
         )
         selectionRectGlobal = newGlobal
         // 编辑画布跟随新选区（视图侧自己算过一次，这里以 controller 为准再同步）
-        editorWindow()?.contentView?.needsDisplay = true
-        toolbar?.place(below: newGlobal)
+        editorWindow()?.overlayView.needsDisplay = true
+        toolbar?.reposition(below: toolbarAnchorRectGlobal(for: session))
+    }
+
+    /// 独立外源图编辑态实时滚轮/捏合缩放：同步视口与标注缩放；工具栏保持原位稳妥锚定，不随缩放锚点左右漂移
+    func zoomStandaloneSelection(to newGlobal: CGRect) {
+        guard let session = editorSession, frozenImages.isEmpty else { return }
+        session.applyViewportTransform(newSelection: newGlobal)
+        selectionRectGlobal = newGlobal
+    }
+
+    /// 工具栏定位与贴图落位参考的全局矩形（开启画框时返回画框外沿全局矩形，否则返回选区全局矩形）
+    private func toolbarAnchorRectGlobal(for session: EditorSession) -> CGRect {
+        let selection = session.selectionGlobal
+        guard let layout = session.currentBackdropLayout(for: selection.size) else {
+            return selection
+        }
+        return CGRect(
+            x: selection.minX - layout.imageRect.minX,
+            y: selection.maxY + layout.imageRect.minY - layout.canvasSize.height,
+            width: layout.canvasSize.width,
+            height: layout.canvasSize.height
+        )
     }
 
     // MARK: - 编辑态
@@ -517,7 +743,7 @@ final class OverlayController {
             toolbar?.orderOut(nil)
             for window in windows {
                 window.exitScrollMode()
-                (window.contentView as? OverlayView)?.exitEditorIfNeeded()
+                window.overlayView.exitEditorIfNeeded()
             }
         }
         // scale 用实测比例（px/pt），不信任 backingScale（BetterDisplay 病例）
@@ -535,6 +761,13 @@ final class OverlayController {
             window.enterEditorMode(session: session)
         }
 
+        // 先确保 App 激活与编辑覆盖窗成为 key（避免工具栏先于激活态出场、16ms 后再二次 activate + orderFront 导致玻璃闪一下）
+        ensureActivation(reason: "editor.enter")
+        if let editorWindow = self.editorWindow() {
+            editorWindow.makeKeyAndOrderFront(nil)
+            _ = editorWindow.makeFirstResponder(editorWindow.overlayView)
+        }
+
         // 工具栏（复用实例——病例 2026-11-17「回车之后才出现工具栏」：每次
         // 新建 ToolbarPanel 的构建 ~440ms（20 按钮+玻璃+布局），松手→工具栏
         // 可见之间空窗长到用户以为工具栏是回车触发的。复用上次会话的工具栏
@@ -543,54 +776,45 @@ final class OverlayController {
         toolbar.updateScreen(screen)
         toolbar.configure(
             session: session,
-            onToolChange: { [weak self] in self?.editorWindow()?.contentView?.needsDisplay = true },
+            onToolChange: { [weak self] in
+                self?.editorWindow()?.overlayView.syncActiveTextColor()
+                self?.editorWindow()?.overlayView.needsDisplay = true
+            },
             onAction: { [weak self] action in
                 self?.toolbarAction(action)
             }
         )
-        toolbar.place(below: selection)
-        toolbar.orderFrontRegardless()
+        toolbar.updateBackdropStyle(session.backdropStyle)
+        toolbar.onBackdropStyleChange = { [weak self] newStyle in
+            guard let self, let session = self.editorSession else { return }
+            session.backdropStyle = newStyle
+            self.editorWindow()?.overlayView.needsDisplay = true
+            self.toolbar?.reposition(below: self.toolbarAnchorRectGlobal(for: session))
+        }
+        toolbar.place(below: toolbarAnchorRectGlobal(for: session))
         self.toolbar = toolbar
         Log.event(.editor, "editor.enter", ["pxW": "\(base.width)", "pxH": "\(base.height)"])
-        // 确保编辑画布是 first responder（键盘路由确定性）。
-        // ⚠️ ToolbarPanel 创建/orderFront 会让窗口 key 状态失效（病例：editor.focus
-        // makeKey=false 且注入键盘事件丢失），延后一个 runloop tick 再夺回 key。
+        // 次帧键焦兜底：仅在窗口意外失焦时补回 key，正常情况下不重复调用 orderFrontRegardless 惊扰玻璃层
         DispatchQueue.main.async { [weak self] in
             guard let self, self.editorSession != nil,
-                  let editorWindow = self.editorWindow(),
-                  let editorView = editorWindow.contentView else { return }
-            // 病例（e2e 实测）：ToolbarPanel 创建后 App key 状态丢失且 appActive=false，
-            // 无激活态的窗口无法成为 key ⇒ Enter/Esc 键盘事件全部丢失。activate+makeKey 夺回。
-            self.ensureActivation(reason: "editor.enter")
-            editorWindow.makeKeyAndOrderFront(nil)
-            _ = editorWindow.makeFirstResponder(editorView)
-            // 覆盖层 makeKey 之后必须把工具栏重新提到最前（否则点不到按钮）
-            self.toolbar?.orderFrontRegardless()
-            let keyOK = editorWindow.isKeyWindow
-            let active = NSApp.isActive
+                  let editorWindow = self.editorWindow() else { return }
+            let editorView = editorWindow.overlayView
+            if !NSApp.isActive || !editorWindow.isKeyWindow || editorWindow.firstResponder !== editorView {
+                self.ensureActivation(reason: "editor.enter")
+                editorWindow.makeKeyAndOrderFront(nil)
+                _ = editorWindow.makeFirstResponder(editorView)
+                self.toolbar?.orderFrontRegardless()
+            }
             Log.event(.editor, "editor.focus", [
-                "keyWin": "\(keyOK)", "active": "\(active)",
+                "keyWin": "\(editorWindow.isKeyWindow)", "active": "\(NSApp.isActive)",
             ])
         }
     }
 
-    /// 激活保障（病例：⌘⇧S 全屏路径**没有真实鼠标点击**触发激活，
-    /// `NSApp.activate` 在 Carbon 热键回调里可能被系统忽略 ⇒ frontmost 仍是
-    /// Chrome ⇒ Enter/Esc 全送给了 Chrome，编辑器僵死。区域路径靠点击掩盖了这个 bug）
+    /// 单次轻量激活请求（不轮询、不 sleep；Esc 已由会话级 Carbon 热键独立兜底）
     func ensureActivation(reason: String, attempt: Int = 0) {
         guard NSApp.isActive == false else { return }
-        NSApp.activate(ignoringOtherApps: true)
-        if attempt == 0 {
-            NSRunningApplication.current.activate(options: [.activateIgnoringOtherApps])
-        }
-        guard attempt < 3 else {
-            Log.error(.app, "activate.fail", ["reason": reason])
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-            guard let self, !NSApp.isActive else { return }
-            self.ensureActivation(reason: reason, attempt: attempt + 1)
-        }
+        NSApp.activate()
     }
 
     private func editorWindow() -> OverlayWindow? {
@@ -604,25 +828,24 @@ final class OverlayController {
         case .undo:
             session.store.undo()
             toolbar?.refreshSelectionState()
-            editorWindow()?.contentView?.needsDisplay = true
+            editorWindow()?.overlayView.needsDisplay = true
             Log.event(.editor, "annotate.undo", [
                 "canUndo": "\(session.store.canUndo)", "canRedo": "\(session.store.canRedo)",
             ])
         case .redo:
             session.store.redo()
             toolbar?.refreshSelectionState()
-            editorWindow()?.contentView?.needsDisplay = true
+            editorWindow()?.overlayView.needsDisplay = true
             Log.event(.editor, "annotate.redo", [
                 "canUndo": "\(session.store.canUndo)", "canRedo": "\(session.store.canRedo)",
             ])
         case .toggleVisibility:
             session.toolbarVisible.toggle()
+            // 键盘高频切换（H）不做入退场动画，零延迟响应（Emil Animation Standards）
+            toolbar?.hideTooltip()
+            toolbar?.setVisibleInstant(session.toolbarVisible)
             if session.toolbarVisible {
-                toolbar?.orderFrontRegardless()
-                toolbar?.playEnter()   // H 显隐复用同一对入退场动画（拿起/放下闭环）
-            } else {
-                toolbar?.hideTooltip()
-                toolbar?.dismiss()     // motion.exit：fade + scale→.97 + 下沉 4pt
+                toolbar?.reposition(below: toolbarAnchorRectGlobal(for: session))
             }
             // 显隐按钮图标同步：隐藏态 = eye.slash，再次点/按 H 唤回时表达「当前收起」
             toolbar?.setToolbarHidden(!session.toolbarVisible)
@@ -639,30 +862,134 @@ final class OverlayController {
             pinCurrentImage()
         case .scroll:
             beginScrollCapture()
+        case .autoRedact:
+            runAutoRedact()
+        case .toggleBackdrop:
+            session.backdropStyle.enabled.toggle()
+            toolbar?.updateBackdropStyle(session.backdropStyle)
+            toolbar?.reposition(below: toolbarAnchorRectGlobal(for: session))
+            editorWindow()?.overlayView.needsDisplay = true
+            Log.event(.editor, "backdrop.toggle", [
+                "enabled": "\(session.backdropStyle.enabled)",
+                "preset": session.backdropStyle.preset.rawValue,
+            ])
+        }
+    }
+
+    private var isAutoRedacting = false
+
+    /// 智能一键脱敏（M1）：本地 Vision 词级定位敏感信息 → 批量生成 `.mosaic` 标注（一次 ⌘Z 整体撤销）
+    private func runAutoRedact() {
+        guard !isAutoRedacting, let session = editorSession else { return }
+        guard let recognizer = AppCoordinatorShared.deps?.textRecognizer else { return }
+        editorWindow()?.overlayView.flushPendingAnnotationForExport()
+
+        isAutoRedacting = true
+        toolbar?.setAutoRedactBusy(true)
+        let baseImage = session.baseImage
+        let canvasSize = session.selectionGlobal.size
+        let epoch = overlaySessionEpoch
+
+        Task { @MainActor [weak self] in
+            defer {
+                self?.isAutoRedacting = false
+                self?.toolbar?.setAutoRedactBusy(false)
+            }
+            let regions = (try? await recognizer.detectSensitiveRegions(baseImage)) ?? []
+            guard let self, self.overlaySessionEpoch == epoch, let liveSession = self.editorSession else { return }
+
+            let existingMosaics: [CGRect] = liveSession.store.annotations.compactMap { ann in
+                if case .mosaic(let r) = ann.shape { return r }
+                return nil
+            }
+
+            var newItems: [AnnotationModel] = []
+            var flashRects: [CGRect] = []
+            let mosaicStroke = max(3.5, liveSession.strokeWidth)
+
+            for region in regions {
+                let rect = SensitiveTextDetector.localRect(
+                    fromNormalizedTopLeft: region.normalizedRect,
+                    canvasSize: canvasSize
+                )
+                guard rect.width >= 4, rect.height >= 4 else { continue }
+                let alreadyCovered = existingMosaics.contains {
+                    SensitiveTextDetector.overlapRatio(rect, $0) >= 0.65
+                } || flashRects.contains {
+                    SensitiveTextDetector.overlapRatio(rect, $0) >= 0.65
+                }
+                if alreadyCovered { continue }
+
+                newItems.append(AnnotationModel(
+                    shape: .mosaic(rect),
+                    colorIndex: liveSession.colorIndex,
+                    strokeWidth: mosaicStroke,
+                    text: nil,
+                    index: nil,
+                    isAutoRedacted: true
+                ))
+                flashRects.append(rect)
+            }
+
+            if !newItems.isEmpty {
+                liveSession.store.addBatch(newItems)
+                self.toolbar?.refreshSelectionState()
+                self.editorWindow()?.overlayView.flashAutoRedactRects(flashRects)
+                self.editorWindow()?.overlayView.showEditorToast("已自动脱敏 \(newItems.count) 处 · 单击可取消")
+                Log.event(.editor, "redact.applied", [
+                    "added": "\(newItems.count)",
+                    "detected": "\(regions.count)",
+                ])
+            } else if !regions.isEmpty {
+                self.editorWindow()?.overlayView.showEditorToast("敏感信息已全部脱敏")
+            } else {
+                self.editorWindow()?.overlayView.showEditorToast("未检测到敏感信息")
+            }
         }
     }
 
     // MARK: - OCR / 贴图（端口驱动）
 
-    /// 取字：识别当前合成图（含标注）→ 浮层展示
+    private func makeHistoryMetadata(for session: EditorSession) -> HistoryCaptureMetadata {
+        HistoryCaptureMetadata(
+            sourceApp: previousApp?.localizedName,
+            windowTitle: nil,
+            baseImage: session.baseImage,
+            canvasSize: session.selectionGlobal.size,
+            annotations: session.store.annotations,
+            strokeWidth: session.strokeWidth
+        )
+    }
+
+    /// 取字：结构化识别当前合成图（文字 / 二维码 / Markdown 表格）→ 浮层展示
     private func runOCR() {
         guard let session = editorSession else { return }
-        (editorWindow()?.contentView as? OverlayView)?.flushPendingAnnotationForExport()
+        editorWindow()?.overlayView.flushPendingAnnotationForExport()
         let image = session.renderFinalImage()
         let rect = session.selectionGlobal
         let screen = session.screen
         let recognizer = AppCoordinatorShared.deps?.textRecognizer
-        let clipboard = AppCoordinatorShared.deps?.clipboard
         let history = AppCoordinatorShared.deps?.history
-        history?.record(image)
+        history?.record(image, metadata: makeHistoryMetadata(for: session))
         Log.event(.ocr, "ocr.start", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
         Task { @MainActor in
             guard let recognizer else { return }
-            let text = (try? await recognizer.recognize(image)) ?? ""
-            clipboard.map { _ in () }
-            OCRResultPanel.present(text: text, nearGlobalRect: rect, on: screen)
+            let result = (try? await recognizer.recognizeStructured(image))
+                ?? StructuredOCRResult(
+                    plainText: "",
+                    qrCodes: [],
+                    markdownTable: nil,
+                    tableRowCount: 0,
+                    tableColumnCount: 0
+                )
+            let toolbarRect = (self.toolbar?.isVisible == true) ? self.toolbar?.visibleBarFrameGlobal : nil
+            OCRResultPanel.present(result: result, nearGlobalRect: rect, on: screen, avoidRect: toolbarRect)
             restoreEditorFocusAfterOCRPanelCloses()
-            Log.event(.ocr, "ocr.present", ["chars": "\(text.count)"])
+            Log.event(.ocr, "ocr.present", [
+                "chars": "\(result.plainText.count)",
+                "qrs": "\(result.qrCodes.count)",
+                "table": result.markdownTable != nil ? "\(result.tableRowCount)x\(result.tableColumnCount)" : "none",
+            ])
         }
     }
 
@@ -691,9 +1018,7 @@ final class OverlayController {
                 self.ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
                 self.ocrCloseObserver = nil
                 win.makeKeyAndOrderFront(nil)
-                if let contentView = win.contentView {
-                    _ = win.makeFirstResponder(contentView)
-                }
+                _ = win.makeFirstResponder(win.overlayView)
                 Log.event(.editor, "editor.focus.restored", [
                     "keyWin": "\(win.isKeyWindow)", "from": "ocr.close",
                 ])
@@ -704,11 +1029,12 @@ final class OverlayController {
     /// 贴图：把当前合成图钉在屏幕上
     private func pinCurrentImage() {
         guard let session = editorSession else { return }
-        (editorWindow()?.contentView as? OverlayView)?.flushPendingAnnotationForExport()
+        editorWindow()?.overlayView.flushPendingAnnotationForExport()
         let image = session.renderFinalImage()
-        let rect = session.selectionGlobal
-        AppCoordinatorShared.deps?.history.record(image)
+        let rect = toolbarAnchorRectGlobal(for: session)
+        AppCoordinatorShared.deps?.history.record(image, metadata: makeHistoryMetadata(for: session))
         AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: rect)
+        CaptureSoundPlayer.play()
         Log.event(.pin, "pin.wire", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
         perform(action: .cancel)   // 贴图后结束截图会话（图像已经在屏幕上）
     }
@@ -736,15 +1062,28 @@ final class OverlayController {
             ])
             return
         }
-        scrollFrames = []
+        scrollSessionToken += 1
+        scrollFrameInFlight = false
+        scrollFrameQueue.removeAll()
+        scrollPipeline = ScrollStitchPipeline()
+        scrollAcceptedCount = 0
+        scrollStitchedHeightPx = 0
+        scrollViewportHeightPx = max(1, Int(rect.height * screen.backingScaleFactor))
         scrollSelectionRect = rect
         scrollInitialSelection = rect
         scrollScreen = screen
-        scrollNoProgressCount = 0
         scrollBottomDetected = false
-        scrollProgress = 0
-        scrollRefBuffer = nil
-        scrollRefImage = nil
+        scrollWheelEverReceived = false
+        scrollDownSign = -1
+        scrollDownSignCalibrated = false
+        lastScrollEventDeltaY = 0
+        lastDownScrollTime = 0
+        lastUpScrollTime = 0
+        scrollDownEventsSinceGrowth = 0
+        scrollUpEventsSinceGrowth = 0
+        boundaryWallStaticFrames = 0
+        boundaryWallStartTime = nil
+        scrollInContainedRegion = false
         scrollEverScrolled = false
 
         // 编辑态 UI 退场（会话保留；motion.exit 替代 orderOut 直切）
@@ -756,24 +1095,31 @@ final class OverlayController {
         controller.onStop = { count in
             Log.event(.scroll, "scroll.stop", ["frames": "\(count)"])
         }
+        controller.onError = { [weak self] error in
+            guard let self, self.scrollController != nil else { return }
+            CaptureToast.show(message: "滚动截图采集中断：\(error.localizedDescription)", status: .warn)
+            self.teardownScrollSession()
+            self.scrollSelectionRect = nil
+            self.scrollScreen = nil
+            if let session = self.editorSession {
+                self.toolbar?.place(below: self.toolbarAnchorRectGlobal(for: session))
+                self.toolbar?.orderFrontRegardless()
+            }
+        }
         do {
             try controller.start(region: rect)
             scrollController = controller
             registerScrollHotKeys()
-            // 编辑窗口切滚动模式（区域 outline + 光晕脉动；滚动事件穿透下层）
+            installScrollWheelMonitor()
+            // 编辑窗口切滚动模式（区域 outline + 光晕脉动；滚动事件穿透下层；采集框固定在真实视口 rect）
             for window in windows where window.owningScreen == screen {
                 window.enterScrollMode()
             }
-            // 采集 HUD（档 1 钉暗，贴选区下缘 8pt）。病例二轮（用户「HUD 进了
-            // 截图」——windowID 排除对 NSPanel 不可靠）：改为「进入后短暂提示
-            // 1.2s 即隐藏」——采集中 HUD 不在场，物理上不可能入镜；到底/收尾
-            // 短暂显示结论
+            // 采集 HUD 全程驻留（SCK 已按进程级排除 Snapcut 自身窗口，不会入镜）
             let hud = ScrollCaptureHUDPanel()
             hud.show(below: rect, on: screen)
+            hud.update(state: .waiting)
             scrollHUD = hud
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                self?.scrollHUD?.orderOut(nil)
-            }
             Log.event(.scroll, "scroll.enter", ["rect": "\(Int(rect.width))x\(Int(rect.height))"])
         } catch {
             Log.error(.scroll, "scroll.begin.fail", ["err": error.localizedDescription])
@@ -810,25 +1156,6 @@ final class OverlayController {
         scrollFinishReturnHotKey = center.register(
             keyCode: kVK_Return, modifiers: []
         ) { [weak self] in self?.finishHotKeyFired() }
-        scrollCancelHotKey = center.register(
-            keyCode: kVK_Escape, modifiers: []
-        ) { [weak self] in
-            guard let self else { return }
-            if self.isScrollComposing {
-                // 逃生通道（病例 2026-11-16：compose 卡 6.7s 期间 Esc 全吞、
-                // 用户被锁死）：compose 期连按 3 次 Esc = 强制取消整个滚动会话
-                self.scrollEscForceCount += 1
-                Log.event(.scroll, "scroll.composing.ignoreKey", [
-                    "key": "esc", "force": "\(self.scrollEscForceCount)/3",
-                ])
-                if self.scrollEscForceCount >= 3 {
-                    self.teardownScrollSession()
-                    self.perform(action: .cancel)
-                }
-                return
-            }
-            self.cancelScrollCapture()
-        }
     }
 
     /// 收尾热键公共入口：compose 期忽略，采集态手动收尾
@@ -840,143 +1167,211 @@ final class OverlayController {
         finishScrollCapture(mode: .manual)
     }
 
-    // MARK: 采样帧处理：净贡献帧序列 + 到底判定
+    // MARK: 采样帧处理：串行流式增量拼接 + 到底判定
 
-    /// 采样帧入列。拼接序列只收「净贡献帧」：
-    /// ① 首帧直接入列；② 与参考帧（上一入列帧）近似 ⇒ 静止，不入列只累计到底判定；
-    /// ③ 与参考帧能找到可信重叠（findOverlap 成功）⇒ 入列 + 区域生长；
-    /// ④ 找不到可信重叠（跳屏/内容突变）⇒ 不入列——否则 compose 必败
-    ///   （病例：1 静止帧 + 1 滚动新帧凑成 2 帧序列，中间内容全丢 ⇒ stitch.noOverlap）。
-    /// 慢滚不再被 0.98 阈值误杀：判静止阈值降到 0.95，且基准是参考帧而不是上一
-    /// 交付帧，滚动中停顿/慢滚的净贡献帧正常计入（HUD 帧数该涨）。
+    /// 采样帧串行入口：确保同一时刻仅有一帧进入拼接管线，同时用有界 FIFO 缓冲（上限 24 帧）
+    /// 承接 60fps 高速甩屏突发帧，绝不随意覆盖中间重叠帧。
     private func handleScrollFrame(_ frame: CGImage) {
-        // stop 之后在途帧不入列（拼接序列已定格；且 scrollFrames/refBuffer 已清空，
-        // 此时入列会被当成下个会话的首帧污染状态）
-        guard scrollController != nil else {
+        guard scrollController != nil, let pipeline = scrollPipeline else {
             Log.event(.scroll, "scroll.frame.dropAfterStop")
             return
         }
-        // 重计算链后台化（病例 2026-11-16「还是没拼接好」：PixelBuffer 解码
-        // 2168×3456 RGBA ~30MB/帧 + 行签名 + findOverlap 全在主线程 → 8fps
-        // 下主线程被吞，采样帧大量丢弃（12 交付只 4 入列、帧间隔 0.24-0.9s
-        // 不均）。改：解码/比对在后台线程，主线程只收结论）
-        let refSnapshot = scrollRefBuffer
-        let refImageSnapshot = scrollRefImage
-        Task { [weak self] in
-            // 重计算全链后台（病例「还是没拼接好」：主线程帧处理吞掉采样吞吐）：
-            // 解码 30MB + 行签名 + findOverlap 全部在后台，主线程只收结论
-            let buffer = PixelBuffer(cgImage: frame)
-            var verdict: Verdict = .first
-            if let ref = refSnapshot {
-                // SnowShot 同思想裁决（用户终报「看 snowshot 源码吧」）：tile-NCC
-                // 位移估计先行——行签名对「90% 行静止 + 卡片局部滚动」结构性误判
-                // （静态区采样点稀释滚动区 → 大 overlap 恒通过 → 每帧贡献 1-5px）。
-                // tile 化后无纹理区（页眉/侧栏纯色）剔除投票,有纹理的卡片区以
-                // NCC 投真实位移。dy 高置信 → 直接按 dy 折算 overlap（不走向重叠
-                // 枚举）；dy=0 → 静止；低置信 → 回落行签名旧链
-                let estimate = TileMotionEstimator.estimateShift(
-                    ref: refImageSnapshot ?? frame, cur: frame)
-                // 诊断（卡片页拼接调试）：每帧 tile 估计结论全量落日志——
-                // dy/置信度/tile 数,判断分支走向
-                if let est = estimate {
-                    Log.event(.scroll, "scroll.motion.tile", [
-                        "dy": "\(est.dy)", "conf": String(format: "%.2f", est.confidence),
-                        "tiles": "\(est.texturedTiles)",
-                    ])
-                }
-                // tile 三态裁决（病例「还没滚完就中断」：滚动中 12 帧 conf=0.20
-                // dy=3 回落行签名被判静止 → bottom.detected → 0.6s 自动收束）：
-                // SnowShot 语义——位移估计只有「动/静」两种可信结论,低置信=
-                // 未判定,不参与 bottom 静止计数也不丢内容。行签名静止判定
-                // 整体废弃（对局部/慢速滚动结构性误判,多轮验证）：
-                // ① conf≥0.30 且 dy≤-4 → 滚动中（折算 overlap 入列）
-                // ② conf≥0.30 且 dy>-4 → 高置信静止 → bottom 计数
-                // ③ conf<0.30 → 未判定：跳帧但不算静止（bottom 不误触）
-                if let est = estimate, est.texturedTiles >= 6 {
-                    if est.confidence >= 0.30 {
-                        if est.dy >= -4 {
-                            verdict = .staticFrame
-                        } else {
-                            let shiftPx = Double(-est.dy) * 4.0   // 降采样 4x → 全分辨率
-                            let overlap = buffer.height - Int(shiftPx)
-                            Log.event(.scroll, "scroll.motion.tile", [
-                                "dy": "\(est.dy)", "conf": String(format: "%.2f", est.confidence),
-                                "tiles": "\(est.texturedTiles)", "overlap": "\(overlap)",
-                            ])
-                            verdict = overlap >= Stitcher.Options().minOverlap
-                                ? .contributing(overlap: overlap)
-                                : .skipped
-                        }
-                    } else {
-                        verdict = .skipped   // 未判定：跳帧但不算静止（bottom 不误触）
-                    }
-                } else {
-                    verdict = .skipped
-                }
+        if scrollFrameInFlight {
+            if scrollFrameQueue.count >= Self.maxBufferedScrollFrames {
+                scrollFrameQueue.removeFirst()
             }
-            guard let self else { return }
+            scrollFrameQueue.append(frame)
+            return
+        }
+        scrollFrameInFlight = true
+        let token = scrollSessionToken
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let outcome = await pipeline.push(frame)
             await MainActor.run {
-                self.processScrollFrame(frame, buffer: buffer, verdict: verdict)
+                guard let self else { return }
+                self.scrollFrameInFlight = false
+                guard token == self.scrollSessionToken, self.scrollController != nil else {
+                    self.scrollFrameQueue.removeAll()
+                    return
+                }
+                self.applyScrollStepOutcome(outcome)
+                if !self.scrollFrameQueue.isEmpty {
+                    let next = self.scrollFrameQueue.removeFirst()
+                    self.handleScrollFrame(next)
+                }
             }
         }
     }
 
-    private enum Verdict: Equatable { case first, staticFrame, contributing(overlap: Int), skipped }
-
-    private static func framesNearIdenticalAsync(_ a: PixelBuffer, _ b: PixelBuffer) async -> Bool {
-        await Task.detached(priority: .userInitiated) {
-            Self.framesNearIdentical(a, b)
-        }.value
+    private func currentHUDState() -> ScrollCaptureHUDPanel.State {
+        guard scrollEverScrolled else { return .waiting }
+        let screens = Double(scrollStitchedHeightPx) / Double(max(1, scrollViewportHeightPx))
+        if scrollInContainedRegion {
+            return .contained(screens: screens, heightPx: scrollStitchedHeightPx)
+        }
+        return .capturing(screens: screens, heightPx: scrollStitchedHeightPx)
     }
 
-    /// 帧处理后半段（主线程；解码/比对已在后台完成，verdict 为结论）
-    private func processScrollFrame(_ frame: CGImage, buffer: PixelBuffer, verdict: Verdict) {
-        // stop 之后在途帧不入列（状态已定格——后台解码窗口期会话可能已结束）
-        guard scrollController != nil else {
-            Log.event(.scroll, "scroll.frame.dropAfterStop")
-            return
+    private enum ScrollBoundaryEdge {
+        case bottom
+        case top
+    }
+
+    /// 双向边界撞墙检测：
+    /// - 向下滑到底：位于画布最底缘 + 最近 0.65s 内有持续向下滚动输入；
+    /// - 从下往上滑到顶：位于画布最顶缘（posY ≤ 16）+ 最近 0.65s 内有持续向上滚动输入；
+    /// 中途停下来看屏无滚动输入时恒返 nil，绝不误触发自动结束。
+    private func activeBoundaryWallEdge(_ outcome: ScrollStitchPipeline.StepOutcome) -> ScrollBoundaryEdge? {
+        guard scrollEverScrolled else { return nil }
+        let now = CFAbsoluteTimeGetCurrent()
+        let atBottomEdge = outcome.viewportPosition >= outcome.maxViewportPosition - 16
+        if atBottomEdge && (now - lastDownScrollTime) <= 0.65 && scrollDownEventsSinceGrowth >= 2 {
+            return .bottom
         }
-        if scrollRefBuffer == nil || verdict == .first {
-            if scrollRefBuffer == nil {
-                scrollRefBuffer = buffer
-                scrollRefImage = frame
-                scrollFrames.append(frame)
-                Log.event(.scroll, "scroll.frame.n", ["n": "1"])
-                scrollHUD?.update(frames: scrollFrames.count, progress: 0)
-                return
-            }
+        let atTopEdge = outcome.viewportPosition <= 16
+        if atTopEdge && (now - lastUpScrollTime) <= 0.65 && scrollUpEventsSinceGrowth >= 2 {
+            return .top
         }
-        let overlap: Int
-        switch verdict {
-        case .first:
-            return
-        case .staticFrame:
-            scrollNoProgressCount += 1
-            scrollProgress = 0
-            scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
-            if scrollNoProgressCount >= DesignTokens.Scroll.bottomConfirmSamples {
-                detectScrollBottom()
-            }
-            return
-        case .skipped:
-            Log.event(.scroll, "scroll.frame.skipNoOverlap", [
-                "afterN": "\(scrollFrames.count)",
+        return nil
+    }
+
+    private func applyScrollStepOutcome(_ outcome: ScrollStitchPipeline.StepOutcome) {
+        scrollAcceptedCount = outcome.frameCount
+        scrollStitchedHeightPx = outcome.canvasHeight
+        if outcome.viewportHeight > 0 {
+            scrollViewportHeightPx = outcome.viewportHeight
+        }
+        scrollEverScrolled = outcome.hasScrolled
+
+        switch outcome.status {
+        case .firstFrame:
+            boundaryWallStaticFrames = 0
+            boundaryWallStartTime = nil
+            scrollInContainedRegion = false
+            Log.event(.scroll, "scroll.frame.n", [
+                "n": "1", "pxH": "\(outcome.canvasHeight)", "prepMs": "\(outcome.prepMs)",
             ])
-            scrollProgress = 0
-            scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress, droppedHint: true)
+            scrollHUD?.update(state: .waiting)
+
+        case .staticFrame:
+            // 仅当用户在底缘继续下滚或顶缘继续上滚撞墙不增长时累计（60fps 下需帧数 ≥ 4 且持续 ≥ 0.32s，防误触）
+            if let edge = activeBoundaryWallEdge(outcome) {
+                let now = CFAbsoluteTimeGetCurrent()
+                if boundaryWallStartTime == nil { boundaryWallStartTime = now }
+                boundaryWallStaticFrames += 1
+                if boundaryWallStaticFrames >= 4,
+                   let start = boundaryWallStartTime,
+                   (now - start) >= 0.32 {
+                    detectScrollBottom(isTop: edge == .top)
+                }
+            } else {
+                boundaryWallStaticFrames = 0
+                boundaryWallStartTime = nil
+            }
+
+        case .skipped:
+            boundaryWallStaticFrames = 0
+            boundaryWallStartTime = nil
+            var fields: [String: String] = [
+                "afterN": "\(outcome.frameCount)",
+                "prepMs": "\(outcome.prepMs)",
+                "estMs": "\(outcome.estMs)",
+            ]
+            if let est = outcome.estimate {
+                fields["dy"] = "\(est.dy)"
+                fields["conf"] = String(format: "%.2f", est.confidence)
+                fields["tex"] = "\(est.texturedTiles)"
+                fields["mov"] = "\(est.movingTiles)"
+                fields["err"] = String(format: "%.3f", est.preciseError)
+            }
+            Log.event(.scroll, "scroll.frame.skipNoOverlap", fields)
+            scrollHUD?.update(state: .dropped)
             scrollDroppedHintWork?.cancel()
             let w = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                self.scrollHUD?.update(frames: self.scrollFrames.count, progress: self.scrollProgress)
+                guard let self, self.scrollController != nil else { return }
+                self.scrollHUD?.update(state: self.currentHUDState())
             }
             scrollDroppedHintWork = w
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: w)
-            return
-        case .contributing(let o):
-            overlap = o
+
+        case .appended(let growthRows, let totalHeight):
+            // 首次向下扩展时自动校准向下滚轮方向符号（兼容自然滚动/反向滚动/第三方鼠标工具）
+            if !scrollDownSignCalibrated && abs(lastScrollEventDeltaY) >= 0.5 {
+                scrollDownSign = lastScrollEventDeltaY > 0 ? 1 : -1
+                scrollDownSignCalibrated = true
+                Log.event(.scroll, "scroll.wheel.calibrated", ["downSign": "\(Int(scrollDownSign))", "via": "down"])
+            }
+            scrollDownEventsSinceGrowth = 0
+            scrollUpEventsSinceGrowth = 0
+            boundaryWallStaticFrames = 0
+            boundaryWallStartTime = nil
+            scrollInContainedRegion = false
+            revokeBottomIfNeeded()
+            Log.event(.scroll, "scroll.frame.n", [
+                "n": "\(outcome.frameCount)",
+                "pxH": "\(totalHeight)",
+                "growth": "\(growthRows)",
+                "prepMs": "\(outcome.prepMs)",
+                "estMs": "\(outcome.estMs)",
+                "conf": String(format: "%.2f", outcome.estimate?.confidence ?? 0),
+                "err": String(format: "%.3f", outcome.estimate?.preciseError ?? 0),
+            ])
+            scrollHUD?.update(state: currentHUDState())
+            scrollHUD?.pulseOnGrowth()
+
+        case .prepended(let growthRows, let totalHeight):
+            // 首次向上扩展（从下往上滑）时自动校准向下符号 = 当前滚轮符号取反
+            if !scrollDownSignCalibrated && abs(lastScrollEventDeltaY) >= 0.5 {
+                scrollDownSign = lastScrollEventDeltaY > 0 ? -1 : 1
+                scrollDownSignCalibrated = true
+                Log.event(.scroll, "scroll.wheel.calibrated", ["downSign": "\(Int(scrollDownSign))", "via": "up"])
+            }
+            scrollDownEventsSinceGrowth = 0
+            scrollUpEventsSinceGrowth = 0
+            boundaryWallStaticFrames = 0
+            boundaryWallStartTime = nil
+            scrollInContainedRegion = false
+            revokeBottomIfNeeded()
+            Log.event(.scroll, "scroll.frame.n", [
+                "n": "\(outcome.frameCount)",
+                "pxH": "\(totalHeight)",
+                "growth": "\(growthRows)",
+                "dir": "up",
+                "prepMs": "\(outcome.prepMs)",
+                "estMs": "\(outcome.estMs)",
+            ])
+            scrollHUD?.update(state: currentHUDState())
+            scrollHUD?.pulseOnGrowth()
+
+        case .contained(let positionY, let totalHeight):
+            // 若是在画布底缘继续下滚或顶缘继续上滚（例如 macOS 边界橡皮筋回弹），视作触底/触顶而非回滚
+            if let edge = activeBoundaryWallEdge(outcome) {
+                let now = CFAbsoluteTimeGetCurrent()
+                if boundaryWallStartTime == nil { boundaryWallStartTime = now }
+                boundaryWallStaticFrames += 1
+                if boundaryWallStaticFrames >= 4,
+                   let start = boundaryWallStartTime,
+                   (now - start) >= 0.32 {
+                    detectScrollBottom(isTop: edge == .top)
+                }
+                return
+            }
+            boundaryWallStaticFrames = 0
+            boundaryWallStartTime = nil
+            scrollInContainedRegion = true
+            revokeBottomIfNeeded()
+            Log.event(.scroll, "scroll.frame.contained", [
+                "posY": "\(positionY)",
+                "maxPosY": "\(outcome.maxViewportPosition)",
+                "pxH": "\(totalHeight)",
+                "prepMs": "\(outcome.prepMs)",
+                "estMs": "\(outcome.estMs)",
+            ])
+            scrollHUD?.update(state: currentHUDState())
         }
-        scrollNoProgressCount = 0
-        // 到底后又有新帧（用户继续滚）：取消 pending 自动收尾，重新等到底
+    }
+
+    private func revokeBottomIfNeeded() {
         if scrollBottomDetected {
             scrollBottomWork?.cancel()
             scrollBottomWork = nil
@@ -987,98 +1382,25 @@ final class OverlayController {
             Log.event(.scroll, "scroll.bottom.revoked", [:])
         }
         scrollBottomDetected = false
-        growRegionIfPossible(ref: buffer, cur: buffer, frame: frame, overlap: overlap)
-        scrollRefBuffer = buffer
-        scrollRefImage = frame
-        scrollFrames.append(frame)
-        Log.event(.scroll, "scroll.frame.n", ["n": "\(scrollFrames.count)"])
-        scrollHUD?.update(frames: scrollFrames.count, progress: scrollProgress)
     }
 
-    /// 两帧是否几乎一致（抽 60 行签名比对，≥98% 行匹配 = 没滚动）。
-    /// 阈值史（三级病例推演）：
-    /// ① 0.95→0.98 病例：慢速滚动被误判静止 ⇒ 11s 只入列 2 帧
-    /// ② 0.98→0.95：停顿期误判，回落
-    /// ③ 0.80（病例「卡片局部滚动」5-15% 面积局部滚 → 相似率 85-95% 需要
-    /// 低阈值接住）——但 **0.80 把「卡片 10% 面积变化」也判静止**（只 10% 行
-    /// 变 < 20% 阈值）：29 帧全 static、拼不出长图（用户 2026-11-17 实报
-    /// 「Safari 卡片页没拼接成功」日志铁证）
-    /// 终案：staticFrame 只认 **真静止**（0.98）——小变化帧（0.80-0.98，
-    /// 慢滚/局部滚/微动）一律送 stitcher.findOverlap 裁决：拼得上=贡献帧，
-    /// 拼不上=skip（带 droppedHint 提示，比静默吞好）。拼接层是唯一真裁判。
-    nonisolated private static let nearIdenticalRowRatio: CGFloat = 0.98
-
-    nonisolated private static func framesNearIdentical(_ a: PixelBuffer, _ b: PixelBuffer) -> Bool {
-        guard a.height == b.height, a.width == b.width else { return false }
-        let threshold = Stitcher.Options().rowDiffThreshold
-        let stride = max(1, a.height / 60)
-        var total = 0
-        var matched = 0
-        var row = 0
-        while row < a.height {
-            total += 1
-            if PixelBuffer.rowMatches(a.signature[row], b.signature[row], threshold: threshold) {
-                matched += 1
-            }
-            row += stride
-        }
-        return total > 0 && CGFloat(matched) / CGFloat(total) >= nearIdenticalRowRatio
-    }
-
-    /// 区域生长：用预计算的重叠行数 → 净贡献行数（px）→ pt，选区向下扩展；
-    /// 同时更新覆盖层画布矩形与 HUD 位置。
-    /// 焦点屏语义：grow 只允许在 selectionScreen 内（clamp 到 screen.frame），
-    /// 绝不跨屏把相邻显示器算进选区。
-    private func growRegionIfPossible(
-        ref: PixelBuffer, cur: PixelBuffer, frame: CGImage, overlap: Int
-    ) {
-        guard let screen = scrollScreen, let rect = scrollSelectionRect else { return }
-        let contributedPx = cur.height - overlap
-        scrollProgress = CGFloat(contributedPx) / CGFloat(max(1, cur.height))
-        guard contributedPx > 0 else { return }
-        scrollEverScrolled = true
-        // px → pt：实测比例（帧宽 px / 选区宽 pt），不信任 backingScale
-        let scale = CGFloat(frame.width) / max(1, rect.width)
-        let growPt = CGFloat(contributedPx) / max(scale, 0.001)
-        var newRect = rect
-        // reviewer Critical#2（Y-up 方向修正）：长图顶行 = 首帧顶行 = 原选区
-        // **顶边**（maxY）——grow 固定顶边、向下（-y）扩展，clamp 到屏底。
-        // 旧实现固定 minY 向上长：① 画布整体上移 growPt 内容错位；② HUD
-        // reposition 贴 minY 恒不动（死代码）；③ clamp 用「选区底到屏顶」距离
-        // ——选区在屏上半部时区域完全不长
-        let bounds = screen.frame
-        let newHeight = min(rect.height + growPt, rect.maxY - bounds.minY)
-        newRect = CGRect(x: rect.minX, y: rect.maxY - newHeight, width: rect.width, height: newHeight)
-        // x clamp 保证永不越出焦点屏（双屏病例：另一屏 1920 被算进选区宽）
-        newRect.origin.x = max(bounds.minX, min(newRect.origin.x, bounds.maxX - newRect.width))
-        if abs(newRect.height - rect.height) >= 0.5 {
-            scrollSelectionRect = newRect
-            for window in windows where window.owningScreen == screen {
-                window.updateScrollRegion(newRect)
-            }
-            scrollHUD?.reposition(below: newRect, on: screen)
-            Log.event(.scroll, "scroll.region.grow", [
-                "ptH": "\(Int(newRect.height))",
-                "screen": "\(Int(bounds.width))x\(Int(bounds.height))@\(Int(bounds.minX)),\(Int(bounds.minY))",
-            ])
-        }
-    }
-
-    /// 到底：底缘 2pt 绿条 + HUD 切确认态 + 0.6s 后自动合成（无需用户动作）。
-    /// 前置：本次采集观测到过真实滚动——从未滚动的静止只是用户在读屏定位，
-    /// 不是到底（病例：静止 0.8s 就自动合成单帧收场）。
-    private func detectScrollBottom() {
+    /// 到底/到顶：底缘 2pt 绿条 + HUD 切确认态 + 0.6s 后自动合成（无需用户动作）。
+    private func detectScrollBottom(isTop: Bool = false) {
         guard !scrollBottomDetected else { return }
         guard scrollEverScrolled else {
             Log.event(.scroll, "scroll.bottom.skipNoScroll")
             return
         }
         scrollBottomDetected = true
-        Log.event(.scroll, "scroll.bottom.detected", ["frames": "\(scrollFrames.count)"])
+        Log.event(.scroll, "scroll.bottom.detected", [
+            "edge": isTop ? "top" : "bottom",
+            "frames": "\(scrollAcceptedCount)",
+            "pxH": "\(scrollStitchedHeightPx)",
+        ])
         for window in windows where window.owningScreen == scrollScreen {
             window.setScrollBottomReached()
         }
-        scrollHUD?.setBottomState()
+        scrollHUD?.setBottomState(isTop: isTop)
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.scrollBottomDetected else { return }
             self.finishScrollCapture(mode: .autoBottom)
@@ -1091,22 +1413,16 @@ final class OverlayController {
 
     // MARK: 取消 / 收尾
 
-    /// Esc：已采集帧丢弃，回标注态（标注会话从未销毁）
+    /// Esc：直接取消并关闭整个截图会话（不再退回普通框选/编辑面板，一步退出）
     private func cancelScrollCapture() {
         teardownScrollSession()
         scrollSelectionRect = nil
         scrollScreen = nil
-        if let session = editorSession {
-            toolbar?.place(below: session.selectionGlobal)
-            toolbar?.orderFrontRegardless()
-        }
-        restoreEditorFocus(reason: "scroll.cancel")
         Log.event(.scroll, "scroll.cancel")
+        perform(action: .cancel)
     }
 
-    /// OverlayView Esc 驱动：采集态取消（丢已采帧回标注态，编辑会话不动）。
-    /// ⚠️ 不能走 perform(.cancel)——那会拆掉整个 overlay 会话（含编辑会话），
-    /// 与设计语义「Esc 取消回标注态」相悖。
+    /// OverlayView Esc 驱动：采集态取消并关闭整个截图会话
     func cancelScrollForUser() {
         cancelScrollCapture()
     }
@@ -1116,69 +1432,67 @@ final class OverlayController {
         case autoBottom    // 到底 0.6s 自动
     }
 
-    /// 收尾：停采样 → 后台拼接（≤ composeTimeout，超时回退单帧）→ 合成长图进
-    /// 标注编辑器（与普通截图同一条流：Enter/⌘S/工具 1–6/撤销栈含长图整体）。
-    /// ⚠️ 收尾热键在 compose 期不撤（活到 enterEditorAfterScroll / teardown），
-    /// 但回调里吞掉——用户在整个 compose 期按键不能无反应也不能破坏会话。
+    /// 收尾：停采样 → 增量管线毫秒级出图 → 按 afterCapture 单次导出完成
     private func finishScrollCapture(mode: ScrollFinishMode) {
-        guard let controller = scrollController else { return }
+        guard let controller = scrollController, let pipeline = scrollPipeline else { return }
         scrollBottomWork?.cancel()
         scrollBottomWork = nil
+        scrollDroppedHintWork?.cancel()
+        scrollDroppedHintWork = nil
+        removeScrollWheelMonitor()
+        scrollSessionToken += 1
+        let trailingFrames = scrollFrameQueue
+        scrollFrameQueue.removeAll()
+        scrollFrameInFlight = false
         controller.stop()
         scrollController = nil
+        scrollPipeline = nil
         scrollHUD?.hide()
         scrollHUD = nil
 
-        let frames = scrollFrames
         let selection = scrollSelectionRect
         let screen = scrollScreen
-        scrollFrames = []
-        scrollRefBuffer = nil
+        let recordedFrames = scrollAcceptedCount
         scrollBottomDetected = false
-        // 焦点屏语义：只退焦点屏窗口的滚动态（其余屏从未进入）
         let focal = scrollScreen
         for window in windows where focal == nil || window.owningScreen == focal {
             window.exitScrollMode()
         }
 
-        guard frames.count > 0, let selection, let screen else {
-            Log.error(.scroll, "scroll.compose.fail", ["err": "no frames"])
+        guard let selection, let screen else {
+            Log.error(.scroll, "scroll.compose.fail", ["err": "no session geometry"])
             cancelScrollCapture()
             return
         }
         Log.event(.scroll, "scroll.compose.begin", [
-            "frames": "\(frames.count)", "mode": mode == .autoBottom ? "auto" : "manual",
+            "frames": "\(recordedFrames)", "mode": mode == .autoBottom ? "auto" : "manual",
         ])
-        // 拼接窗口期：编辑器键全吞（OverlayView.keyDown 检查 isScrollComposing），
-        // 防 Enter→done / Esc→cancel 在回填前销毁 editorSession；收尾热键同样吞
         isScrollComposing = true
         scrollEscForceCount = 0
         let timeoutNs = UInt64(DesignTokens.Scroll.composeTimeout * 1_000_000_000)
         let composeStart = DispatchTime.now()
-        // 会话代际（reviewer 补丁 A/C）：Esc×3 逃生或取消后立刻开新截图时，
-        // 旧 compose Task 的长图绝不能回填新会话
         let epoch = overlaySessionEpoch
+
         Task { @MainActor in
             enum ComposeOutcome {
                 case done(Stitcher.Result)
                 case timeout
-                case failed
+                case failed(CGImage?)
             }
-            // ⚠️ 病例（ms=6772 timeoutMs=3000）两段根因（reviewer Critical#1）：
-            // ① @MainActor 上下文 addTask 继承隔离，stitch 堵主线程（UI/Esc 全卡）；
-            // ② withTaskGroup 返回前隐式 await 全部子任务——detached 的 value
-            //    对 cancelAll 不响应 ⇒ 拼接真卡死时 .timeout 分支仍要等它跑完。
-            // 修：detached + 主线程 20ms 轮询 isCompleted，到点即走、晚到结果丢弃。
-            // TaskGroup 竞速：stitch 子任务跑 detached 且协作可取消（Stitcher
-            // 循环内检查 Task.isCancelled）——timeout 分支 cancelAll 即刻中断
-            // 拼接并返回，不会隐式等待跑完（reviewer Critical#1 全量修复）
             let outcome: ComposeOutcome = await withTaskGroup(of: ComposeOutcome.self) { group in
                 group.addTask {
                     await Task.detached(priority: .userInitiated) {
-                        if let result = try? Stitcher.stitch(frames: frames) {
+                        for frame in trailingFrames {
+                            _ = await pipeline.push(frame)
+                        }
+                        guard await pipeline.hasContent() else {
+                            return .failed(nil)
+                        }
+                        if let result = try? await pipeline.finish() {
                             return .done(result)
                         }
-                        return .failed
+                        let fallback = await pipeline.fallbackFirstFrame()
+                        return .failed(fallback)
                     }.value
                 }
                 group.addTask {
@@ -1193,7 +1507,6 @@ final class OverlayController {
                 Double(DispatchTime.now().uptimeNanoseconds - composeStart.uptimeNanoseconds)
                     / 1_000_000
             )
-            // 会话换代守卫：丢弃晚到的旧结果（不回填新会话）
             guard epoch == self.overlaySessionEpoch else {
                 self.isScrollComposing = false
                 Log.event(.scroll, "scroll.compose.stale", ["ms": "\(elapsedMs)"])
@@ -1205,52 +1518,35 @@ final class OverlayController {
                     "pxW": "\(result.image.width)", "pxH": "\(result.image.height)",
                     "seams": "\(result.seams.count)", "ms": "\(elapsedMs)",
                 ])
-                // 选区按拼接结果实际尺寸延展（病例 2026-11-16「只截最后一帧」：
-                // selection 是采集窗口（固定），合成图 2171px 塞回 1084pt 窗口被
-                // 压扁。长图高度 = pxH/scale，顶边对齐原选区顶、向下延展——
-                // 编辑器选区 = 长图真实高度）
-                var grownSelection = selection
-                if selection.height > 0, result.image.width > 0 {
-                    let scale = CGFloat(result.image.width) / selection.width
-                    let grownH = CGFloat(result.image.height) / max(scale, 0.001)
-                    grownSelection = CGRect(
-                        x: selection.minX,
-                        y: selection.maxY - grownH,
-                        width: selection.width, height: grownH)
-                }
-                // 用户裁定（2026-11-16「滚动截图完应该自动关闭面板，为什么还
-                // 要点一下回车」）：滚完直接完成——合成结果直接走 afterCapture
-                // 动作（复制/保存/贴图，同普通截图的完成流），不进编辑器。
-                // 要标注的用户在滚动前的编辑态标注（会话一直保留）
                 self.finishScrollWithResult(image: result.image)
-                _ = grownSelection
             case .timeout:
-                // 卡死保险丝：拼帧超时（病例：10s 无反馈）⇒ 回退单帧，不让用户干等
                 Log.error(.scroll, "scroll.compose.fail", [
                     "err": "compose.timeout", "timeoutMs": "\(Int(DesignTokens.Scroll.composeTimeout * 1000))",
                     "ms": "\(elapsedMs)",
                 ])
-                CaptureToast.show(message: "拼接超时，已回退为单帧", status: .warn)
-                self.enterEditorAfterScroll(
-                    image: frames[0], selection: self.scrollInitialSelection ?? selection, screen: screen)
-            case .failed:
-                // 拼接失败（静止画面/无可信重叠）：明确回退单帧进编辑器 + toast 告知。
-                // ⚠️ 恢复 grow 前的原选区（scrollInitialSelection）——回退图 frames[0]
-                // 就是以原选区尺寸抓的，保留 grown 选区会出现底图/选区尺寸错位，
-                // 且用户看到选区被扩成全屏（另一屏也被框住）的假象。
+                if let fallback = await pipeline.fallbackFirstFrame() {
+                    CaptureToast.show(message: "拼接超时，已回退为单帧", status: .warn)
+                    self.enterEditorAfterScroll(
+                        image: fallback, selection: self.scrollInitialSelection ?? selection, screen: screen)
+                } else {
+                    self.cancelScrollCapture()
+                }
+            case .failed(let fallback):
                 Log.error(.scroll, "scroll.compose.fail", [
-                    "err": "stitch.noOverlap", "ms": "\(elapsedMs)",
+                    "err": "stitch.noFrames", "ms": "\(elapsedMs)",
                 ])
-                CaptureToast.show(message: "滚动拼接未找到重叠内容，已回退为单帧", status: .warn)
-                self.enterEditorAfterScroll(
-                    image: frames[0], selection: self.scrollInitialSelection ?? selection, screen: screen)
+                if let fallback {
+                    CaptureToast.show(message: "滚动拼接未找到重叠内容，已回退为单帧", status: .warn)
+                    self.enterEditorAfterScroll(
+                        image: fallback, selection: self.scrollInitialSelection ?? selection, screen: screen)
+                } else {
+                    self.cancelScrollCapture()
+                }
             }
         }
     }
 
-    /// 合成长图回填标注会话：底图替换、选区随内容生长、画布矩形重算、
-    /// 工具栏贴新选区下缘并夺回键盘焦点
-    /// 滚动合成结果直接完成（不进编辑器——用户裁定「滚完自动关闭面板」）
+    /// 滚动合成结果单次完成流（统一交由 completion / 单处收口，杜绝双次导出与双弹窗）
     private func finishScrollWithResult(image: CGImage) {
         isScrollComposing = false
         unregisterScrollHotKeys()
@@ -1260,32 +1556,32 @@ final class OverlayController {
         Log.event(.scroll, "scroll.compose.autoFinish", [
             "pxW": "\(image.width)", "pxH": "\(image.height)",
         ])
-        // 走与普通截图一致的完成流（afterCapture 设置驱动：复制+toast/
-        // 保存/贴图）
+        AppCoordinatorShared.deps?.history.record(image)
         let settings = AppCoordinatorShared.coordinator?.settings ?? .defaultSettings
+        let pinRect = sessionPinRect() ?? .zero
+        let completion = self.completion
+        end()
+        self.completion = nil
         switch settings.afterCapture {
         case .copy:
-            AppCoordinatorShared.deps?.history.record(image)
-            AppCoordinatorShared.deps?.clipboard.writeImage(image)
-            if settings.showCopyNotification {
-                CaptureToast.show(image: image, message: "长图已复制")
+            if let completion {
+                completion(.copy(image))
+            } else {
+                AppCoordinatorShared.deps?.clipboard.writeImage(image)
+                CaptureSoundPlayer.play()
+                if settings.showCopyNotification {
+                    CaptureToast.show(image: image, message: "长图已复制")
+                }
             }
-            let completion = self.completion
-            end()
-            self.completion = nil
-            completion?(.copy(image))
         case .save:
-            AppCoordinatorShared.deps?.history.record(image)
-            AppCoordinatorShared.coordinator?.quickSaveScroll(image: image)
-            let completion = self.completion
-            end()
-            self.completion = nil
-            completion?(.save(image))
+            if let completion {
+                completion(.save(image))
+            } else {
+                AppCoordinatorShared.coordinator?.quickSaveScroll(image: image)
+            }
         case .pin:
-            AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: sessionPinRect() ?? .zero)
-            let completion = self.completion
-            end()
-            self.completion = nil
+            AppCoordinatorShared.deps?.pinning.pin(image, atGlobalRect: pinRect)
+            CaptureSoundPlayer.play()
             completion?(.cancelled)
         }
     }
@@ -1320,7 +1616,7 @@ final class OverlayController {
         for window in windows where window.owningScreen == screen {
             window.enterEditorMode(session: session)   // 重算 editorRectLocal（生长后的画布）
         }
-        toolbar?.place(below: selection)
+        toolbar?.place(below: toolbarAnchorRectGlobal(for: session))
         toolbar?.orderFrontRegardless()
         restoreEditorFocus(reason: "scroll.compose")
         Log.event(.editor, "editor.enter.fromScroll", [
@@ -1333,9 +1629,7 @@ final class OverlayController {
         ensureActivation(reason: reason)
         guard let win = editorWindow() else { return }
         win.makeKeyAndOrderFront(nil)
-        if let contentView = win.contentView {
-            _ = win.makeFirstResponder(contentView)
-        }
+        _ = win.makeFirstResponder(win.overlayView)
         toolbar?.orderFrontRegardless()
         Log.event(.editor, "editor.focus.restored", [
             "keyWin": "\(win.isKeyWindow)", "from": reason,
@@ -1344,7 +1638,7 @@ final class OverlayController {
 
     /// OverlayView 滚动 HUD 读取（选区全局矩形 / 已抓帧数）
     var scrollSelectionGlobal: CGRect? { scrollSelectionRect }
-    var scrollFrameCount: Int { scrollFrames.count }
+    var scrollFrameCount: Int { scrollAcceptedCount }
 
     /// 键盘 Enter / 自测驱动：结束滚动采集（合成长图进标注编辑器）
     func finishScrollForSelfTest() {
@@ -1357,7 +1651,7 @@ final class OverlayController {
         guard let session = editorSession else { return }
         session.store.add(annotation)
         toolbar?.refreshSelectionState()
-        editorWindow()?.contentView?.needsDisplay = true
+        editorWindow()?.overlayView.needsDisplay = true
     }
 
     func undoAnnotation() { toolbarAction(.undo) }
@@ -1409,7 +1703,11 @@ final class OverlayController {
             // 编辑态：合成导出（编辑器所见 = 导出所得）
             // 病例收口（2026-11-15）：拖拽标注 + 立即导出的 mouseUp/keyDown
             // 竞态——渲染前 flush pending，三个导出点共用同一兜底
-            (editorWindow()?.contentView as? OverlayView)?.flushPendingAnnotationForExport()
+            editorWindow()?.overlayView.flushPendingAnnotationForExport()
+            lastExportSnapshot = session.makeExportSnapshot(
+                sourceApp: previousApp?.localizedName,
+                windowTitle: nil
+            )
             let start = DispatchTime.now()
             let finalImage = session.renderFinalImage()
             let elapsedMs = Int(
@@ -1421,7 +1719,7 @@ final class OverlayController {
                 "pxW": "\(finalImage.width)",
                 "pxH": "\(finalImage.height)",
             ])
-            AppCoordinatorShared.deps?.history.record(finalImage)   // 任何导出都写历史
+            AppCoordinatorShared.deps?.history.record(finalImage, metadata: makeHistoryMetadata(for: session))   // 任何导出都写历史
             if case .quickSave = action {
                 AppCoordinatorShared.coordinator?.quickSave(image: finalImage)
                 let completion = self.completion
@@ -1465,5 +1763,53 @@ extension OverlayController {
 
     func performForSelfTest(_ action: Action) {
         perform(action: action)
+    }
+}
+
+/// 串行流式滚动拼接管线：actor 隔离保证任意时刻只处理一帧且严格保序。
+private actor ScrollStitchPipeline {
+    struct StepOutcome: Sendable {
+        let status: Stitcher.PushStatus
+        let frameCount: Int
+        let canvasHeight: Int
+        let viewportHeight: Int
+        let viewportPosition: Int
+        let maxViewportPosition: Int
+        let frameHeight: Int
+        let hasScrolled: Bool
+        let prepMs: Int
+        let estMs: Int
+        let estimate: TileMotionEstimator.Estimate?
+    }
+
+    private let session = Stitcher.Session()
+
+    func push(_ frame: CGImage) -> StepOutcome {
+        let status = session.push(frame)
+        return StepOutcome(
+            status: status,
+            frameCount: session.contributingFrameCount,
+            canvasHeight: session.canvasHeight,
+            viewportHeight: session.viewportHeight,
+            viewportPosition: session.viewportPosition,
+            maxViewportPosition: session.maxViewportPosition,
+            frameHeight: frame.height,
+            hasScrolled: session.hasScrolled,
+            prepMs: session.lastPrepMs,
+            estMs: session.lastEstMs,
+            estimate: session.lastEstimate
+        )
+    }
+
+    func finish() throws -> Stitcher.Result {
+        try session.finish()
+    }
+
+    func hasContent() -> Bool {
+        session.contributingFrameCount > 0
+    }
+
+    func fallbackFirstFrame() -> CGImage? {
+        session.firstFrameImage
     }
 }
