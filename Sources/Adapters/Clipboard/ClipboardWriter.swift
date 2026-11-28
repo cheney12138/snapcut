@@ -6,15 +6,50 @@ import UniformTypeIdentifiers
 enum ClipboardWriter {
     // MARK: - 自写标记（剪贴板图片智能感知的防自触发闸门）
 
+    /// 附加在 Snapcut 自写剪贴板内容上的私有 pasteboard type。
+    ///
+    /// 只多一个 type 名，不给外部 App 添任何负担：任何 App 粘贴图片/文件时只会按
+    /// `public.png` / `public.tiff` / `public.file-url` 取数据，根本不会看这个自定义 type。
+    /// 它让 `ClipboardImageWatcher` 100% 能认出「这一轮剪贴板是 Snapcut 自己写的」，
+    /// 比只比对 `changeCount` 整数可靠得多（第三方剪贴板管理器 / Universal Clipboard
+    /// 重写一次 changeCount 就飘了）。
+    static let ownWriteMarkerType = NSPasteboard.PasteboardType("app.snapcut.own-clipboard-write")
+
     /// Snapcut 自己最后一次写系统剪贴板时的 `changeCount`（-1 = 尚未写过）。
     /// 外部剪贴板 watcher 据此跳过自己写进去的内容——否则「截图自动复制 → 弹提示 → 提示里再复制」
     /// 会自己触发自己，形成提示套娃。
     @MainActor private(set) static var lastOwnWriteChangeCount: Int = -1
 
-    /// 写入完成后调用：记下当前 changeCount 作为「这是自己写的」凭证。
+    /// 最后一次自写剪贴板的时间（配合 `matchesRecentOwnImage` 做极短窗口兜底）
+    @MainActor private(set) static var lastOwnWriteAt: Date = .distantPast
+
+    /// 最后一次 `writeImage` 写出的图片像素宽高（第三方工具剥掉私有 type 后仍能指纹比对）
+    @MainActor private(set) static var lastOwnImagePixelSize: CGSize?
+
+    /// 写入完成后调用：记下当前 changeCount / 时间作为「这是自己写的」凭证，
+    /// 并立刻把观察游标推给 watcher（同步取消在途探测任务，消灭「探测任务抢在
+    /// markOwnWrite 之前跑完 Vision」的竞态）。
     @MainActor
     static func markOwnWrite() {
-        lastOwnWriteChangeCount = NSPasteboard.general.changeCount
+        let count = NSPasteboard.general.changeCount
+        lastOwnWriteChangeCount = count
+        lastOwnWriteAt = Date()
+        ClipboardImageWatcher.shared.noteOwnWrite(changeCount: count)
+    }
+
+    /// 检查当前剪贴板是否明确带有 Snapcut 自写标记
+    @MainActor
+    static func hasOwnWriteMarker(in pasteboard: NSPasteboard = .general) -> Bool {
+        pasteboard.availableType(from: [ownWriteMarkerType]) != nil
+    }
+
+    /// 兜底：若第三方剪贴板管理器在极短时间（<= 3.0s）内重新规范化剪贴板剥掉了私有标记，
+    /// 比对像素宽高是否与 Snapcut 刚刚写出的截图完全一致。
+    @MainActor
+    static func matchesRecentOwnImage(_ image: CGImage, within seconds: TimeInterval = 3.0) -> Bool {
+        guard Date().timeIntervalSince(lastOwnWriteAt) <= seconds,
+              let lastSize = lastOwnImagePixelSize else { return false }
+        return Int(lastSize.width) == image.width && Int(lastSize.height) == image.height
     }
 
     // MARK: - 写入
@@ -46,6 +81,11 @@ enum ClipboardWriter {
             }
         }
         let ok = !writtenTypes.isEmpty
+        if ok {
+            // 同一轮内容里附加私有自写标记（不额外 clearContents，只是多挂一个 type）
+            _ = pasteboard.setData(Data([1]), forType: Self.ownWriteMarkerType)
+            lastOwnImagePixelSize = CGSize(width: image.width, height: image.height)
+        }
         Log.event(.clipboard, "clipboard.write", [
             "fmts": writtenTypes.joined(separator: "+"),
             "bytes": "\(pngData?.count ?? tiffData?.count ?? 0)",
@@ -74,6 +114,12 @@ enum ClipboardWriter {
         } else if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
                   let size = attrs[.size] as? NSNumber {
             bytes = size.intValue
+        }
+        if wrote {
+            // 写文件 URL 时同样打自写标记；顺带清掉上一张图的指纹，避免「刚写完文件 URL
+            // 又冒出同尺寸外部图」被旧尺寸误判成自写
+            _ = pasteboard.setData(Data([1]), forType: Self.ownWriteMarkerType)
+            lastOwnImagePixelSize = nil
         }
         Log.event(.clipboard, "clipboard.write", [
             "fmts": fmts.joined(separator: "+"),

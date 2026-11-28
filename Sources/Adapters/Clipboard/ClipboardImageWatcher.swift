@@ -188,7 +188,9 @@ enum ClipboardImageReader {
 /// 0.6s + 0.2s tolerance 的 Timer 在 App Nap 下几乎零成本，且能保证「复制后 1s 内」响应。
 ///
 /// 三道自扰闸门：
-/// 1. 自写过滤：`ClipboardWriter.lastOwnWriteChangeCount` —— Snapcut 自己复制的图不弹提示；
+/// 1. 自写过滤：`ClipboardWriter.lastOwnWriteChangeCount` + `hasOwnWriteMarker()`（私有
+///    pasteboard type）+ `matchesRecentOwnImage()`（3s 内同尺寸指纹）—— Snapcut 自己复制的图
+///    不弹提示；
 /// 2. 忙态/前台过滤：正在截图、正在录屏、Snapcut 自己的窗口在前台时用户视线不在这里；
 /// 3. 内容过滤：`hasText || hasQR` 才回调 —— 纯表情包/照片 0 打扰。
 @MainActor
@@ -259,6 +261,16 @@ final class ClipboardImageWatcher {
 
     // MARK: - 轮询
 
+    /// `ClipboardWriter` 写完剪贴板后同步推开观察游标：
+    /// 把刚写出的这一轮当成「已看过」，并取消在途探测任务，
+    /// 避免「探测任务抢在 markOwnWrite 之前跑完 Vision」的竞态把自写图当外部图弹提示。
+    func noteOwnWrite(changeCount: Int) {
+        lastObservedChangeCount = changeCount
+        cancelProbe()
+        // 托盘里的「剪贴板图片」入口必须跟着变，但绝不走 OCR 弹窗路径
+        Self.publishHasImage()
+    }
+
     private func tick() {
         let currentCount = NSPasteboard.general.changeCount
         guard currentCount != lastObservedChangeCount else { return }
@@ -267,8 +279,13 @@ final class ClipboardImageWatcher {
         // ① 先刷「剪贴板里有图吗」——与业务过滤无关，托盘入口必须实时跟着变
         Self.publishHasImage()
 
-        // ② 自己写的不算什么「外部复制」
-        guard currentCount != ClipboardWriter.lastOwnWriteChangeCount else { return }
+        // ② 自己写的不算什么「外部复制」（changeCount 对齐 + 私有标记双保险）
+        if currentCount == ClipboardWriter.lastOwnWriteChangeCount
+            || ClipboardWriter.hasOwnWriteMarker() {
+            cancelProbe()
+            Log.event(.clipboard, "clipboard.watch.skip", ["reason": "ownWrite"])
+            return
+        }
 
         // ③ 开关 / 忙态 / Snapcut 自己在前台（用户视线不在这里，弹提示只会碍事）
         guard isEnabled, isBusyProvider?() != true, !NSApp.isActive else { return }
@@ -283,6 +300,14 @@ final class ClipboardImageWatcher {
             return
         }
 
+        // ④' 冷却 + 尺寸指纹兜底：第三方剪贴板管理器 / Universal Clipboard 可能在极短时间
+        // 内重写剪贴板（changeCount 飘了、私有 type 也被剥掉），只要“刚刚写过同尺寸截图”就不当外部图
+        if ClipboardWriter.matchesRecentOwnImage(image) {
+            cancelProbe()
+            Log.event(.clipboard, "clipboard.watch.skip", ["reason": "ownImageRecent"])
+            return
+        }
+
         // ⑤ 重解码 + Vision 分析放后台任务；期间用户又复制 → changeCount 变了，结果作废
         probeTask?.cancel()
         probeTask = Task { [weak self] in
@@ -291,6 +316,14 @@ final class ClipboardImageWatcher {
             guard !Task.isCancelled else { return }
             guard NSPasteboard.general.changeCount == currentCount else { return }
             guard self.isEnabled, self.isBusyProvider?() != true else { return }
+            // 准备弹提示前二次确认：分析的这段时间里 Snapcut 可能又自己写了剪贴板
+            // （截图 → 自动复制 → 立即取字等）——三道自写闸门再查一遍
+            guard currentCount != ClipboardWriter.lastOwnWriteChangeCount,
+                  !ClipboardWriter.hasOwnWriteMarker(),
+                  !ClipboardWriter.matchesRecentOwnImage(image) else {
+                Log.event(.clipboard, "clipboard.watch.skip", ["reason": "ownWriteLate"])
+                return
+            }
             guard let analysis else {
                 Log.event(.clipboard, "clipboard.watch.skip", [
                     "reason": "analyzeFail", "px": "\(image.width)x\(image.height)",

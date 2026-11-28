@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
 
 /// 屏幕录制 TCC 权限（docs/03 §9）
@@ -41,7 +42,7 @@ enum TCCPermission {
         )
         Log.event(.permission, "permission.request", ["granted": "\(granted)"])
         // 浮窗待命：tick 找到系统设置窗口后自动显示
-        PermissionDragOverlay.shared.show()
+        PermissionDragOverlay.shared.show(for: .screenRecording)
     }
 
     /// 托盘菜单手动入口（用户主动要求看设置页）
@@ -52,7 +53,47 @@ enum TCCPermission {
         )
         Log.event(.permission, "permission.openSettings", ["granted": "\(granted)"])
         if !granted {
-            PermissionDragOverlay.shared.show()
+            PermissionDragOverlay.shared.show(for: .screenRecording)
+        }
+    }
+}
+
+/// 辅助功能权限（智能框选表格 / 控件 / 网页元素用）
+/// 纪律：isTrusted() 只查不弹；requestAndOpenSettings() 仅在用户主动点击「去授权」时调用。
+@MainActor
+enum AccessibilityPermission {
+    /// 只查不弹。macOS 的 AX 授权要求 App 在系统设置里重新勾选才生效（运行期不撤销），
+    /// 但用户可能中途手动关掉，所以这里不做缓存。
+    static func isTrusted() -> Bool {
+        AXIsProcessTrusted()
+    }
+
+    /// **仅用户主动点击时调用**：先让系统把 Snapcut 登记进辅助功能列表（可能弹一次
+    /// 系统确认框），再打开「隐私与安全性 → 辅助功能」页。
+    static func requestAndOpenSettings() {
+        // 用字面量而不是 kAXTrustedCheckOptionPrompt：后者是全局 CFString 变量，
+        // Swift 6 strict concurrency 下会被判为共享可变状态而报并发告警（两者等价）。
+        let promptKey = "AXTrustedCheckOptionPrompt" as CFString
+        let options = [promptKey: kCFBooleanTrue as Any] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        if !trusted,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+            // 贴身浮窗：系统设置窗口出现后自动贴到右下角，图标可直接拖进列表
+            PermissionDragOverlay.shared.show(for: .accessibility)
+        }
+        Log.event(.permission, "accessibility.request", ["trusted": "\(trusted)"])
+    }
+
+    /// 只打开设置页，不触发系统确认框（已在列表里的场景无副作用）
+    static func openSettings() {
+        let trusted = isTrusted()
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+        Log.event(.permission, "accessibility.openSettings", ["trusted": "\(trusted)"])
+        if !trusted {
+            PermissionDragOverlay.shared.show(for: .accessibility)
         }
     }
 }

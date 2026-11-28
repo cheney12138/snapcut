@@ -215,17 +215,39 @@ enum CaptureToast {
         Log.event(.app, "toast.show", ["kind": "text", "msg": message])
     }
 
-    static func show(image: CGImage, message: String = "已复制到剪贴板",
-                     onClick: (() -> Void)? = nil) {
-        // 连续截图：旧 toast 0.1s 快 fade 再上新，避免叠影硬切
+    /// 取色完成反馈（功能 #3 一键取色闭环的收尾一拍）：色卡芯片 + 当前格式色值
+    ///
+    /// 视觉真源沿本文件既有体系：
+    /// - 248×64（色值较长时最多扩到 284）、radius 14（`Radius.xl`）、`mat.hud` 自适应玻璃 + 双层光学影
+    /// - 左侧 36×36 圆角 9 纯色芯片：采样色填充 + **自适应** 0.5pt 发丝边（亮色压暗边、暗色提白边，
+    ///   否则纯白/纯黑采样会与玻璃底融成一片）+ 柔和阴影
+    /// - 主行 `formatted`（等宽加粗 label1，HEX/RGB/HSL 数字不跳字）、副行 `已复制色值 · secondary`
+    /// - 右下角入场同 `show(image:)`；2.2s 自动退场（`playExit` + 0.6s 强制收窗双保险）
+    /// - 不抢焦点也不吃鼠标（`ignoresMouseEvents = true`）——取色时用户可能在连续拖拽
+    static func showColorCopied(
+        formatted: String,
+        secondary: String,
+        r: Int,
+        g: Int,
+        b: Int
+    ) {
         dismissWork?.cancel()
         retireCurrentToast()
 
         guard let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })
             ?? NSScreen.main ?? NSScreen.screens.first else { return }
         let visible = screen.visibleFrame
-        let width: CGFloat = onClick != nil ? 284 : 268
-        let height: CGFloat = 76
+
+        let chipSide: CGFloat = 36
+        let textX: CGFloat = 10 + chipSide + 12
+        let mainFont = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        let subFont = DesignTokens.Font.monoDigit(11)
+        let secondaryLine = "已复制色值 · \(secondary)"
+        let mainWidth = (formatted as NSString).size(withAttributes: [.font: mainFont]).width
+        let subWidth = (secondaryLine as NSString).size(withAttributes: [.font: subFont]).width
+        // 248 起；色值更长时按真实字宽扩（上限 284，label 另有尾部截断兜底）
+        let width: CGFloat = min(284, max(248, ceil(textX + max(mainWidth, subWidth) + 12)))
+        let height: CGFloat = 64
 
         let m = shadowMargin
         let panel = ToastPanel(
@@ -242,13 +264,149 @@ enum CaptureToast {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
 
+        let (outer, effect) = makeCardContainer(
+            cardWidth: width, cardHeight: height, cornerRadius: DesignTokens.Radius.xl
+        )
+
+        let chip = makeColorChip(r: r, g: g, b: b, side: chipSide, radius: 9)
+        chip.frame.origin = CGPoint(x: 10, y: (height - chipSide) / 2)
+        effect.addSubview(chip)
+
+        // 两行文字垂直居中：主行 17 + 间距 4 + 副行 14 = 35，上下各留 14.5
+        let valueLabel = NSTextField(labelWithString: formatted)
+        valueLabel.font = mainFont
+        valueLabel.textColor = DesignTokens.label1
+        valueLabel.lineBreakMode = .byTruncatingTail
+        valueLabel.frame = NSRect(x: textX, y: height - 14.5 - 17, width: width - textX - 12, height: 17)
+        effect.addSubview(valueLabel)
+
+        let noteLabel = NSTextField(labelWithString: secondaryLine)
+        noteLabel.font = subFont
+        noteLabel.textColor = DesignTokens.label2
+        noteLabel.lineBreakMode = .byTruncatingTail
+        noteLabel.frame = NSRect(x: textX, y: height - 14.5 - 17 - 4 - 14, width: width - textX - 12, height: 14)
+        effect.addSubview(noteLabel)
+
+        panel.contentView = outer
+
+        let restOrigin = CGPoint(
+            x: visible.maxX - width - 20 - m,
+            y: visible.minY + 20 - m
+        )
+        let reduce = DesignTokens.Motion.reduceMotion
+        panel.setFrameOrigin(CGPoint(x: restOrigin.x, y: restOrigin.y - (reduce ? 0 : 10)))
+        panel.alphaValue = 0
+        panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = DesignTokens.Motion.enterDuration
+            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+            panel.animator().alphaValue = 1
+            if !reduce { panel.animator().setFrameOrigin(restOrigin) }
+        }
+        current = panel
+
+        let work = DispatchWorkItem {
+            guard current === panel else { return }
+            playExit(panel: panel, duration: DesignTokens.Motion.exitDuration) {
+                if current === panel { current = nil }
+            }
+            // 双保险（NSAnimationContext completion 偶发不触发 → 0.6s 后无条件收窗）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                if current === panel {
+                    panel.orderOut(nil)
+                    current = nil
+                    Log.event(.app, "toast.exit.forced", [:])
+                }
+            }
+        }
+        dismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: work)
+        Log.event(.app, "toast.colorCopied", ["value": formatted])
+    }
+
+    /// 色卡芯片：纯色圆角方块 + 自适应发丝边 + 柔和阴影
+    ///
+    /// 发丝边为什么自适应：纯白采样（#FFFFFF）在暗玻璃上是“无边”的，纯黑采样（#000000）也会糊掉，
+    /// 按采样亮度切换黑/白半透明描边，任何颜色都有清晰轮廓且不显脏。
+    private static func makeColorChip(r: Int, g: Int, b: Int, side: CGFloat, radius: CGFloat) -> NSView {
+        let holder = NSView(frame: NSRect(origin: .zero, size: NSSize(width: side, height: side)))
+        holder.wantsLayer = true
+        holder.layer?.shadowColor = NSColor.black.cgColor
+        holder.layer?.shadowOpacity = 0.18
+        holder.layer?.shadowRadius = 4
+        holder.layer?.shadowOffset = CGSize(width: 0, height: -1)
+        holder.layer?.shadowPath = CGPath(
+            roundedRect: NSRect(origin: .zero, size: NSSize(width: side, height: side)),
+            cornerWidth: radius, cornerHeight: radius, transform: nil
+        )
+
+        let chip = NSView(frame: NSRect(origin: .zero, size: NSSize(width: side, height: side)))
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = NSColor(
+            srgbRed: CGFloat(min(255, max(0, r))) / 255,
+            green: CGFloat(min(255, max(0, g))) / 255,
+            blue: CGFloat(min(255, max(0, b))) / 255,
+            alpha: 1
+        ).cgColor
+        chip.layer?.cornerRadius = radius
+        chip.layer?.cornerCurve = .continuous
+        chip.layer?.masksToBounds = true
+        chip.layer?.borderWidth = 0.5
+        let luminance = (0.2126 * CGFloat(r) + 0.7152 * CGFloat(g) + 0.0722 * CGFloat(b)) / 255
+        chip.layer?.borderColor = luminance > 0.72
+            ? NSColor.black.withAlphaComponent(0.20).cgColor
+            : NSColor.white.withAlphaComponent(0.28).cgColor
+
+        holder.addSubview(chip)
+        return holder
+    }
+
+    static func show(image: CGImage, message: String = "已复制到剪贴板",
+                     onClick: (() -> Void)? = nil) {
+        // 连续截图：旧 toast 0.1s 快 fade 再上新，避免叠影硬切
+        dismissWork?.cancel()
+        retireCurrentToast()
+
+        guard let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })
+            ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        let visible = screen.visibleFrame
+        // 尺寸角标 + 拖出提示比原来的「点击编辑」长，放不下就按规格扩到 296（上限 320），绝不裁切/压字
+        let thumbSide = DesignTokens.Toast.thumbSide
+        let textX: CGFloat = thumbSide + 20
+        let rightReserve: CGFloat = onClick != nil ? 28 : 14
+        let detailText = onClick != nil
+            ? "\(image.width) × \(image.height) · 点击编辑或拖出"
+            : "\(image.width) × \(image.height) · 按住可拖出"
+        let titleWidth = (message as NSString).size(withAttributes: [.font: DesignTokens.Font.head]).width
+        let detailWidth = (detailText as NSString)
+            .size(withAttributes: [.font: DesignTokens.Font.monoDigit(11)]).width
+        let neededWidth = textX + rightReserve + max(titleWidth, detailWidth)
+        var width: CGFloat = onClick != nil ? 284 : 268
+        if neededWidth > width { width = min(320, max(296, ceil(neededWidth))) }
+        let height: CGFloat = 76
+
+        let m = shadowMargin
+        let panel = ToastPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width + m * 2, height: height + m * 2),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        // 图片 Toast 一律允许鼠标交互：无论能否点击编辑，都要支持「按住随手拖出 PNG 文件」
+        panel.ignoresMouseEvents = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isReleasedWhenClosed = false
+
         // 背景：mat.hud 自适应玻璃（radius 14 + maskImage 零白角 + 双层光学影 + 顶缘高光）
         let (outer, effect) = makeCardContainer(
             cardWidth: width, cardHeight: height, cornerRadius: DesignTokens.Radius.xl
         )
 
         // 缩略图（独立阴影托架 + 56pt 圆角 7 + 精细 0.5pt 边界线，告别贴死在灰板上的廉价感）
-        let thumbSide = DesignTokens.Toast.thumbSide
         let thumbHolder = NSView(frame: NSRect(x: 10, y: 10, width: thumbSide, height: thumbSide))
         thumbHolder.wantsLayer = true
         thumbHolder.layer?.shadowColor = NSColor.black.cgColor
@@ -271,17 +429,12 @@ enum CaptureToast {
         effect.addSubview(thumbHolder)
 
         // 文案两行：t.head 主文案 + t.note 尺寸/操作提示（数字 tabular-nums）
-        let textX = thumbSide + 20
-        let rightReserve: CGFloat = onClick != nil ? 28 : 14
         let title = NSTextField(labelWithString: message)
         title.font = DesignTokens.Font.head
         title.textColor = DesignTokens.label1
         title.lineBreakMode = .byTruncatingTail
         title.frame = NSRect(x: textX, y: height - 34, width: width - textX - rightReserve, height: 18)
 
-        let detailText = onClick != nil
-            ? "\(image.width) × \(image.height) · 点击编辑"
-            : "\(image.width) × \(image.height) · PNG"
         let detail = NSTextField(labelWithString: detailText)
         detail.font = DesignTokens.Font.monoDigit(11)
         detail.textColor = DesignTokens.label2
@@ -341,33 +494,74 @@ enum CaptureToast {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
 
-        // 点击打开编辑：停留延长到 5s，且鼠标悬停时暂停倒计时（移出后 1.8s 退场），
-        // 绝不出现「还没来得及点就消失」；点击立即取消退场定时并打开截图编辑器。
-        if let onClick {
-            panel.ignoresMouseEvents = false
-            let clickView = ToastClickView(frame: effect.bounds)
-            clickView.targetCard = effect
-            clickView.onHoverChange = { [weak panel, weak chevronView] hovering in
-                guard let panel, current === panel else { return }
-                if let chevron = chevronView {
-                    chevron.contentTintColor = hovering ? DesignTokens.label1 : DesignTokens.label3
-                    if !DesignTokens.Motion.reduceMotion {
-                        CATransaction.begin()
-                        CATransaction.setAnimationDuration(0.14)
-                        CATransaction.setAnimationTimingFunction(DesignTokens.Motion.easeOutStrong)
-                        chevron.layer?.transform = hovering
-                            ? CATransform3DMakeTranslation(2, 0, 0)
-                            : CATransform3DIdentity
-                        CATransaction.commit()
-                    }
-                }
-                if hovering {
-                    dismissWork?.cancel()
-                    dismissWork = nil
-                } else {
-                    scheduleDismiss(after: 1.8)
+        /// 立即优雅退场（拖出成功放下 / 点击后收窗用，不再等倒计时）
+        func dismissNow() {
+            dismissWork?.cancel()
+            dismissWork = nil
+            guard current === panel else { return }
+            playExit(panel: panel, duration: DesignTokens.Motion.exitDuration) {
+                if current === panel { current = nil }
+            }
+            // 双保险（NSAnimationContext completion 偶发不触发 → 0.6s 后无条件收窗）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                if current === panel {
+                    panel.orderOut(nil)
+                    current = nil
+                    Log.event(.app, "toast.exit.forced", [:])
                 }
             }
+        }
+
+        // 整卡交互层（功能 #2 随手拖拽出图）：
+        // - 有 onClick 时单击编辑（停留延长到 5s）；两种形态都支持「按住拖出 PNG」
+        // - 悬停暂停倒计时（移出后 1.8s 退场），绝不出现「还没来得及用就消失」
+        // - 起拖（位移 ≥ 5pt）时掐掉自动退场：拖到一半卡片自己消失是最糟的手感；
+        //   放下成功立即优雅收窗，取消拖放则重新排 1.8s
+        let clickView = ToastClickView(frame: effect.bounds)
+        clickView.targetCard = effect
+        clickView.onHoverChange = { [weak panel, weak chevronView] hovering in
+            guard let panel, current === panel else { return }
+            if let chevron = chevronView {
+                chevron.contentTintColor = hovering ? DesignTokens.label1 : DesignTokens.label3
+                if !DesignTokens.Motion.reduceMotion {
+                    CATransaction.begin()
+                    CATransaction.setAnimationDuration(0.14)
+                    CATransaction.setAnimationTimingFunction(DesignTokens.Motion.easeOutStrong)
+                    chevron.layer?.transform = hovering
+                        ? CATransform3DMakeTranslation(2, 0, 0)
+                        : CATransform3DIdentity
+                    CATransaction.commit()
+                }
+            }
+            if hovering {
+                dismissWork?.cancel()
+                dismissWork = nil
+            } else {
+                scheduleDismiss(after: 1.8)
+            }
+        }
+        clickView.onBeginDrag = { [weak panel] event, sourceView in
+            guard let panel, current === panel else { return false }
+            dismissWork?.cancel()
+            dismissWork = nil
+            let started = ImageDragCoordinator.shared.beginImageDrag(
+                cgImage: image,
+                suggestedName: "Snapcut-\(image.width)x\(image.height).png",
+                from: sourceView,
+                event: event,
+                onEnd: { dropped in
+                    if dropped {
+                        dismissNow()
+                    } else {
+                        scheduleDismiss(after: 1.8)
+                    }
+                }
+            )
+            // 起拖被拒（已有会话在跑 / 临时文件写失败）时把退场计时接回来，不留僵尸卡片
+            if !started { scheduleDismiss(after: 1.8) }
+            return started
+        }
+        if let onClick {
             clickView.onClick = { [weak panel] in
                 guard let panel else { return }
                 dismissWork?.cancel()
@@ -376,12 +570,10 @@ enum CaptureToast {
                 if current === panel { current = nil }
                 onClick()
             }
-            effect.addSubview(clickView)
-            clickView.autoresizingMask = [.width, .height]
-            scheduleDismiss(after: 5.0)
-        } else {
-            scheduleDismiss(after: 3.0)
         }
+        effect.addSubview(clickView)
+        clickView.autoresizingMask = [.width, .height]
+        scheduleDismiss(after: onClick != nil ? 5.0 : 3.0)
         Log.event(.app, "toast.show", [
             "pxW": "\(image.width)", "pxH": "\(image.height)",
             "clickable": "\(onClick != nil)",
@@ -1171,13 +1363,23 @@ private final class ToastCardHoverTracker: NSView {
     override func mouseExited(with event: NSEvent) { onHoverChange?(false) }
 }
 
-/// toast 点击与悬停层（全幅 hit-test，首击激活，悬停暂停自动消失 + 轻按触觉反馈）
+/// toast 点击/拖出与悬停层（全幅 hit-test，首击激活，悬停暂停自动消失 + 轻按触觉反馈）
+///
+/// 拖出判定：`mouseDown` 记锚点，`mouseDragged` 位移 ≥ 5pt 才起拖（与系统拖拽手势同参），
+/// 起拖成功一次后 `mouseUp` 不再算点击 —— 避免“拖完图又弹出编辑器”的双触发。
 private final class ToastClickView: NSView {
     weak var targetCard: NSView?
     var onClick: (() -> Void)?
+    /// 起拖回调：返回 true 表示拖拽会话已被接管（此后本次 `mouseUp` 不再触发 onClick）
+    var onBeginDrag: ((NSEvent, NSView) -> Bool)?
     var onHoverChange: ((Bool) -> Void)?
     private var tracking: NSTrackingArea?
     private var isHovering = false
+    /// 起拖位移阈值：5pt 以内仍当点击（手指/触控板微抖不算拖）
+    private static let dragThreshold: CGFloat = 5
+    private var pressPoint: NSPoint?
+    private var didStartDrag = false
+    private var didAttemptDrag = false
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -1213,15 +1415,38 @@ private final class ToastClickView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        pressPoint = convert(event.locationInWindow, from: nil)
+        didStartDrag = false
+        didAttemptDrag = false
         if let card = targetCard {
             TactilePress.animate(view: card, pressed: true, scale: 0.985)
         }
     }
 
-    override func mouseUp(with event: NSEvent) {
+    override func mouseDragged(with event: NSEvent) {
+        guard !didStartDrag, !didAttemptDrag, let start = pressPoint else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        let dx = point.x - start.x
+        let dy = point.y - start.y
+        guard (dx * dx + dy * dy).squareRoot() >= Self.dragThreshold else { return }
+        // 只尝试一次：起拖失败（端口不接）就退回点击语义，不反复骚扰拖拽协调器
+        didAttemptDrag = true
         if let card = targetCard {
             TactilePress.animate(view: card, pressed: false)
         }
+        didStartDrag = onBeginDrag?(event, self) ?? false
+        if didStartDrag { popHoverCursorIfNeeded() }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let wasDragging = didStartDrag
+        pressPoint = nil
+        didStartDrag = false
+        didAttemptDrag = false
+        if let card = targetCard {
+            TactilePress.animate(view: card, pressed: false)
+        }
+        guard !wasDragging else { return }
         let local = convert(event.locationInWindow, from: nil)
         guard bounds.contains(local) else { return }
         popHoverCursorIfNeeded()

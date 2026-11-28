@@ -84,6 +84,15 @@ final class ToolbarPanel: NSPanel {
 
     var onBackdropStyleChange: ((BackdropStyle) -> Void)?
 
+    /// 选中标注的样式实时联动（颜色点选 / 线宽滑杆）
+    /// - `commit == false`：滑杆拖动中的预览帧（不压撤销栈）
+    /// - `commit == true`：颜色点选 / 滑杆松手，整段拖动只占一步撤销
+    var onStyleChange: ((_ colorIndex: Int?, _ strokeWidth: CGFloat?, _ commit: Bool) -> Void)?
+
+    /// 编辑画布是否有「已选中标注」：为真时即使当前是 `.none`（选择/移动态）也浮出属性胶囊，
+    /// 否则选中一条线想改颜色/线宽就没有任何入口
+    var annotationSelectionActive = false
+
     enum Action {
         case undo, redo, toggleVisibility, done, save, cancel, ocr, pin, scroll, autoRedact, toggleBackdrop
         case record, recordGIF
@@ -161,6 +170,8 @@ final class ToolbarPanel: NSPanel {
         self.capabilities = capabilities
         self.onToolChange = onToolChange
         self.onAction = onAction
+        // 新会话默认没有选中标注（上一轮残留的样式胶囊绝不能跨会话浮着）
+        annotationSelectionActive = false
         lastSelectedTool = session.currentTool
         backdropStyle = BackdropStyle()
         scrollButton?.isHidden = !capabilities.supportsScroll
@@ -774,13 +785,18 @@ final class ToolbarPanel: NSPanel {
     }
 
     /// 方案 B：仅当选中具体标注工具时，在工具图标上方/下方自动浮出对应属性胶囊
+    /// （额外：选中已有标注时，`.none` 选择态也浮出「颜色 + 线宽」样式胶囊）
     private func syncSmartAttributePill(animated: Bool) {
         guard isVisible,
               let session,
-              session.toolbarVisible,
-              session.currentTool != .none,
-              let anchorBtn = toolButtons[session.currentTool]
+              session.toolbarVisible
         else {
+            smartAttributePill?.hide(immediate: !animated)
+            return
+        }
+        let styleMode = session.currentTool == .none && annotationSelectionActive
+        let anchorBtn = toolButtons[session.currentTool]
+        guard styleMode || (session.currentTool != .none && anchorBtn != nil) else {
             smartAttributePill?.hide(immediate: !animated)
             return
         }
@@ -790,18 +806,23 @@ final class ToolbarPanel: NSPanel {
                     guard let self else { return }
                     Log.event(.editor, "toolbar.color", ["index": "\(index)"])
                     self.session?.colorIndex = index
+                    self.onStyleChange?(index, nil, true)
                     self.refreshSelectionState(animated: true)
                     self.onToolChange()
                 },
                 onStrokeChange: { [weak self] width, sender in
                     guard let self else { return }
                     self.session?.strokeWidth = width
+                    // 拖动中的逐帧预览：只套样式不压栈（松手 onStrokeCommit 时整段算一步）
+                    self.onStyleChange?(nil, width, false)
                     let text = (self.session?.currentTool == .mosaic)
                         ? "马赛克 \(Int(max(8, width * 4))) px"
                         : String(format: "线宽 %.1f pt", width)
                     self.handlePillHover(view: sender, text: text)
                 },
-                onStrokeCommit: { width in
+                onStrokeCommit: { [weak self] width in
+                    guard let self else { return }
+                    self.onStyleChange?(nil, width, true)
                     Log.event(.editor, "toolbar.stroke", ["width": String(format: "%.1f", width)])
                 },
                 onFontSizeSelect: { [weak self] size in
@@ -827,13 +848,21 @@ final class ToolbarPanel: NSPanel {
             colorIndex: session.colorIndex,
             strokeWidth: session.strokeWidth,
             textFontSize: session.textFontSize,
-            animated: animated
+            animated: animated,
+            styleMode: styleMode
         )
-        let inWindow = anchorBtn.convert(anchorBtn.bounds, to: nil)
-        let btnGlobal = convertToScreen(inWindow)
         let barGlobal = plannedBarFrameGlobal ?? visibleBarFrameGlobal
+        // 样式模式没有「当前工具按钮」：锚在工具栏水平中心，胶囊自然浮在工具栏正上方
+        let anchorGlobal: CGRect
+        if styleMode {
+            anchorGlobal = CGRect(x: barGlobal.midX, y: barGlobal.maxY, width: 1, height: 1)
+        } else if let anchorBtn {
+            anchorGlobal = convertToScreen(anchorBtn.convert(anchorBtn.bounds, to: nil))
+        } else {
+            anchorGlobal = CGRect(x: barGlobal.midX, y: barGlobal.maxY, width: 1, height: 1)
+        }
         let visible = targetScreen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero
-        pill.show(anchoredTo: btnGlobal, barRect: barGlobal, visible: visible, animated: animated)
+        pill.show(anchoredTo: anchorGlobal, barRect: barGlobal, visible: visible, animated: animated)
     }
 
     /// 仅在 `backdropStyle.enabled == true` 且工具栏可见时，在主工具栏上方（避让 SmartToolAttributePillPanel）展开微调胶囊
@@ -2563,16 +2592,18 @@ private final class SmartToolAttributePillPanel: NSPanel {
         colorIndex: Int,
         strokeWidth: CGFloat,
         textFontSize: Int,
-        animated: Bool
+        animated: Bool,
+        styleMode: Bool = false
     ) {
         let colorChanged = colorIndex != currentColorIndex
         currentTool = tool
         currentColorIndex = colorIndex
 
-        let showColors = (tool != .none && tool != .mosaic)
-        let showStroke = (tool == .arrow || tool == .rect || tool == .ellipse || tool == .highlight || tool == .sequence || tool == .mosaic)
-        let showFontSize = (tool == .text)
-        let showRedact = (tool == .mosaic)
+        // 样式模式（选中已有标注、当前是 .none 选择态）：只露「颜色 + 线宽」
+        let showColors = styleMode || (tool != .none && tool != .mosaic)
+        let showStroke = styleMode || (tool == .arrow || tool == .rect || tool == .ellipse || tool == .highlight || tool == .sequence || tool == .mosaic)
+        let showFontSize = !styleMode && (tool == .text)
+        let showRedact = !styleMode && (tool == .mosaic)
 
         colorsGroup.isHidden = !showColors
         strokeSlider.isHidden = !showStroke

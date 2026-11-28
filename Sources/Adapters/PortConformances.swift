@@ -116,7 +116,16 @@ final class PinPresenterAdapter: PinningPresenting {
     }
 }
 
+// MARK: - 智能框选（元素层 + 像素层）
+//
+// 元素层：AX hit-test（穿透自身遮罩，沿父链回溯），会话级懒激活 Chromium/Firefox 的 AX 树。
+// 像素层：Vision 文本行 + 规整矩形，纯本地。
+// UI 层只看到 `[SmartSelectionCandidate]`，不知道背后是 AX 还是 Vision。
+
 // MARK: - 合成根
+//
+// 录屏后处理（头尾裁剪 / MP4 → GIF）适配器：`VideoPostProcessor`（AVFoundation + ImageIO）
+// 无状态（每次调用自带 asset / generator），合成根只造一个实例即可复用。
 
 extension Dependencies {
     /// 唯一允许 new 适配器的地方（AppCoordinator 启动时调用一次）
@@ -131,7 +140,10 @@ extension Dependencies {
             permission: ScreenPermissionAdapter(),
             pinning: PinPresenterAdapter(),
             updating: SparkleUpdater.shared,
-            recording: SCKScreenRecorder()
+            recording: SCKScreenRecorder(),
+            smartElementProber: AXElementProber(),
+            smartVisionDetector: VisionSmartDetector(),
+            videoPostProcessor: VideoPostProcessor()
         )
     }
 }

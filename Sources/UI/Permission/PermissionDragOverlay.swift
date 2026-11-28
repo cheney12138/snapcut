@@ -1,9 +1,10 @@
 import AppKit
+import ApplicationServices
 import CoreGraphics
 
 /// 贴身拖拽源浮窗（Pattern: anchor-following drag-source overlay）
 ///
-/// 用途：用户需要去系统设置手动加「屏幕录制」权限时，在设置窗口右下角贴一枚
+/// 用途：用户需要去系统设置手动加「屏幕录制」/「辅助功能」权限时，在设置窗口右下角贴一枚
 /// 不抢焦点的浮层，浮层上的 App 图标可拖进 TCC 权限列表（负载与 Finder 逐字等价）。
 ///
 /// 病例警告（照搬 pattern 文档，勿重蹈）：
@@ -14,6 +15,12 @@ import CoreGraphics
 @MainActor
 final class PermissionDragOverlay {
     static let shared = PermissionDragOverlay()
+
+    /// 浮窗服务的权限目标（决定文案 + 授权判定口径 + tick 起跑延迟）
+    enum TargetPermission: String {
+        case screenRecording
+        case accessibility
+    }
 
     // MARK: - 常量
 
@@ -28,12 +35,19 @@ final class PermissionDragOverlay {
     /// show() 后延迟 3s 才开始 tick：TCC 确认框弹出后用户还没点「打开系统设置」的
     /// 时期内，浮窗必须安静待命（设置主窗冷启动要几秒，时序天然分离）
     private static let tickStartDelay: TimeInterval = 3.0
+    /// 辅助功能：用户点「去授权…」是直开设置列表页（不经过 TCC 确认框），
+    /// 没有抢跑风险，短延迟让浮窗尽快贴上去；系统设置主窗另有 policy==.regular
+    /// 与 700×500 尺寸闸兜底，不会误贴到小确认框上。
+    private static let accessibilityTickStartDelay: TimeInterval = 0.8
     private static let permissionPollInterval: TimeInterval = 2.0
     /// 目标窗消失超过这个时长 → 收浮层（孤儿浮层比没有浮层更糟）
     /// 12s：系统设置冷启动可能 >5s（病例：浮窗等不到目标出现就退场了）
     private static let orphanGrace: TimeInterval = 12.0
 
-    private static let panelSize = CGSize(width: 172, height: 116)
+    /// 宽度实测（不是手感值）：图标列 16+48+12 = 76pt，中文最长一行
+    /// 「已添加 ✓ 重启 Snapcut 后生效」@10pt = 139.7pt，右侧留 12pt 安全边 → 232。
+    /// 旧 172 宽会让两条副标题（>110pt）被裁切。
+    private static let panelSize = CGSize(width: 232, height: 116)
     private static let anchorRight: CGFloat = 12
     private static let anchorBottom: CGFloat = 16
 
@@ -45,6 +59,8 @@ final class PermissionDragOverlay {
     private var targetGoneSince: Date?
 
     private var isShown = false
+    /// 当前浮窗服务的权限目标（pollPermission / 文案都按它分流）
+    private var targetPermission: TargetPermission = .screenRecording
     /// tick 生效时刻（show() + tickStartDelay）：确认框在场期间不启动匹配
     private var tickStartAt = Date.distantPast
     /// 用户已把 App 拖进权限列表（等待重启生效）——浮窗切换「已添加」文案
@@ -56,8 +72,14 @@ final class PermissionDragOverlay {
     // MARK: - 对外接口
 
     /// 显示浮窗（幂等）。调用前提：目标（系统设置）即将被拉起。
-    func show() {
-        guard !isShown else { return }
+    /// - Parameter target: 默认 `.screenRecording`（既有调用点零改动）
+    func show(for target: TargetPermission = .screenRecording) {
+        if isShown {
+            // 同目标重复调用 → 幂等；换目标 → 先收再按新目标重开
+            guard targetPermission != target else { return }
+            dismiss()
+        }
+        targetPermission = target
         isShown = true
         droppedInList = false
         hasSeenTarget = false
@@ -77,8 +99,14 @@ final class PermissionDragOverlay {
         // （冷启动期直接显示会在错误位置闪现）
         // tick 延迟 tickStartDelay 启动：TCC 确认框与设置主窗的时序天然分离
         // （用户点「打开系统设置」后设置冷启动要几秒），确认框在场期不匹配
-        tickStartAt = Date().addingTimeInterval(Self.tickStartDelay)
-        Log.event(.permission, "dragOverlay.show", ["tickStartDelay": "\(Self.tickStartDelay)"])
+        let startDelay = targetPermission == .accessibility
+            ? Self.accessibilityTickStartDelay
+            : Self.tickStartDelay
+        tickStartAt = Date().addingTimeInterval(startDelay)
+        Log.event(.permission, "dragOverlay.show", [
+            "target": targetPermission.rawValue,
+            "tickStartDelay": "\(startDelay)",
+        ])
 
         let tick = Timer(timeInterval: Self.tickInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
@@ -106,7 +134,7 @@ final class PermissionDragOverlay {
         panel?.orderOut(nil)
         panel = nil
         targetGoneSince = nil
-        Log.event(.permission, "dragOverlay.dismiss")
+        Log.event(.permission, "dragOverlay.dismiss", ["target": targetPermission.rawValue])
     }
 
     /// 用户完成了一次拖放（drag.end）：切换提示并定时退场
@@ -114,7 +142,7 @@ final class PermissionDragOverlay {
         guard isShown, !droppedInList else { return }
         droppedInList = true
         (panel?.contentView as? PanelContentView)?.updateForDropped()
-        Log.event(.permission, "dragOverlay.droppedInList")
+        Log.event(.permission, "dragOverlay.droppedInList", ["target": targetPermission.rawValue])
         dismissTimer?.invalidate()
         dismissTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
@@ -142,7 +170,7 @@ final class PermissionDragOverlay {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isReleasedWhenClosed = false
-        panel.contentView = PanelContentView(frame: frame, overlay: self)
+        panel.contentView = PanelContentView(frame: frame, overlay: self, target: targetPermission)
         return panel
     }
 
@@ -308,11 +336,22 @@ final class PermissionDragOverlay {
 
     // MARK: - 授权轮询
 
+    /// 授权轮询：按目标权限各自判定（两者语义完全不同，不可混用）
+    /// - `.screenRecording`：`CGPreflightScreenCaptureAccess()` 只查不弹；
+    ///   但录屏授权需重启进程才生效，这里是免重启场景的兜底。
+    /// - `.accessibility`：`AXIsProcessTrusted()` 只查不弹；用户把 Snapcut 拖进
+    ///   辅助功能列表并打开开关的瞬间即变 true → 立刻收浮窗（无需重启）。
     private func pollPermission() {
         guard isShown else { return }
-        // 免重启生效的兜底（多数情况下屏幕录制需要 relaunch）
-        if CGPreflightScreenCaptureAccess() {
-            Log.event(.permission, "dragOverlay.granted")
+        let granted: Bool
+        switch targetPermission {
+        case .screenRecording:
+            granted = CGPreflightScreenCaptureAccess()
+        case .accessibility:
+            granted = AXIsProcessTrusted()
+        }
+        if granted {
+            Log.event(.permission, "dragOverlay.granted", ["target": targetPermission.rawValue])
             dismiss()
         }
     }

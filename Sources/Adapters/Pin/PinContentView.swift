@@ -30,6 +30,10 @@ final class PinContentView: NSView {
     /// 右上角悬停关闭按钮（20×20 深半透圆钮，悬停时柔显，一键关闭单张贴图）
     private let closeButton = PinHoverCloseButton()
 
+    /// 左上角悬停「拖出」胶囊句柄（52×20 胶囊 + 抓手图标 + `拖出` 白字，按住拖即出图）。
+    /// 与右上角的点击按钮组（实况文本 T / 关闭 ×）左右分区：左上拖出 · 右上点按。
+    private let dragHandle = PinDragHandleView()
+
     /// 实况文本宿主（垫在最底层：右上角按钮 / HUD 永远压在它上面保持可点击可读）
     private let liveTextHost = PinLiveTextHostView(frame: .zero)
     /// 右上角实况文本圆钮（位于关闭钮左侧 6pt，20×20 同规范）
@@ -42,6 +46,13 @@ final class PinContentView: NSView {
     private var controlsTooSmall: Bool { bounds.width < 84 || bounds.height < 44 }
 
     private var hoverTrackingArea: NSTrackingArea?
+
+    /// ⌃+拖出：按下点（nil = 本次按下不是 ⌃ 拖出路径）
+    private var controlDragOrigin: CGPoint?
+    /// ⌃+拖出：本会话是否已真正起拖（避免 mouseDragged 反复发起）
+    private var controlDragTriggered = false
+    /// ⌃单击被系统派发成右键事件时的待命标记（未拖动松手才弹右键菜单）
+    private var isControlRightPending = false
 
     /// 吸附预览（拖动中贴合：移动卡与目标卡都亮）；视觉由 CAShapeLayer 承担
     private var snapGlow = false
@@ -80,6 +91,11 @@ final class PinContentView: NSView {
         closeButton.action = #selector(menuClose)
         addSubview(closeButton)
 
+        dragHandle.alphaValue = 0
+        dragHandle.isHidden = true
+        dragHandle.contentView = self
+        addSubview(dragHandle)
+
         liveTextButton.alphaValue = 0
         liveTextButton.isHidden = true
         liveTextButton.target = self
@@ -103,8 +119,19 @@ final class PinContentView: NSView {
     override func layout() {
         super.layout()
         liveTextHost.frame = bounds
+        refreshLiveTextButtonVisibility(animated: false)
+        layoutHoverButtons()
+        refreshDragHandleVisibility(animated: false)
+    }
+
+    /// 悬停按钮组排布（左静右动分区）：
+    /// - 右上角（点击组，右 → 左）：关闭钮 · 实况文本钮，间距 6pt；
+    /// - 左上角（拖拽句柄）：固定 `x: 8, y: 8` 的胶囊标签，与点击组彻底分开——
+    ///   用户一眼能看到「左上拖出 · 右上点按」两个区域，而不是一排四颗同形状圆钮。
+    private func layoutHoverButtons() {
         let btnSide: CGFloat = 20
         let inset: CGFloat = 8
+        let gap: CGFloat = 6
         closeButton.frame = NSRect(
             x: max(4, bounds.width - btnSide - inset),
             y: inset,
@@ -113,12 +140,14 @@ final class PinContentView: NSView {
         )
         // 实况文本钮在关闭钮左侧 6pt（同高同宽，同一套发丝边/TactilePress 语言）
         liveTextButton.frame = NSRect(
-            x: closeButton.frame.minX - btnSide - 6,
+            x: closeButton.frame.minX - btnSide - gap,
             y: inset,
             width: btnSide,
             height: btnSide
         )
-        refreshLiveTextButtonVisibility(animated: false)
+        // 拖出句柄：贴图左上角，不再挤在点击组里
+        let handleSide = PinDragHandleView.capsuleSize
+        dragHandle.frame = NSRect(x: inset, y: inset, width: handleSide.width, height: handleSide.height)
     }
 
     override func updateTrackingAreas() {
@@ -145,6 +174,7 @@ final class PinContentView: NSView {
             }
         }
         refreshLiveTextButtonVisibility(animated: true)
+        refreshDragHandleVisibility(animated: true)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -161,6 +191,7 @@ final class PinContentView: NSView {
         })
         // 划词态下实况文本钮常驻（mouseExited 只淡出关闭钮）
         refreshLiveTextButtonVisibility(animated: true)
+        refreshDragHandleVisibility(animated: true)
     }
 
     // MARK: - 实况文本（划词）
@@ -184,6 +215,8 @@ final class PinContentView: NSView {
         }
         liveTextButton.isLiveTextOn = active
         refreshLiveTextButtonVisibility(animated: true)
+        // 划词态下拖出句柄让位（划词时整张图是可拖选文本区，句柄会挡字）
+        refreshDragHandleVisibility(animated: true)
         needsDisplay = true
     }
 
@@ -203,6 +236,8 @@ final class PinContentView: NSView {
     /// - 贴图过小（宽 < 84 / 高 < 44）→ 只留关闭钮，防拥挤。
     private func refreshLiveTextButtonVisibility(animated: Bool) {
         let shouldShow = !controlsTooSmall && (isLiveTextActive || (hasLiveText && isHovering))
+        // 实况文本钮显隐一变就重排（右上点击组布局稳定，重排零成本）
+        defer { layoutHoverButtons() }
         if shouldShow {
             liveTextButton.isHidden = false
             guard animated, !DesignTokens.Motion.reduceMotion else {
@@ -230,6 +265,46 @@ final class PinContentView: NSView {
                     guard let self, self.liveTextButton.alphaValue < 0.05 else { return }
                     guard !self.isLiveTextActive, !self.isHovering else { return }
                     self.liveTextButton.isHidden = true
+                }
+            })
+        }
+    }
+
+    /// 拖出句柄显隐：贴图太小（宽 < 116 / 高 < 44）时胶囊会遮掉画面 ⇒ 整个不出现。
+    /// 116 是硬门槛而非手感值：胶囊占 8…60，右上角两颗钮最左伸到 `width - 54`
+    /// （关闭钮 + 间距 + 实况文本钮），`width ≥ 116` 才保证两区永不重叠。
+    /// 划词态让位（划词时图上是文本选择区）；其余情况随鼠标悬停与关闭钮同步柔显。
+    private var dragHandleAvailable: Bool { bounds.width >= 116 && bounds.height >= 44 }
+
+    private func refreshDragHandleVisibility(animated: Bool) {
+        let shouldShow = dragHandleAvailable && isHovering && !isLiveTextActive
+        if shouldShow {
+            dragHandle.isHidden = false
+            guard animated, !DesignTokens.Motion.reduceMotion else {
+                dragHandle.alphaValue = 1
+                return
+            }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.14
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                dragHandle.animator().alphaValue = 1
+            }
+        } else {
+            guard !dragHandle.isHidden else { return }
+            guard animated, !DesignTokens.Motion.reduceMotion else {
+                dragHandle.alphaValue = 0
+                dragHandle.isHidden = true
+                return
+            }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.12
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                dragHandle.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.dragHandle.alphaValue < 0.05 else { return }
+                    guard !self.isHovering || self.isLiveTextActive else { return }
+                    self.dragHandle.isHidden = true
                 }
             })
         }
@@ -326,14 +401,27 @@ final class PinContentView: NSView {
             controller?.toggleDoubleClickZoom(anchor: convert(event.locationInWindow, from: nil))
             return
         }
+        // ⌃+拖动贴图本体：快捷拖出图片文件（位移 ≥5pt 才真起拖，绝不触发移窗）
+        if event.modifierFlags.contains(.control) {
+            armControlDragOut(with: event)
+            return
+        }
         controller?.beginDrag(groupDrag: groupDrag, detach: detach)
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if controlDragOrigin != nil {
+            handleControlDragOut(with: event)
+            return
+        }
         controller?.dragMoved()
     }
 
     override func mouseUp(with event: NSEvent) {
+        if controlDragOrigin != nil {
+            resetControlDragOut()
+            return
+        }
         controller?.endDrag()
     }
 
@@ -349,7 +437,58 @@ final class PinContentView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        buildContextMenu().popUp(positioning: nil, at: convert(event.locationInWindow, from: nil), in: self)
+        // ⌃单击会被系统派发成右键事件（与 mouseDown 的 ⌃ 路径可能二选一）：
+        // 带 ⌃ 的右键先待命——没拖动、松手时才弹菜单（右键菜单行为零回归）
+        if event.modifierFlags.contains(.control) {
+            armControlDragOut(with: event)
+            isControlRightPending = true
+            return
+        }
+        isControlRightPending = false
+        presentContextMenu(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        handleControlDragOut(with: event)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        let wasPending = isControlRightPending
+        let triggered = controlDragTriggered
+        isControlRightPending = false
+        resetControlDragOut()
+        guard wasPending else {
+            super.rightMouseUp(with: event)
+            return
+        }
+        // 真的拖出过就不再弹菜单；只按一下松手 = 用户要的就是右键菜单
+        guard !triggered else { return }
+        presentContextMenu(at: convert(event.locationInWindow, from: nil))
+    }
+
+    private func presentContextMenu(at point: CGPoint) {
+        buildContextMenu().popUp(positioning: nil, at: point, in: self)
+    }
+
+    // MARK: - ⌃+拖动出图（快捷手势）
+
+    /// 按下点待命：位移 ≥5pt 才真正发起文件拖出，否则什么也不做（绝不误触移窗）
+    private func armControlDragOut(with event: NSEvent) {
+        controlDragOrigin = convert(event.locationInWindow, from: nil)
+        controlDragTriggered = false
+    }
+
+    private func handleControlDragOut(with event: NSEvent) {
+        guard let origin = controlDragOrigin, !controlDragTriggered else { return }
+        let current = convert(event.locationInWindow, from: nil)
+        guard hypot(current.x - origin.x, current.y - origin.y) >= 5 else { return }
+        controlDragTriggered = true
+        controller?.beginImageFileDrag(from: self, event: event)
+    }
+
+    private func resetControlDragOut() {
+        controlDragOrigin = nil
+        controlDragTriggered = false
     }
 
     override func keyDown(with event: NSEvent) {
@@ -676,5 +815,176 @@ private final class PinHoverLiveTextButton: NSButton {
             contentTintColor = NSColor.white.withAlphaComponent(0.92)
             toolTip = "实况文本划词 (T)"
         }
+    }
+}
+
+/// 贴图**左上角**悬停「拖出图片文件」胶囊句柄（左手柄 · 右上按钮的动静分区）。
+///
+/// 用户病例 2026-11-28：「贴图 pin 的拖拽有点怪……看起来像是点击的」——
+/// 原来那颗 20×20 圆钮与关闭/实况文本钮同形状同尺寸排成一排，没人读得出「要拖」。
+/// 现在升级成一眼就是句柄的胶囊标签：
+/// - 位置：贴图左上角（`x: 8, y: 8`），与右上角的点按按钮组彻底分开（左上拖出 · 右上点按）；
+/// - 形态：52×20 深半透磨砂胶囊 + 0.5pt 白发丝边 + 抓手图标 + `拖出` 10pt 白字；
+/// - 光标：悬停 `.openHand`、按下 `.closedHand`（拖拽语义的双态爪，与点击类 pointingHand 区分）；
+/// - 教学：只点不拖 ⇒ 弹 HUD「按住往外拖即可发图」（绝不做点完毫无反应的假按钮）。
+///
+/// 交互：按住并拖出 ≥4pt 发起系统原生文件拖拽（`public.file-url`，落到 Finder/飞书/Slack/
+/// 微信/Chrome/Figma 都是「一个 png 文件」）；本视图自己接管全部鼠标事件，
+/// 从不转发给 window 拖动（所以点它永远不会误移贴图）。
+@MainActor
+private final class PinDragHandleView: NSView {
+    /// 起拖最小位移：4pt（比贴图本体移动的 5pt 更灵敏 —— 句柄本身就是明确意图）
+    private static let dragThreshold: CGFloat = 4
+    /// 胶囊静态尺寸：高度 20 = cornerRadius 10 的全圆端；宽度容得下图标 + 「拖出」
+    static let capsuleSize = NSSize(width: 52, height: 20)
+
+    /// 贴图内容视图（拖出时要拿到它的 controller 与它自己的坐标系起拖）
+    weak var contentView: PinContentView?
+
+    private let iconView = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "拖出")
+
+    /// 按下点（nil = 没有进行中的按压 / 已起拖）
+    private var pressOrigin: CGPoint?
+    private var isHot = false
+    /// 按下态（决定 closedHand 光标与底色加深）
+    private var isPressed = false
+    private var trackingArea: NSTrackingArea?
+
+    init() {
+        super.init(frame: NSRect(origin: .zero, size: Self.capsuleSize))
+        wantsLayer = true
+        layer?.cornerRadius = Self.capsuleSize.height / 2
+        layer?.borderWidth = 0.5
+        toolTip = "按住拖出图片文件（也可 ⌃+拖动贴图本体）"
+
+        iconView.image = TBIcon.symbolImage(
+            named: "line.3.horizontal",
+            pointSize: 9.5,
+            weight: .semibold,
+            hierarchical: false
+        )
+        iconView.contentTintColor = NSColor.white.withAlphaComponent(0.92)
+        iconView.imageScaling = .scaleProportionallyDown
+        addSubview(iconView)
+
+        titleLabel.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        titleLabel.textColor = NSColor.white.withAlphaComponent(0.92)
+        titleLabel.alignment = .center
+        addSubview(titleLabel)
+
+        applyStyle()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// 与父视图同向（Y-down）：子视图排布按「从顶部往下」的直觉写
+    override var isFlipped: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// 胶囊整体当一颗句柄用：图标 / `拖出` 文字子视图绝不能抢走按压事件
+    /// （文字控件会吃掉 mouseDown ⇒ 拖拽与点击教学就都变成「点不动」）
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01 else { return nil }
+        let local = superview.map { convert(point, from: $0) } ?? point
+        return bounds.contains(local) ? self : nil
+    }
+
+    override func layout() {
+        super.layout()
+        let iconSide: CGFloat = 11
+        let textSize = titleLabel.intrinsicContentSize
+        let contentWidth = iconSide + 4 + textSize.width
+        let originX = max(6, ((bounds.width - contentWidth) / 2).rounded())
+        iconView.frame = NSRect(
+            x: originX,
+            y: ((bounds.height - iconSide) / 2).rounded(),
+            width: iconSide,
+            height: iconSide
+        )
+        titleLabel.frame = NSRect(
+            x: originX + iconSide + 4,
+            y: ((bounds.height - textSize.height) / 2).rounded(),
+            width: textSize.width,
+            height: textSize.height
+        )
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        // 拖拽语义用开手爪/握拳爪，与「点击类」按钮（pointingHand）明确区分
+        addCursorRect(bounds, cursor: isPressed ? .closedHand : .openHand)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHot = true
+        applyStyle()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHot = false
+        applyStyle()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        pressOrigin = convert(event.locationInWindow, from: nil)
+        isPressed = true
+        window?.invalidateCursorRects(for: self)
+        NSCursor.closedHand.set()
+        applyStyle()
+        TactilePress.animate(view: self, pressed: true, scale: 0.94)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let origin = pressOrigin else { return }
+        let current = convert(event.locationInWindow, from: nil)
+        guard hypot(current.x - origin.x, current.y - origin.y) >= Self.dragThreshold else { return }
+        // 只起拖一次：会话接管后系统不会再给我们 mouseDragged / mouseUp
+        pressOrigin = nil
+        endPressFeedback()
+        contentView?.controller?.beginImageFileDrag(from: self, event: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let wasClickOnly = pressOrigin != nil
+        pressOrigin = nil
+        endPressFeedback()
+        super.mouseUp(with: event)
+        // 防呆教学：只点不拖不算失败——0.1 秒就把「按住往外拖」教会，
+        // 免得用户以为按钮点不动（旧版最常见的困惑）
+        guard wasClickOnly else { return }
+        contentView?.controller?.showHUD("按住往外拖即可发图")
+    }
+
+    private func endPressFeedback() {
+        isPressed = false
+        window?.invalidateCursorRects(for: self)
+        TactilePress.animate(view: self, pressed: false)
+        applyStyle()
+    }
+
+    /// 深半透磨砂底 + 白发丝边；悬停柔和蓝、按下再深一阶（与右上角按钮同色系，
+    /// 但形态是胶囊标签而不是圆图标 —— 一眼读作「句柄」）
+    private func applyStyle() {
+        let background: NSColor
+        if isPressed {
+            background = DesignTokens.accentPress.withAlphaComponent(0.92)
+        } else if isHot {
+            background = DesignTokens.accent.withAlphaComponent(0.82)
+        } else {
+            background = DesignTokens.capsuleDark
+        }
+        layer?.backgroundColor = background.cgColor
+        layer?.borderColor = NSColor.white.withAlphaComponent(isHot || isPressed ? 0.30 : 0.20).cgColor
     }
 }

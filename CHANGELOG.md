@@ -1,7 +1,37 @@
 # Snapcut Changelog
 
 本文件记录 Snapcut 的所有重要功能演进、体验打磨与缺陷修复，按时间倒序归档，便于回溯决策脉络与定位代码改动。  
-规划中的下一阶段需求与代码级任务拆解见：[docs/07-v0.3-roadmap-design.md](docs/07-v0.3-roadmap-design.md)。
+规划中的下一阶段需求与代码级任务拆解见：[docs/10-v0.4-roadmap-design.md](docs/10-v0.4-roadmap-design.md)（v0.4+）· [docs/07-v0.3-roadmap-design.md](docs/07-v0.3-roadmap-design.md)（v0.3）。
+
+---
+
+## [0.4.0] — 2026-11-28（智能框选 4 级表格识别、标注二次编辑、拖拽出图、取色闭环与录屏裁剪转 GIF）
+
+### 新增功能（Added）
+- **智能框选（Smart Selection）与 4 级表格精准识别**
+  - **纯 Core 候选栈融合与仲裁引擎**：新增 [SmartSelectionModel.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Core/Domain/SmartSelectionModel.swift)（11 档候选类型含 `tableCell` / `tableRow` / `tableColumn` / `table` / `listItem` / `element` / `visualRect` / `textLine` 等）、[Ports.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Core/Ports/Ports.swift) 扩展 `SmartElementProbing` / `SmartVisionDetecting`，及 16 组双口径自动化单测 [test-smart-selection.sh](file:///Users/qianyuchen/work/screenshot/snapcut/scripts/test-smart-selection.sh)。
+  - **跨进程 AX + 冻结帧视觉双轨探测**：新增 [AXElementProber.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/SmartSelect/AXElementProber.swift)（穿透自身全屏遮罩、`80ms` IPC 超时、独立串行队列、对 Electron/WebView/原生 App 通用会话级懒激活 `AXManualAccessibility` 与退场自动恢复、缺 `AXColumn` 时零 IPC 几何合成列矩形）与 [VisionSmartDetector.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/SmartSelect/VisionSmartDetector.swift)（异步探测文本行、视觉大矩形与基于灰度栅格投影的**视觉表格网格切分**，覆盖图片内静态表格与无 AX 权限场景）。
+  - **0ms 极速交互**：[OverlayController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayController.swift) 与 [OverlayWindow.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayWindow.swift) 实现 0ms 阻塞上屏、160ms 平滑变形框、**单击智能框 0ms 秒进编辑态**、按住 `Option` 临时关闭智能框选、表格内默认优先选中单元格（贴表格外缘 8pt 吸附整表，滚轮 `单元格 → 行 → 列 → 整表` 逐级切换）与克制纯尺寸角标。
+- **v0.4 一期 #1 · 已画标注二次编辑（Select / Move / Reshape / 原地改字 / 样式联动）**
+  - 新增纯 Core 几何引擎 [AnnotationEditing.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Core/Domain/AnnotationEditing.swift)（含 `AnnotationTextMetrics` 基线精确包围盒、7 种 Shape 操控柄与描边环穿透命中、拖拽变换纯函数）并扩展 [AnnotationModel.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Core/Domain/AnnotationModel.swift) 的 `previewReplace` / `commitMutation` / `replace` / `remove` / `updateStyle`；新增 16 组独立单测 [test-annotation-editing.sh](file:///Users/qianyuchen/work/screenshot/snapcut/scripts/test-annotation-editing.sh)。
+  - 更新 [OverlayWindow.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayWindow.swift)、[OverlayController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayController.swift) 与 [ToolbarPanel.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Editor/ToolbarPanel.swift)：无工具态单击选中标注拖拽平移/拉柄调形、双击文字标注原地无偏移改字、选中时自动浮出颜色/线宽胶囊实时调样式（单次 `⌘Z` 撤销）、`Delete` 单条删除、方向键微调标注位置、`Esc` 优先退选中态。
+- **v0.4 一期 #2 · 随手拖拽出图（Drag-out）**
+  - 新增共享原生文件拖拽底座 [ImageDragHelper.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Export/ImageDragHelper.swift)（标准 `public.file-url` 负载 + 144dpi 临时 PNG 滚动保留 24 份 + 文件名安全闸门，零重编码 APFS 硬链接清洗含 `:` 的历史 ISO8601 文件名以兼容大象/飞书/微信/浏览器）。
+  - 打通三处入口：桌面贴图左上角悬停「拖出」胶囊与 `⌃+拖拽`（[PinContentView.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/Pin/PinContentView.swift)、[PinWindowController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/Pin/PinWindowController.swift)）、视觉记忆库卡片直拖原图（[HistorySpotlightPanel.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/History/HistorySpotlightPanel.swift)、[HistoryStore.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/History/HistoryStore.swift)、[AppCoordinator.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/App/AppCoordinator.swift)）与右下角导出 Toast 卡片直拖（[CaptureToast.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Notification/CaptureToast.swift)）。
+- **v0.4 一期 #3 · 选区放大镜多格式取色闭环（`C` + `⇧C` + 色卡 Toast）**
+  - 扩展 [FrozenSampler.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/FrozenSampler.swift) 新增 `ColorCopyFormat`（`HEX` / `RGB` / `HSL` 轮换与持久化）与等宽不跳动放大镜底栏；[OverlayWindow.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayWindow.swift) 支持选区态 `⇧C` 实时切换格式、`C` 复制并弹出 [CaptureToast.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Notification/CaptureToast.swift) 圆角色卡芯片轻提示。
+- **v0.4 二期 #5 · 录屏预览窗头尾快速裁剪 + MP4 一键转 GIF**
+  - 新增纯 Core 裁剪区间模型 `VideoTrimRange` / `GIFConversionOptions`（[RecordingModel.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Core/Domain/RecordingModel.swift)）、`VideoPostProcessing` 端口（[Ports.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Core/Ports/Ports.swift)）与 12 组双口径单测 [test-video-trim.sh](file:///Users/qianyuchen/work/screenshot/snapcut/scripts/test-video-trim.sh)。
+  - 新增 [VideoPostProcessor.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/Recording/VideoPostProcessor.swift)（接入 [PortConformances.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/PortConformances.swift)）：`AVAssetExportPresetPassthrough` 优先无损快裁（失败自动降级重导出并清理半成品，支持同路径原子就地替换），以及双趟 `AVAssetReader` 顺序解码流式 MP4 转循环 GIF（完整兼容 VFR 静止画面与 B 帧，60 秒硬上限 + 20–60 秒自动温和降帧缩边、450 帧封顶与取消清理）。
+  - 升级 [VideoPreviewPanel.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Recording/VideoPreviewPanel.swift) 与 [AppCoordinator.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/App/AppCoordinator.swift)：进度条新增磨砂白左右头尾裁剪柄（拖动实时预览首/尾帧、自动在裁剪区间内循环播放、顶栏实时显示保留区间），裁剪后浮现「应用裁剪」原地替换并重播，「转 GIF」自动按当前裁剪区间转换带实时百分比进度并无缝切换至内置 `GIFPreviewPanel`。
+- **v0.4 二期 #6 · 智能框选悬停按 `O`/`P` 一步直达 + 键盘 `↑`/`↓` 切层**
+  - 更新 [OverlayWindow.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayWindow.swift) 与 [OverlayController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Overlay/OverlayController.swift)：悬停命中智能框选（或贴边全屏）时，按 `↑`/`↓` 逐级外扩/内缩候选层；直接按 `O`（或用户自定义取字键）跳过编辑态直出结构化 OCR 面板、按 `P`（或自定义贴图键）0ms 裁冻结帧直接贴图上屏并写入历史记录。
+
+### 视觉与交互优化 & 缺陷修复（Changed / Fixed）
+- **辅助功能权限完整引导与拖拽授权浮窗**：[TCCPermission.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/Permission/TCCPermission.swift)、[SettingsWindowController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Settings/SettingsWindowController.swift)、[PermissionDragOverlay.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Permission/PermissionDragOverlay.swift) 与 [DragSourceCoordinator.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Permission/DragSourceCoordinator.swift) 补齐设置页「辅助功能」权限状态与「去授权…」入口、截图遮罩可关闭顶部提示条及 `TargetPermission.accessibility` 拖拽授权浮窗（实时轮询 `AXIsProcessTrusted()`）。
+- **设置面板四页顶栏统一固定对齐**：[SettingsWindowController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Settings/SettingsWindowController.swift) 将四个分页重构为 `installFixedHeaderPage`（标题固定在 `top + 46pt` 与左侧「设置」齐平，仅下方卡片区滚动，关闭 `automaticallyAdjustsContentInsets`）。
+- **根治截图回车复制误触发外部剪贴板 OCR 提示**：[ClipboardWriter.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/Clipboard/ClipboardWriter.swift) 与 [ClipboardImageWatcher.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/Adapters/Clipboard/ClipboardImageWatcher.swift) 建立四层自写拦截（私有 pasteboard 标记 `app.snapcut.own-clipboard-write`、同步推进游标、取消在途探测与 3 秒同尺寸冷却指纹）。
+- **托盘菜单精简**：[TrayMenu.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Tray/TrayMenu.swift) 与 [StatusItemController.swift](file:///Users/qianyuchen/work/screenshot/snapcut/Sources/UI/Tray/StatusItemController.swift) 移除多余的「隐藏/显示全部贴图」菜单项（保留 `⌥⌘P` 快捷键能力）。
 
 ---
 

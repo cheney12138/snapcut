@@ -142,14 +142,6 @@ final class StatusItemController: NSObject {
         self.historySpotlightItem = historySpotlightItem
         menu.addItem(historySpotlightItem)
 
-        let togglePinsItem = NSMenuItem(
-            title: "隐藏/显示全部贴图  ⌥ ⌘ P",
-            action: #selector(toggleAllPins(_:)),
-            keyEquivalent: ""
-        )
-        togglePinsItem.target = self
-        menu.addItem(togglePinsItem)
-
         menu.addItem(.separator())
 
         let delayItem = NSMenuItem(
@@ -274,11 +266,6 @@ final class StatusItemController: NSObject {
     @objc private func openHistorySpotlight(_ sender: Any?) {
         Log.event(.tray, "tray.action", ["item": "historySpotlight"])
         coordinator?.toggleHistorySpotlight()
-    }
-
-    @objc private func toggleAllPins(_ sender: Any?) {
-        Log.event(.tray, "tray.action", ["item": "togglePins"])
-        AppCoordinatorShared.coordinator?.toggleAllPinsVisibility()
     }
 
     @objc private func captureDelayed(_ sender: Any?) {

@@ -98,11 +98,6 @@ struct TrayMenuContent: View {
             AppCoordinatorShared.coordinator?.toggleHistorySpotlight()
         }
 
-        Button("隐藏/显示全部贴图  ⌥ ⌘ P") {
-            Log.event(.tray, "tray.action", ["item": "togglePins"])
-            AppCoordinatorShared.coordinator?.toggleAllPinsVisibility()
-        }
-
         Divider()
 
         Button("设置…") {

@@ -8,9 +8,12 @@ import CoreMedia
 /// - 居中于当前鼠标所在屏幕，深色磨砂玻璃卡片 + 双层光学阴影（`.spotlight` / margin 24 / r16）；
 /// - `AVPlayer` + `AVPlayerLayer(videoGravity: .resizeAspect)` 承载画面，打开即自动播放并无缝循环；
 /// - 舞台与底栏之间是自绘胶囊进度条（点击 / 拖拽实时 seek），时间读数走 tabular-nums；
-/// - 底栏「暂停/播放 · 静音/有声 · 复制文件 · 访达 · 丢弃」；
+/// - 进度条两端各一枚裁剪柄：拖左/右柄定头尾，播放头与循环播放都收进 `[start, end]`，
+///   被裁掉的两端用暗化遮罩表达「这段不要」，双击柄一键复位；
+/// - 底栏「暂停/播放 · 静音/有声 · 应用裁剪（仅已裁剪时出现）· 转 GIF · 复制文件 · 访达 · 丢弃」；
 /// - 快捷键（仅窗口可见且为 keyWindow 时生效）：空格播放/暂停、`Esc` 关闭、`←/→` 快退/快进 2s、`M` 静音；
-/// - `cleanUpPlayer()` 在关闭与「丢弃」前必定先行，确保 mp4 文件句柄立即释放、磁盘删除绝不失败。
+/// - `cleanUpPlayer()` 在关闭、「丢弃」以及**原地裁剪替换前**必定先行，确保 mp4 文件句柄立即
+///   释放——否则导出的新文件写不进去、磁盘删除也绝不成功。
 @MainActor
 final class VideoPreviewPanel: NSPanel {
     static let shared = VideoPreviewPanel()
@@ -19,6 +22,14 @@ final class VideoPreviewPanel: NSPanel {
         var onCopyFile: (URL) -> Void
         var onRevealInFinder: (URL) -> Void
         var onDiscard: (URL) -> Void
+        /// 头尾裁剪：拿 `[range]` 段换一个新文件（可原地原子替换），返回裁剪后的结果
+        var onTrim: ((RecordingResult, VideoTrimRange) async throws -> RecordingResult)? = nil
+        /// 按当前裁剪区间转 GIF，进度回调 0...1（可能来自后台线程，消费方自行 hop 回主线程）
+        var onConvertToGIF: (
+            (RecordingResult, VideoTrimRange, @escaping @Sendable (Double) -> Void) async throws -> RecordingResult
+        )? = nil
+        /// 转好 GIF 后直接打开内置 GIF 预览（本窗此时已 dismiss）
+        var onOpenGIFPreview: ((RecordingResult) -> Void)? = nil
     }
 
     /// 卡片几何（header 44 + stage + scrubber 34 + footer 50，间隙固定 8pt 栅格里的小档）
@@ -35,7 +46,8 @@ final class VideoPreviewPanel: NSPanel {
         /// header + 间隙 + scrubber + 间隙 + footer，即卡片除舞台外的高度
         static let chromeHeight: CGFloat =
             headerHeight + stageTopGap + stageScrubberGap + scrubberHeight + scrubberFooterGap + footerHeight
-        static let minCardWidth: CGFloat = 420
+        /// 底栏加到 7 枚按钮后 420 会挤成一行省略号，560 才排得下且留出弹性留白
+        static let minCardWidth: CGFloat = 560
         static let minStageHeight: CGFloat = 180
         static let stageCornerRadius: CGFloat = 10
     }
@@ -49,6 +61,16 @@ final class VideoPreviewPanel: NSPanel {
     private var timeObserverToken: Any?
     private var endObserver: NSObjectProtocol?
     private var isPlaying = false
+
+    /// 当前裁剪区间（打开即整段；拖柄 / 复位都走领域值，越界与「两端重合」在构造时已被合法化）
+    private var trimRange: VideoTrimRange = .full(duration: 0)
+    private var isProcessing = false
+    private var processingTask: Task<Void, Never>?
+    /// 转 GIF 前是否在播放：成功就切走预览窗，失败要恢复成用户交过来的样子
+    private var wasPlayingBeforeProcessing = false
+    private var lastGIFPercent = -1
+    /// 区间循环补 seek 期间屏蔽重复 seek（周期回调比 seek 完成快得多，不挡会疯狂重发）
+    private var isLoopSeeking = false
 
     private let outerView = VideoPreviewOuterView()
     private let cardRoot = NSView()
@@ -66,6 +88,10 @@ final class VideoPreviewPanel: NSPanel {
     private var stageHeightConstraint: NSLayoutConstraint!
     private var playPauseBtn: VideoPreviewPillButton!
     private var muteBtn: VideoPreviewPillButton!
+    private var applyTrimBtn: VideoPreviewPillButton!
+    private var gifBtn: VideoPreviewPillButton!
+    /// 处理中要整体置灰的按钮（「转 GIF」不在此列：它就是进度读数本身）
+    private var disableDuringProcessing: [VideoPreviewPillButton] = []
 
     private init() {
         super.init(
@@ -92,17 +118,23 @@ final class VideoPreviewPanel: NSPanel {
 
     func show(result: RecordingResult, callbacks: Callbacks) {
         cleanUpPlayer()
+        cancelProcessing()
 
         self.currentResult = result
         self.callbacks = callbacks
+        self.trimRange = .full(duration: max(0, result.duration))
 
         applyFrame(for: result)
         titleLabel.stringValue = result.fileURL.lastPathComponent
         metaLabel.stringValue =
             "\(result.pixelWidth)×\(result.pixelHeight) · \(result.formattedDuration) · \(result.formattedSize)"
         durationLabel.stringValue = result.formattedDuration
+        durationLabel.textColor = DesignTokens.label2
         currentTimeLabel.stringValue = "00:00"
+        scrubberTrack.setTrimFractions(start: 0, end: 1)
         scrubberTrack.setProgress(0, force: true)
+        syncTrimUI()
+        syncActionButtons()
 
         startPlayback(url: result.fileURL)
 
@@ -123,13 +155,28 @@ final class VideoPreviewPanel: NSPanel {
 
     func dismiss() {
         removeKeyMonitor()
+        cancelProcessing()
         // 关键：先释放 AVPlayer 与文件句柄，再 orderOut（否则「丢弃」删盘会撞上未释放的 mp4）
         cleanUpPlayer()
         scrubberTrack.setProgress(0, force: true)
+        scrubberTrack.setTrimFractions(start: 0, end: 1)
         currentTimeLabel.stringValue = "00:00"
+        durationLabel.stringValue = "00:00"
+        durationLabel.textColor = DesignTokens.label2
+        trimRange = .full(duration: 0)
         orderOut(nil)
         currentResult = nil
         callbacks = nil
+    }
+
+    /// 取消在途的裁剪/转 GIF（窗口关闭、换片、丢弃都要叫一遍）
+    private func cancelProcessing() {
+        processingTask?.cancel()
+        processingTask = nil
+        isProcessing = false
+        lastGIFPercent = -1
+        gifBtn?.update(symbol: "film", title: "转 GIF")
+        syncActionButtons()
     }
 
     /// 按录制像素与屏幕可见区域自适应卡片尺寸，居中于鼠标所在屏幕
@@ -173,6 +220,7 @@ final class VideoPreviewPanel: NSPanel {
 
         self.player = player
         self.playerItem = item
+        isLoopSeeking = false
 
         stageView.playerLayer.player = player
         stageView.playerLayer.videoGravity = .resizeAspect
@@ -231,20 +279,45 @@ final class VideoPreviewPanel: NSPanel {
     private func handleTimeTick(seconds: Double) {
         guard !scrubberTrack.isDragging else { return }
         let duration = effectiveDuration
-        guard seconds.isFinite else { return }
-        let clamped = min(max(seconds, 0), max(duration, 0))
+        guard seconds.isFinite, duration > 0 else { return }
+
+        // 区间循环：播到裁剪终点前一点点就无缝跳回起点（比等 didPlayToEnd 快得多，
+        // 也保证「裁掉尾段后不会黑屏停住」）
+        if trimRange.isTrimmed, seconds >= trimRange.end - 0.03 {
+            if !isLoopSeeking {
+                isLoopSeeking = true
+                player?.seek(
+                    to: CMTime(seconds: trimRange.start, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                )
+                currentTimeLabel.stringValue = RecordingGeometry.formatDuration(trimRange.start)
+                scrubberTrack.setProgress(trimRange.startFraction, force: true)
+            }
+            return
+        }
+        isLoopSeeking = false
+
+        let clamped = trimRange.isTrimmed
+            ? trimRange.clampingTime(seconds)
+            : min(max(seconds, 0), duration)
         currentTimeLabel.stringValue = RecordingGeometry.formatDuration(clamped)
         scrubberTrack.setProgress(duration > 0 ? clamped / duration : 0)
     }
 
     private func restartFromBeginning() {
         guard let player else { return }
-        player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+        let start = trimRange.isTrimmed ? trimRange.start : 0
+        player.seek(
+            to: CMTime(seconds: start, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
         player.play()
         isPlaying = true
         syncPlaybackButtons()
-        currentTimeLabel.stringValue = RecordingGeometry.formatDuration(0)
-        scrubberTrack.setProgress(0, force: true)
+        currentTimeLabel.stringValue = RecordingGeometry.formatDuration(start)
+        scrubberTrack.setProgress(trimRange.isTrimmed ? trimRange.startFraction : 0, force: true)
     }
 
     private func togglePlayPause() {
@@ -256,10 +329,16 @@ final class VideoPreviewPanel: NSPanel {
             // 播到尾再按播放：从头开始，别让用户以为按钮坏了
             let duration = effectiveDuration
             let current = CMTimeGetSeconds(player.currentTime())
-            if duration > 0, current.isFinite, current >= duration - 0.05 {
-                player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
-                currentTimeLabel.stringValue = RecordingGeometry.formatDuration(0)
-                scrubberTrack.setProgress(0, force: true)
+            let boundary = trimRange.isTrimmed ? trimRange.end : duration
+            if duration > 0, current.isFinite, current >= boundary - 0.05 {
+                let start = trimRange.isTrimmed ? trimRange.start : 0
+                player.seek(
+                    to: CMTime(seconds: start, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                )
+                currentTimeLabel.stringValue = RecordingGeometry.formatDuration(start)
+                scrubberTrack.setProgress(trimRange.isTrimmed ? trimRange.startFraction : 0, force: true)
             }
             player.play()
             isPlaying = true
@@ -302,7 +381,8 @@ final class VideoPreviewPanel: NSPanel {
         guard let player else { return }
         let duration = effectiveDuration
         guard duration > 0 else { return }
-        let clamped = min(max(fraction, 0), 1)
+        // 播放头始终只能落在有效区间内（未裁剪时就是 0...1，保持原有手感）
+        let clamped = min(max(fraction, trimRange.startFraction), trimRange.endFraction)
         let target = clamped * duration
         player.seek(
             to: CMTime(seconds: target, preferredTimescale: 600),
@@ -313,12 +393,29 @@ final class VideoPreviewPanel: NSPanel {
         scrubberTrack.setProgress(clamped, force: true)
     }
 
+    /// 拖裁剪柄时预览「精确起始 / 结束帧」（按秒定位，不走归一化以免求回时抖动）
+    private func seek(toTime seconds: TimeInterval) {
+        guard let player else { return }
+        let duration = effectiveDuration
+        guard duration > 0 else { return }
+        let clamped = min(max(seconds, 0), duration)
+        player.seek(
+            to: CMTime(seconds: clamped, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
+        currentTimeLabel.stringValue = RecordingGeometry.formatDuration(clamped)
+        scrubberTrack.setProgress(duration > 0 ? clamped / duration : 0, force: true)
+    }
+
     private func seek(byDelta delta: Double) {
         guard let player else { return }
         let duration = effectiveDuration
         let current = CMTimeGetSeconds(player.currentTime())
         let base = current.isFinite ? max(0, current) : 0
-        let target = min(max(base + delta, 0), max(duration, 0))
+        let lower = trimRange.isTrimmed ? trimRange.start : 0
+        let upper = trimRange.isTrimmed ? trimRange.end : max(duration, 0)
+        let target = min(max(base + delta, lower), upper)
         player.seek(
             to: CMTime(seconds: target, preferredTimescale: 600),
             toleranceBefore: .zero,
@@ -326,6 +423,215 @@ final class VideoPreviewPanel: NSPanel {
         )
         currentTimeLabel.stringValue = RecordingGeometry.formatDuration(target)
         scrubberTrack.setProgress(duration > 0 ? target / duration : 0, force: true)
+    }
+
+    // MARK: - 裁剪区间 UI
+
+    /// 把 `trimRange` 同步到进度条与时长读数（拖柄、重置、裁完、失败恢复都走这一个口）
+    private func syncTrimUI() {
+        scrubberTrack.setTrimFractions(start: trimRange.startFraction, end: trimRange.endFraction)
+        updateTimeReadout()
+        let shouldHide = !trimRange.isTrimmed
+        if applyTrimBtn.isHidden != shouldHide {
+            applyTrimBtn.isHidden = shouldHide
+        }
+        if !isProcessing {
+            applyTrimBtn.update(symbol: "scissors", title: "应用裁剪")
+        }
+    }
+
+    /// 右侧时长读数保持定宽（绝不挤压进度条），裁剪区间读数优雅放到顶栏 metaLabel
+    private func updateTimeReadout() {
+        guard let result = currentResult else {
+            durationLabel.stringValue = "00:00"
+            return
+        }
+        if trimRange.isTrimmed {
+            let start = RecordingGeometry.formatPreciseTime(trimRange.start)
+            let end = RecordingGeometry.formatPreciseTime(trimRange.end)
+            durationLabel.stringValue = RecordingGeometry.formatDuration(trimRange.trimmedDuration)
+            durationLabel.textColor = DesignTokens.label1
+            metaLabel.stringValue =
+                "\(start) – \(end) · 保留 \(String(format: "%.1fs", trimRange.trimmedDuration))"
+            metaLabel.textColor = DesignTokens.label1
+        } else {
+            durationLabel.stringValue = result.formattedDuration
+            durationLabel.textColor = DesignTokens.label2
+            metaLabel.stringValue =
+                "\(result.pixelWidth)×\(result.pixelHeight) · \(result.formattedDuration) · \(result.formattedSize)"
+            metaLabel.textColor = DesignTokens.label2
+        }
+    }
+
+    /// 处理中的按钮态（防重入靠 `isProcessing` + 置灰两层）
+    private func syncActionButtons() {
+        for btn in disableDuringProcessing {
+            btn.setEnabled(!isProcessing)
+        }
+        scrubberTrack.isInteractionEnabled = !isProcessing
+    }
+
+    // MARK: - 头尾裁剪 / 转 GIF
+
+    private func performTrim() {
+        guard !isProcessing,
+              trimRange.isTrimmed,
+              let result = currentResult,
+              let onTrim = callbacks?.onTrim
+        else { return }
+
+        let range = trimRange
+        isProcessing = true
+        isLoopSeeking = false
+        // 关键：原地替换 MP4 前必须放掉 AVPlayer/AVPlayerItem 持有的文件句柄，
+        // 否则导出会话拿不到可写的文件（表现为导出失败或旧帧残留）
+        cleanUpPlayer()
+        syncPlaybackButtons()
+        applyTrimBtn.update(symbol: "scissors", title: "裁剪中…")
+        syncActionButtons()
+        Log.event(.recording, "recording.videoPreview.trim.start", [
+            "start": String(format: "%.2f", range.start),
+            "end": String(format: "%.2f", range.end),
+        ])
+
+        processingTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let trimmed = try await onTrim(result, range)
+                guard !Task.isCancelled else { return }
+                self.finishTrim(trimmed: trimmed)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.failTrim(error: error, original: result)
+            }
+        }
+    }
+
+    private func finishTrim(trimmed: RecordingResult) {
+        isProcessing = false
+        processingTask = nil
+        currentResult = trimmed
+        trimRange = .full(duration: max(0, trimmed.duration))
+
+        titleLabel.stringValue = trimmed.fileURL.lastPathComponent
+        metaLabel.stringValue =
+            "\(trimmed.pixelWidth)×\(trimmed.pixelHeight) · \(trimmed.formattedDuration) · \(trimmed.formattedSize)"
+        currentTimeLabel.stringValue = "00:00"
+        scrubberTrack.setTrimFractions(start: 0, end: 1)
+        scrubberTrack.setProgress(0, force: true)
+        durationLabel.stringValue = trimmed.formattedDuration
+        durationLabel.textColor = DesignTokens.label2
+
+        startPlayback(url: trimmed.fileURL)
+        syncTrimUI()
+        syncActionButtons()
+        CaptureToast.show(message: "已裁剪视频（\(trimmed.formattedDuration)）", status: .ok)
+        // 事件名与适配器的 `recording.trim.ok` 错开：一个是「用户点了裁剪」，
+        // 一个是「导出写盘成功」，同名字会让排查时少一半信息
+        Log.event(.recording, "recording.videoPreview.trim.ok", [
+            "duration": String(format: "%.2f", trimmed.duration),
+            "bytes": "\(trimmed.fileSizeBytes)",
+        ])
+    }
+
+    private func failTrim(error: Error, original: RecordingResult) {
+        isProcessing = false
+        processingTask = nil
+        // 失败时原文件没变（适配器先写临时文件再原子替换），恢复播放原片，别留黑屏
+        startPlayback(url: original.fileURL)
+        syncTrimUI()
+        syncActionButtons()
+        CaptureToast.show(message: "裁剪失败：\(error.localizedDescription)", status: .warn)
+        Log.error(.recording, "recording.videoPreview.trim.fail", ["err": error.localizedDescription])
+    }
+
+    private func performConvertToGIF() {
+        guard !isProcessing,
+              let result = currentResult,
+              let onConvert = callbacks?.onConvertToGIF
+        else { return }
+
+        let range = trimRange
+        // 硬上限提前温柔拦截（不暂停播放、不闪按钮态），直接引导用户拖两端裁剪柄
+        if range.trimmedDuration > GIFConversionOptions.maxDurationSeconds + GIFConversionOptions.durationToleranceSeconds {
+            let cur = RecordingGeometry.formatDuration(range.trimmedDuration)
+            CaptureToast.show(
+                message: "GIF 最长支持 \(Int(GIFConversionOptions.maxDurationSeconds)) 秒，请先拖动进度条两端裁剪片段（当前 \(cur)）",
+                status: .warn
+            )
+            Log.event(.recording, "recording.convertGIF.tooLong", [
+                "duration": String(format: "%.2f", range.trimmedDuration),
+            ])
+            return
+        }
+        isProcessing = true
+        lastGIFPercent = -1
+        wasPlayingBeforeProcessing = isPlaying
+        player?.pause()
+        isPlaying = false
+        syncPlaybackButtons()
+        gifBtn.update(symbol: "film", title: "转 GIF 0%")
+        syncActionButtons()
+
+        // 进度回调可能来自后台线程：hop 回主 actor 再刷按钮标题
+        let progress: @Sendable (Double) -> Void = { [weak self] fraction in
+            Task { @MainActor in
+                self?.updateGIFProgress(fraction)
+            }
+        }
+
+        processingTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let gifResult = try await onConvert(result, range, progress)
+                guard !Task.isCancelled else { return }
+                self.finishGIFConversion(result: gifResult)
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.failGIFConversion(error: error)
+            }
+        }
+    }
+
+    private func updateGIFProgress(_ fraction: Double) {
+        guard isProcessing else { return }
+        let percent = Int((min(max(fraction, 0), 1) * 100).rounded())
+        guard percent != lastGIFPercent else { return }
+        lastGIFPercent = percent
+        gifBtn.update(symbol: "film", title: "转 GIF \(percent)%")
+    }
+
+    private func finishGIFConversion(result gifResult: RecordingResult) {
+        isProcessing = false
+        processingTask = nil
+        lastGIFPercent = -1
+        gifBtn.update(symbol: "film", title: "转 GIF")
+        syncActionButtons()
+        Log.event(.recording, "recording.convertGIF.ok", [
+            "bytes": "\(gifResult.fileSizeBytes)",
+            "frames": "\(gifResult.frameCount)",
+        ])
+
+        // dismiss() 会清掉 callbacks，先取出来再关窗
+        let openPreview = callbacks?.onOpenGIFPreview
+        dismiss()
+        openPreview?(gifResult)
+        CaptureToast.show(message: "已转存 GIF（\(gifResult.formattedSize)）", status: .ok)
+    }
+
+    private func failGIFConversion(error: Error) {
+        isProcessing = false
+        processingTask = nil
+        lastGIFPercent = -1
+        gifBtn.update(symbol: "film", title: "转 GIF")
+        syncActionButtons()
+        if wasPlayingBeforeProcessing, let player {
+            player.play()
+            isPlaying = true
+            syncPlaybackButtons()
+        }
+        CaptureToast.show(message: "转 GIF 失败：\(error.localizedDescription)", status: .warn)
+        Log.error(.recording, "recording.convertGIF.fail", ["err": error.localizedDescription])
     }
 
     // MARK: - 底部操作
@@ -430,6 +736,30 @@ final class VideoPreviewPanel: NSPanel {
         scrubberTrack.onScrubEnd = { [weak self] in
             self?.currentTimeLabel.textColor = DesignTokens.label2
         }
+        scrubberTrack.onTrimStartDrag = { [weak self] fraction in
+            guard let self else { return }
+            self.trimRange = self.trimRange.updatingStartFraction(fraction)
+            self.syncTrimUI()
+            // 拖到哪就看到哪帧：直接 seek 到新起点，裁前先确认「头没切多」
+            self.seek(toTime: self.trimRange.start)
+        }
+        scrubberTrack.onTrimEndDrag = { [weak self] fraction in
+            guard let self else { return }
+            self.trimRange = self.trimRange.updatingEndFraction(fraction)
+            self.syncTrimUI()
+            self.seek(toTime: self.trimRange.end)
+        }
+        scrubberTrack.onTrimDragEnd = { [weak self] in
+            guard let self else { return }
+            self.currentTimeLabel.textColor = DesignTokens.label2
+            self.syncTrimUI()
+        }
+        scrubberTrack.onTrimReset = { [weak self] in
+            guard let self, let result = self.currentResult else { return }
+            self.trimRange = .full(duration: max(0, result.duration))
+            self.syncTrimUI()
+            self.seek(toTime: 0)
+        }
         scrubberTrack.translatesAutoresizingMaskIntoConstraints = false
 
         scrubberRow.addSubview(currentTimeLabel)
@@ -445,6 +775,15 @@ final class VideoPreviewPanel: NSPanel {
         muteBtn = VideoPreviewPillButton(symbol: "speaker.slash", title: "静音", style: .normal) { [weak self] in
             self?.toggleMute()
         }
+        // 「应用裁剪」只在真的拖了柄之后出现，平时不占位也不诱发误点
+        applyTrimBtn = VideoPreviewPillButton(symbol: "scissors", title: "应用裁剪", style: .primary) {
+            [weak self] in
+            self?.performTrim()
+        }
+        applyTrimBtn.isHidden = true
+        gifBtn = VideoPreviewPillButton(symbol: "film", title: "转 GIF", style: .normal) { [weak self] in
+            self?.performConvertToGIF()
+        }
         let copyBtn = VideoPreviewPillButton(symbol: "doc.on.doc", title: "复制文件", style: .primary) { [weak self] in
             self?.performCopyFile()
         }
@@ -455,15 +794,20 @@ final class VideoPreviewPanel: NSPanel {
             [weak self] in
             self?.performDiscard()
         }
+        disableDuringProcessing = [playPauseBtn, muteBtn, applyTrimBtn, copyBtn, finderBtn, discardBtn]
 
         let spacer = NSView()
         spacer.translatesAutoresizingMaskIntoConstraints = false
+        // 弹性留白：按钮行变宽（「应用裁剪」出现）时先挤它，别去挤按钮文字
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let footerStack = NSStackView(views: [playPauseBtn, muteBtn, spacer, copyBtn, finderBtn, discardBtn])
+        let footerStack = NSStackView(views: [
+            playPauseBtn, muteBtn, spacer, applyTrimBtn, gifBtn, copyBtn, finderBtn, discardBtn,
+        ])
         footerStack.orientation = .horizontal
         footerStack.alignment = .centerY
-        footerStack.spacing = 8
+        footerStack.spacing = 7
         footerStack.translatesAutoresizingMaskIntoConstraints = false
 
         glass.addSubview(titleLabel)
@@ -647,6 +991,7 @@ private final class VideoPreviewStageView: NSView {
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 
     /// 吞掉 mouseDown，避免 isMovableByWindowBackground 把点击当窗口拖拽
     override func mouseDown(with event: NSEvent) {}
@@ -667,15 +1012,46 @@ private final class VideoPreviewScrubberTrack: NSView {
     /// fraction ∈ 0...1
     var onScrub: ((Double) -> Void)?
     var onScrubEnd: (() -> Void)?
+    /// 拖左裁剪柄（新起点 fraction）
+    var onTrimStartDrag: ((Double) -> Void)?
+    /// 拖右裁剪柄（新终点 fraction）
+    var onTrimEndDrag: ((Double) -> Void)?
+    var onTrimDragEnd: (() -> Void)?
+    /// 双击裁剪柄复位成整段（极简「重置」，不额外占一枚按钮）
+    var onTrimReset: (() -> Void)?
 
+    /// 处理中（裁剪 / 转 GIF）禁拖：文件正在原地替换时改区间没有任何意义
+    var isInteractionEnabled = true
+
+    /// 任何柄/播放头拖动期间都为 true（面板据此屏蔽周期刷新）
     private(set) var isDragging = false
+
     private var progress: CGFloat = 0
+    private var startFraction: CGFloat = 0
+    private var endFraction: CGFloat = 1
     private var isHovering = false
+    private var hoverHandle: Handle?
+    private var dragMode: DragMode?
     private var tracking: NSTrackingArea?
+
+    private enum Handle { case start, end }
+    private enum DragMode { case scrub, trimStart, trimEnd }
+
+    private enum Metrics {
+        static let handleWidth: CGFloat = 6
+        static let handleHeight: CGFloat = 16
+        /// 柄热区半宽（比手柄本体宽一圈，轻松抓住）
+        static let handleHitSlack: CGFloat = 9
+        /// 轨道两端内缩，保证 fraction=0/1 时柄不被窗口边缘切掉
+        static let trackInset: CGFloat = 6
+        /// 两柄之间永远留一丝缝（真正的 minSpan 由 VideoTrimRange 把关）
+        static let minimumFractionGap: CGFloat = 0.002
+    }
 
     private var isActive: Bool { isDragging || isHovering }
     private var knobRadius: CGFloat { isActive ? 5.5 : 4.5 }
     private var barHeight: CGFloat { isActive ? 6 : 5 }
+    private var isRangeTrimmed: Bool { startFraction > 0.001 || endFraction < 0.999 }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -684,23 +1060,39 @@ private final class VideoPreviewScrubberTrack: NSView {
 
     required init?(coder: NSCoder) { fatalError("VideoPreviewScrubberTrack 只走代码创建") }
 
-    /// `force = true` 时无视拖拽保护（seek 回写 / 复位用）
+    /// `force = true` 时无视拖拽保护（seek 回写 / 复位用）；播放头始终压在有效区间内
     func setProgress(_ fraction: Double, force: Bool = false) {
         guard force || !isDragging else { return }
         let clamped = CGFloat(min(max(fraction, 0), 1))
-        guard abs(clamped - progress) > 0.0005 else { return }
-        progress = clamped
+        let bounded = min(max(clamped, startFraction), endFraction)
+        guard abs(bounded - progress) > 0.0005 else { return }
+        progress = bounded
         needsDisplay = true
     }
 
+    /// 面板裁完 / 拖柄回写用：同步左右柄位置（顺带把播放头收回区间）
+    func setTrimFractions(start: Double, end: Double) {
+        let s = CGFloat(min(max(start, 0), 1))
+        let e = CGFloat(min(max(end, 0), 1))
+        guard e > s else { return }
+        startFraction = s
+        endFraction = e
+        progress = min(max(progress, s), e)
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    /// ⚠️ 关键：父窗口开了 `isMovableByWindowBackground = true`，非不透明子视图默认
+    /// `mouseDownCanMoveWindow == true`，不覆写 false 会导致按住进度条拖动直接把整个窗口拖走！
+    override var mouseDownCanMoveWindow: Bool { false }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
@@ -708,70 +1100,218 @@ private final class VideoPreviewScrubberTrack: NSView {
         tracking = area
     }
 
+    // MARK: - 悬停 / 光标
+
     override func mouseEntered(with event: NSEvent) {
         isHovering = true
+        // 柄上要实时换 .resizeLeftRight，窗口必须先接受 mouseMoved
+        window?.acceptsMouseMovedEvents = true
         needsDisplay = true
     }
 
     override func mouseExited(with event: NSEvent) {
         isHovering = false
+        hoverHandle = nil
         needsDisplay = true
     }
 
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let handle = handleHit(at: point)
+        guard handle != hoverHandle else { return }
+        hoverHandle = handle
+        needsDisplay = true
+    }
+
+    /// 柄上给左右调整光标，其余区域保持箭头（拖动进度条不改光标，避免整条都是小手）
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        let bar = trackGeometry()
+        guard bar.width > 0 else { return }
+        let reach = Metrics.handleWidth / 2 + 4
+        for fraction in [startFraction, endFraction] {
+            let centerX = bar.minX + bar.width * fraction
+            addCursorRect(
+                NSRect(x: centerX - reach, y: 0, width: reach * 2, height: bounds.height),
+                cursor: .resizeLeftRight
+            )
+        }
+    }
+
+    // MARK: - 鼠标
+
     override func mouseDown(with event: NSEvent) {
-        guard bounds.width > 0 else { return }
+        guard isInteractionEnabled, bounds.width > 0 else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        let handle = handleHit(at: point)
+
+        if event.clickCount >= 2, handle != nil {
+            // 双击柄 = 复位整段
+            isDragging = false
+            dragMode = nil
+            needsDisplay = true
+            onTrimReset?()
+            return
+        }
+
         isDragging = true
         onScrubStart?()
-        apply(point: convert(event.locationInWindow, from: nil))
+        if let handle {
+            dragMode = handle == .start ? .trimStart : .trimEnd
+        } else {
+            dragMode = .scrub
+            applyScrub(point: point)
+        }
+        needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard isDragging else { return }
-        apply(point: convert(event.locationInWindow, from: nil))
+        guard isDragging, let dragMode else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        switch dragMode {
+        case .scrub: applyScrub(point: point)
+        case .trimStart: applyTrimDrag(handle: .start, point: point)
+        case .trimEnd: applyTrimDrag(handle: .end, point: point)
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard isDragging else { return }
-        apply(point: convert(event.locationInWindow, from: nil))
+        guard isDragging, let dragMode else {
+            isDragging = false
+            self.dragMode = nil
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        switch dragMode {
+        case .scrub:
+            applyScrub(point: point)
+            onScrubEnd?()
+        case .trimStart, .trimEnd:
+            onTrimDragEnd?()
+        }
         isDragging = false
+        self.dragMode = nil
         needsDisplay = true
-        onScrubEnd?()
+        window?.invalidateCursorRects(for: self)
     }
 
-    private func apply(point: NSPoint) {
-        guard bounds.width > 0 else { return }
-        let x = min(max(point.x, 0), bounds.width)
-        let fraction = CGFloat(x / bounds.width)
-        progress = fraction
-        needsDisplay = true
-        onScrub?(Double(fraction))
+    /// 命中优先级：左右裁剪柄（各自 ±8pt）→ 回落普通进度条 seek
+    private func handleHit(at point: NSPoint) -> Handle? {
+        let bar = trackGeometry()
+        guard bar.width > 0 else { return nil }
+        let startX = bar.minX + bar.width * startFraction
+        let endX = bar.minX + bar.width * endFraction
+        let distanceToStart = abs(point.x - startX)
+        let distanceToEnd = abs(point.x - endX)
+        let hitStart = distanceToStart <= Metrics.handleHitSlack
+        let hitEnd = distanceToEnd <= Metrics.handleHitSlack
+        if hitStart && hitEnd {
+            // 两柄快要重合：按指针落在中点哪一侧区分，避免「只能拖左柄」的怪感
+            let mid = (startX + endX) / 2
+            return point.x <= mid ? .start : .end
+        }
+        if hitStart { return .start }
+        if hitEnd { return .end }
+        return nil
     }
+
+    private func applyScrub(point: NSPoint) {
+        let bar = trackGeometry()
+        guard bar.width > 0 else { return }
+        let x = min(max(point.x, bar.minX), bar.maxX)
+        let fraction = (x - bar.minX) / bar.width
+        // 播放头不许跑出有效区间（未裁剪时相当于原行为）
+        let clamped = min(max(fraction, startFraction), endFraction)
+        guard abs(clamped - progress) > 0.0002 else { return }
+        progress = clamped
+        needsDisplay = true
+        onScrub?(Double(clamped))
+    }
+
+    private func applyTrimDrag(handle: Handle, point: NSPoint) {
+        let bar = trackGeometry()
+        guard bar.width > 0 else { return }
+        let x = min(max(point.x, bar.minX), bar.maxX)
+        let fraction = (x - bar.minX) / bar.width
+        switch handle {
+        case .start:
+            let next = min(fraction, endFraction - Metrics.minimumFractionGap)
+            guard abs(next - startFraction) > 0.0002 else { return }
+            startFraction = max(0, next)
+            progress = max(progress, startFraction)
+            needsDisplay = true
+            onTrimStartDrag?(Double(startFraction))
+        case .end:
+            let next = max(fraction, startFraction + Metrics.minimumFractionGap)
+            guard abs(next - endFraction) > 0.0002 else { return }
+            endFraction = min(1, next)
+            progress = min(progress, endFraction)
+            needsDisplay = true
+            onTrimEndDrag?(Double(endFraction))
+        }
+    }
+
+    private func trackGeometry() -> NSRect {
+        let width = bounds.width - Metrics.trackInset * 2
+        return NSRect(x: Metrics.trackInset, y: 0, width: max(0, width), height: bounds.height)
+    }
+
+    // MARK: - 绘制
 
     override func draw(_ dirtyRect: NSRect) {
-        let knobR = knobRadius
+        let bar = trackGeometry()
+        guard bar.width > 0 else { return }
+
         let barH = barHeight
-        let trackWidth = bounds.width - knobR * 2
-        guard trackWidth > 0 else { return }
-        let trackRect = NSRect(
-            x: knobR,
-            y: (bounds.height - barH) / 2,
-            width: trackWidth,
+        let radius = barH / 2
+        let trackRect = NSRect(x: bar.minX, y: (bounds.height - barH) / 2, width: bar.width, height: barH)
+        let basePath = NSBezierPath(roundedRect: trackRect, xRadius: radius, yRadius: radius)
+
+        // 1) 整条底轨（裁剪后两端保持低调暗透，突出保留段）
+        NSColor.white.withAlphaComponent(isRangeTrimmed ? 0.08 : 0.15).setFill()
+        basePath.fill()
+
+        let validMinX = bar.minX + bar.width * startFraction
+        let validMaxX = bar.minX + bar.width * endFraction
+        let validRect = NSRect(
+            x: validMinX,
+            y: trackRect.minY,
+            width: max(0, validMaxX - validMinX),
             height: barH
         )
-        let radius = barH / 2
 
-        DesignTokens.fill.setFill()
-        NSBezierPath(roundedRect: trackRect, xRadius: radius, yRadius: radius).fill()
+        // 2) 有效区间亮底（克制磨砂白，视觉自然聚焦保留段）
+        NSColor.white.withAlphaComponent(isRangeTrimmed ? 0.24 : 0.16).setFill()
+        NSBezierPath(roundedRect: validRect, xRadius: radius, yRadius: radius).fill()
 
-        if progress > 0 {
-            // 极短进度也给一个圆点，避免「拖到头只看到 1px」
-            let filledW = min(trackWidth, max(barH, trackWidth * progress))
-            let fillRect = NSRect(x: trackRect.minX, y: trackRect.minY, width: filledW, height: barH)
+        // 3) 播放进度（只在有效区间内填充；极短也给一段可见宽度，避免「拖到头只看到 1px」）
+        let span = max(0.0001, Double(endFraction - startFraction))
+        let localFraction = CGFloat(min(1, max(0, Double(progress - startFraction) / span)))
+        if localFraction > 0.001, validRect.width > 0 {
+            let filledW = min(validRect.width, max(barH, validRect.width * localFraction))
+            let fillRect = NSRect(x: validRect.minX, y: trackRect.minY, width: filledW, height: barH)
             DesignTokens.accent.setFill()
             NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius).fill()
         }
 
-        let knobCenterX = trackRect.minX + trackWidth * progress
+        // 4) 已裁剪时给有效区间加一圈克制主色蓝微光细框（与暗色 HUD 玻璃同族，无刺眼黄框）
+        if isRangeTrimmed {
+            let frameRect = validRect.insetBy(dx: -1, dy: -1.5)
+            let frame = NSBezierPath(roundedRect: frameRect, xRadius: radius + 1.5, yRadius: radius + 1.5)
+            frame.lineWidth = 1
+            DesignTokens.accent.withAlphaComponent(0.68).setStroke()
+            frame.stroke()
+        }
+
+        // 5) 左右裁剪柄
+        let startActive = dragMode == .trimStart || hoverHandle == .start
+        let endActive = dragMode == .trimEnd || hoverHandle == .end
+        drawHandle(centerX: validMinX, active: startActive)
+        drawHandle(centerX: validMaxX, active: endActive)
+
+        // 6) 播放头白圆点（画在柄之上，永远看得见）
+        let knobR = knobRadius
+        let knobCenterX = bar.minX + bar.width * progress
         let knobRect = NSRect(
             x: knobCenterX - knobR,
             y: bounds.midY - knobR,
@@ -780,6 +1320,32 @@ private final class VideoPreviewScrubberTrack: NSView {
         )
         NSColor.white.setFill()
         NSBezierPath(ovalIn: knobRect).fill()
+        NSColor.black.withAlphaComponent(0.24).setStroke()
+        let ring = NSBezierPath(ovalIn: knobRect.insetBy(dx: 0.25, dy: 0.25))
+        ring.lineWidth = 0.5
+        ring.stroke()
+    }
+
+    /// 精致磨砂白竖柄 + 1pt 握持微槽；悬停/拖动时亮白并带主色蓝发丝边，克制耐看
+    private func drawHandle(centerX: CGFloat, active: Bool) {
+        let w = Metrics.handleWidth
+        let h = Metrics.handleHeight
+        let rect = NSRect(x: centerX - w / 2, y: bounds.midY - h / 2, width: w, height: h)
+        let pill = NSBezierPath(roundedRect: rect, xRadius: w / 2, yRadius: w / 2)
+
+        let fillAlpha: CGFloat = active ? 0.98 : (isRangeTrimmed ? 0.88 : 0.38)
+        NSColor.white.withAlphaComponent(fillAlpha).setFill()
+        pill.fill()
+
+        if active || isRangeTrimmed {
+            pill.lineWidth = active ? 1.0 : 0.5
+            (active ? DesignTokens.accent : NSColor.black.withAlphaComponent(0.28)).setStroke()
+            pill.stroke()
+        }
+
+        let grip = NSRect(x: centerX - 0.5, y: rect.minY + 4.5, width: 1, height: max(1, h - 9))
+        NSColor.black.withAlphaComponent(active ? 0.42 : (isRangeTrimmed ? 0.30 : 0.22)).setFill()
+        grip.fill()
     }
 }
 
@@ -810,6 +1376,7 @@ private final class VideoPreviewCloseButton: NSView {
     required init?(coder: NSCoder) { fatalError("VideoPreviewCloseButton 只走代码创建") }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -882,6 +1449,8 @@ private final class VideoPreviewPillButton: NSView {
     private let label = NSTextField(labelWithString: "")
     private let onTap: () -> Void
     private var tracking: NSTrackingArea?
+    /// 处理中置灰：不响应点击（防重入的第一道闸，面板里还有 `isProcessing` 守卫）
+    private(set) var isEnabled = true
 
     init(symbol: String, title: String, style: Style, onTap: @escaping () -> Void) {
         self.style = style
@@ -911,8 +1480,8 @@ private final class VideoPreviewPillButton: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 28),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
@@ -923,6 +1492,12 @@ private final class VideoPreviewPillButton: NSView {
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 11.5, weight: .medium))
         label.stringValue = title
+    }
+
+    func setEnabled(_ enabled: Bool) {
+        guard isEnabled != enabled else { return }
+        isEnabled = enabled
+        alphaValue = enabled ? 1 : 0.38
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -941,6 +1516,7 @@ private final class VideoPreviewPillButton: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        guard isEnabled else { return }
         layer?.backgroundColor = style.hoverBg.cgColor
     }
 
@@ -949,10 +1525,12 @@ private final class VideoPreviewPillButton: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         TactilePress.animate(view: self, pressed: true)
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard isEnabled else { return }
         TactilePress.animate(view: self, pressed: false)
         let pt = convert(event.locationInWindow, from: nil)
         if bounds.contains(pt) {

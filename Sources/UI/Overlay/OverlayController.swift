@@ -99,6 +99,10 @@ final class OverlayController {
     private var scrollEscForceCount = 0
     /// overlay 会话代际（begin/end 各 +1）：compose 异步回填必须同代才有效
     private var overlaySessionEpoch = 0
+    /// 智能框选：冻结帧异步视觉探测（先文本行 20-40ms 就绪，再识别区域）
+    private var smartVisionTask: Task<Void, Never>?
+    /// 智能框选：AX 探测会话租约是否已持有（begin/end 成对，编辑态/录屏态提前释放）
+    private var smartSessionActive = false
     /// 本次采集是否观测到过真实滚动（净贡献 > 0）：到底自动合成的前置条件——
     /// 从未滚动就静止 ≠ 到底（用户在读屏定位），不能自动合成
     private var scrollEverScrolled = false
@@ -205,6 +209,12 @@ final class OverlayController {
         }
         for window in windows {
             if window.overlayView.cancelActiveTextEditingIfNeeded() {
+                return
+            }
+        }
+        // 已选中标注：Esc 先只取消选中（不关截图），再按一次才取消整个会话
+        for window in windows {
+            if window.overlayView.dismissAnnotationSelectionIfNeeded() {
                 return
             }
         }
@@ -334,6 +344,10 @@ final class OverlayController {
         toolbar?.orderOut(nil)
         dismissAll()
         frozenImages.removeAll()
+        // 智能框选：清掉上一轮视觉探测任务，重新租用 AX 探测会话
+        smartVisionTask?.cancel()
+        smartVisionTask = nil
+        beginSmartSessionIfNeeded()
         // 立刻注册会话级 Carbon Esc 热键：即使 macOS 14+ 暂未授予激活态，Esc 也能 0ms 可靠退出
         registerOverlayEscapeHotKey()
 
@@ -409,17 +423,75 @@ final class OverlayController {
     }
 
     /// 上屏：仅在鼠标所在屏复用覆盖窗并挂载 GPU 冻结帧（其余屏幕完全不打扰）
+    ///
+    /// 智能框选纪律：**视觉探测绝不阻塞上屏**——冻结帧挂载后立刻 orderFront（0ms 可用），
+    /// 文本行/识别区域由 startSmartVisionDetection 异步回填（先文本行再区域，各带代际校验）。
     private func showOverlayWindow(on targetScreen: NSScreen) {
         let window = acquireOverlayWindow(for: targetScreen)
+        var frozenForVision: CGImage?
         if let displayID = DisplayRegistry.displayID(of: targetScreen),
            let frozen = frozenImages[displayID] {
             window.installFrozenImage(frozen)
+            frozenForVision = frozen
         }
         window.orderFrontRegardless()
         windows.append(window)
         ensureActivation(reason: "overlay.show")
         window.makeKey()
         window.syncInitialCursor()
+        if let frozen = frozenForVision {
+            startSmartVisionDetection(frozen: frozen, screen: targetScreen, window: window)
+        }
+    }
+
+    // MARK: - 智能框选（AX 会话 + 异步视觉探测）
+
+    private func beginSmartSessionIfNeeded() {
+        guard !smartSessionActive else { return }
+        smartSessionActive = true
+        AppCoordinatorShared.deps?.smartElementProber.beginSession()
+    }
+
+    /// 提前释放 AX 会话租约（进入编辑/录屏准备态后不再需要探测，避免目标 App 挂着 AX 激活）
+    private func endSmartSessionIfNeeded() {
+        guard smartSessionActive else { return }
+        smartSessionActive = false
+        AppCoordinatorShared.deps?.smartElementProber.endSession()
+    }
+
+    /// 冻结帧视觉探测（不阻塞上屏）：
+    /// ① 先文本行（最快 20-40ms 就绪，覆盖「文字行」这一最高频目标）
+    /// ② 再识别区域（控件/区域/视觉块）
+    /// ③ 最后表格结构（单元格/行/列；有识别区域才有意义，故仅在非空时触发）
+    /// 每次回调都要过 `epoch == overlaySessionEpoch` 与取消校验，杜绝上一会话的迟到结果污染新会话。
+    private func startSmartVisionDetection(frozen: CGImage, screen: NSScreen, window: OverlayWindow) {
+        smartVisionTask?.cancel()
+        smartVisionTask = nil
+        guard let detector = AppCoordinatorShared.deps?.smartVisionDetector else { return }
+        let epoch = overlaySessionEpoch
+        let screenFrame = screen.frame
+        smartVisionTask = Task { [weak self, weak window] in
+            let textLines = await detector.detectTextLines(in: frozen, screenFrame: screenFrame)
+            guard !Task.isCancelled, let self, self.overlaySessionEpoch == epoch else { return }
+            window?.updateSmartVisionTextLines(textLines)
+            Log.event(.overlay, "overlay.smart.textLines", ["count": "\(textLines.count)"])
+
+            let visualRects = await detector.detectVisualRects(in: frozen, screenFrame: screenFrame)
+            guard !Task.isCancelled, self.overlaySessionEpoch == epoch else { return }
+            window?.updateSmartVisionRects(visualRects)
+            Log.event(.overlay, "overlay.smart.visualRects", ["count": "\(visualRects.count)"])
+
+            // ③ 表格结构（仅在有识别区域时才有意义：表格框一定落在这些视觉块里）
+            guard !visualRects.isEmpty else { return }
+            let visualTables = await detector.detectVisualTables(
+                in: frozen,
+                screenFrame: screenFrame,
+                candidateRects: visualRects
+            )
+            guard !Task.isCancelled, self.overlaySessionEpoch == epoch else { return }
+            window?.updateSmartVisionTables(visualTables)
+            Log.event(.overlay, "overlay.smart.tables", ["count": "\(visualTables.count)"])
+        }
     }
 
     /// 从冻结帧本地裁剪（零延迟、零二次屏捕）
@@ -454,10 +526,17 @@ final class OverlayController {
         }
     }
 
-    func end() {
+    /// 结束整个截图会话。
+    /// - Parameter restorePreviousApp: 是否把键盘焦点还给原 App（默认是）。
+    ///   智能框选直达动作传 `false`：接下来要展示 OCR 浮层 / 贴图，
+    ///   焦点必须留在本 App，否则浮层拿不到键盘（归还时机由调用方自己安排）。
+    func end(restorePreviousApp: Bool = true) {
         overlaySessionEpoch += 1
         let endEpoch = overlaySessionEpoch
         unregisterOverlayEscapeHotKey()
+        smartVisionTask?.cancel()
+        smartVisionTask = nil
+        endSmartSessionIfNeeded()
         dismissAll()
         editorSession = nil
         pendingRecordingFormat = nil
@@ -465,6 +544,8 @@ final class OverlayController {
         toolbar?.dismiss()
         ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
         ocrCloseObserver = nil
+        smartDirectOCRCloseObserver.map { NotificationCenter.default.removeObserver($0) }
+        smartDirectOCRCloseObserver = nil
         teardownScrollSession()
         teardownRecordingSession()
         // 设置窗回场：截图开始时它若开着（被拍进了冻结图），覆盖层上屏前我们
@@ -473,6 +554,7 @@ final class OverlayController {
             SettingsWindowController.shared.restoreAfterCapture()
         }
         settingsWasVisibleAtCaptureBegin = false
+        guard restorePreviousApp else { return }
         // 仅当 80ms 后未开启新截图会话时才归还焦点，杜绝快速 Esc→F1 场景旧回调抢走新会话焦点
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             guard let self, self.overlaySessionEpoch == endEpoch, self.windows.isEmpty else { return }
@@ -645,6 +727,9 @@ final class OverlayController {
     }
 
     private func dismissAll() {
+        smartVisionTask?.cancel()
+        smartVisionTask = nil
+        endSmartSessionIfNeeded()
         for window in windows {
             window.orderOut(nil)
             let isPooled = windowPool.values.contains { $0 === window }
@@ -805,6 +890,8 @@ final class OverlayController {
     // MARK: - 编辑态
 
     private func enterEditor(base: CGImage, selection: CGRect, screen: NSScreen) {
+        // 进编辑态后不再需要 AX 探测：立刻释放会话租约（不让目标 App 一直挂 AX 激活状态）
+        endSmartSessionIfNeeded()
         // 幂等清理（病例 2026-11-16：enter.fromScroll 在 compose 回退链被调两次
         // ——旧工具栏不拆、双面板 + panel 负坐标）：重入先撤旧编辑视觉。
         // ⚠️ toolbar 实例保留（dismiss 视觉退场后复用——构建 440ms 太贵）
@@ -847,6 +934,7 @@ final class OverlayController {
             session: session,
             capabilities: .screenshot,
             onToolChange: { [weak self] in
+                self?.editorWindow()?.overlayView.handleToolbarToolChange()
                 self?.editorWindow()?.overlayView.syncActiveTextColor()
                 self?.editorWindow()?.overlayView.needsDisplay = true
             },
@@ -854,6 +942,14 @@ final class OverlayController {
                 self?.toolbarAction(action)
             }
         )
+        // 选中标注的样式实时联动（颜色点选 / 线宽滑杆）：仅在确实选中某条标注时生效
+        toolbar.onStyleChange = { [weak self] colorIndex, strokeWidth, commit in
+            self?.editorWindow()?.overlayView.applyStyleChangeToSelectedAnnotation(
+                colorIndex: colorIndex,
+                strokeWidth: strokeWidth,
+                commit: commit
+            )
+        }
         toolbar.updateBackdropStyle(session.backdropStyle)
         toolbar.onBackdropStyleChange = { [weak self] newStyle in
             guard let self, let session = self.editorSession else { return }
@@ -901,6 +997,7 @@ final class OverlayController {
         switch action {
         case .undo:
             session.store.undo()
+            editorWindow()?.overlayView.clampAnnotationSelection()
             toolbar?.refreshSelectionState()
             editorWindow()?.overlayView.needsDisplay = true
             Log.event(.editor, "annotate.undo", [
@@ -908,6 +1005,7 @@ final class OverlayController {
             ])
         case .redo:
             session.store.redo()
+            editorWindow()?.overlayView.clampAnnotationSelection()
             toolbar?.refreshSelectionState()
             editorWindow()?.overlayView.needsDisplay = true
             Log.event(.editor, "annotate.redo", [
@@ -1115,6 +1213,175 @@ final class OverlayController {
         CaptureSoundPlayer.play()
         Log.event(.pin, "pin.wire", ["pxW": "\(image.width)", "pxH": "\(image.height)"])
         perform(action: .cancel)   // 贴图后结束截图会话（图像已经在屏幕上）
+    }
+
+    // MARK: - 智能框选 · 悬停直达（O 取字 / P 贴图，不进编辑态）
+
+    /// 直达动作取图：窗口候选优先 SCK 单窗口截取（被遮挡也正确），
+    /// 其余一律先本地裁冻结帧（0ms、所见=所得），最后才兜底实时区域截屏。
+    private func captureImageForSmartDirect(
+        rect: CGRect,
+        on screen: NSScreen,
+        windowID: CGWindowID?
+    ) async -> CGImage? {
+        if let windowID {
+            do {
+                return try await SCKCapture.shared.captureWindow(windowID: windowID)
+            } catch {
+                Log.error(.capture, "capture.window.fail", [
+                    "err": "\(error.localizedDescription)", "src": "smart.direct",
+                ])
+                // 回退：冻结帧本地裁剪（窗口被遮挡时会截到遮挡物，但至少有结果）
+            }
+        }
+        if let frozen = cropFrozenImage(selection: rect, screen: screen) { return frozen }
+        return try? await CaptureService.captureRegion(rect, on: screen)
+    }
+
+    /// 直达动作的历史元数据：没有编辑会话、也没有标注层，只留原图与来源 App
+    private func makeSmartDirectHistoryMetadata(for image: CGImage, rect: CGRect) -> HistoryCaptureMetadata {
+        HistoryCaptureMetadata(
+            sourceApp: previousApp?.localizedName,
+            windowTitle: nil,
+            baseImage: image,
+            canvasSize: rect.size,
+            annotations: [],
+            strokeWidth: 2
+        )
+    }
+
+    /// 悬停智能框按贴图键：0ms 裁冻结帧 → 立刻收起遮罩 → 贴图上屏（不进编辑态、不闪工具栏）
+    func performSmartDirectPin(rect: CGRect, on screen: NSScreen, windowID: CGWindowID?) {
+        Log.event(.overlay, "overlay.smart.directPin", [
+            "rect": "\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))",
+            "windowID": windowID.map(String.init) ?? "none",
+        ])
+        // ⚠️ 必须先拿到 baseImage 再 end()：end() 之后会话状态就作废了
+        if windowID == nil, let frozen = cropFrozenImage(selection: rect, screen: screen) {
+            finishSmartDirectPin(image: frozen, rect: rect, on: screen)
+            return
+        }
+        let epoch = overlaySessionEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let image = await self.captureImageForSmartDirect(rect: rect, on: screen, windowID: windowID) else {
+                Log.error(.overlay, "overlay.smart.directPin.noImage", ["windowID": windowID.map(String.init) ?? "none"])
+                return
+            }
+            // 取图期间会话已被 Esc/新截图接管：丢弃迟到结果，绝不拿旧帧去贴图
+            guard self.overlaySessionEpoch == epoch else { return }
+            self.finishSmartDirectPin(image: image, rect: rect, on: screen)
+        }
+    }
+
+    private func finishSmartDirectPin(image: CGImage, rect: CGRect, on screen: NSScreen) {
+        let completion = self.completion
+        // 先裁图已完成，这里放心收遮罩；焦点暂不切走（贴图要立刻上屏，且避免闪切）
+        end(restorePreviousApp: false)
+        PinWindowController.pin(image, atGlobalRect: rect, on: screen)
+        CaptureSoundPlayer.play()
+        AppCoordinatorShared.deps?.history.record(
+            image, metadata: makeSmartDirectHistoryMetadata(for: image, rect: rect)
+        )
+        Log.event(.pin, "pin.wire", [
+            "pxW": "\(image.width)", "pxH": "\(image.height)", "src": "smart.direct",
+        ])
+        self.completion = nil
+        completion?(.cancelled)   // 唯一出口：AppCoordinator 靠它回到 .idle
+        // 贴图窗口（borderless）不接键盘：把焦点还给原 App，用户不必手动点回去
+        restoreFocusRobust()
+    }
+
+    /// 悬停智能框按取字键：0ms 裁冻结帧 → 立刻收遮罩（用户立刻看到原画面）
+    /// → 异步结构化识别 → 浮层锚在候选旁；浮层关闭后再把焦点还给原 App
+    func performSmartDirectOCR(rect: CGRect, on screen: NSScreen, windowID: CGWindowID?) {
+        Log.event(.overlay, "overlay.smart.directOCR", [
+            "rect": "\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width)),\(Int(rect.height))",
+            "windowID": windowID.map(String.init) ?? "none",
+        ])
+        // ⚠️ 必须先拿到 baseImage 再 end()：end() 之后会话状态就作废了
+        if windowID == nil, let frozen = cropFrozenImage(selection: rect, screen: screen) {
+            finishSmartDirectOCR(image: frozen, rect: rect, on: screen)
+            return
+        }
+        let epoch = overlaySessionEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let image = await self.captureImageForSmartDirect(rect: rect, on: screen, windowID: windowID) else {
+                Log.error(.overlay, "overlay.smart.directOCR.noImage", ["windowID": windowID.map(String.init) ?? "none"])
+                return
+            }
+            // 取图期间会话已被 Esc/新截图接管：丢弃迟到结果，绝不拿旧帧去取字
+            guard self.overlaySessionEpoch == epoch else { return }
+            self.finishSmartDirectOCR(image: image, rect: rect, on: screen)
+        }
+    }
+
+    private func finishSmartDirectOCR(image: CGImage, rect: CGRect, on screen: NSScreen) {
+        let completion = self.completion
+        // 先裁图已完成，这里放心收遮罩（浮层不需要遮罩与工具栏）
+        end(restorePreviousApp: false)
+        AppCoordinatorShared.deps?.history.record(
+            image, metadata: makeSmartDirectHistoryMetadata(for: image, rect: rect)
+        )
+        Log.event(.ocr, "ocr.start", [
+            "pxW": "\(image.width)", "pxH": "\(image.height)", "src": "smart.direct",
+        ])
+        self.completion = nil
+        completion?(.cancelled)   // 唯一出口：AppCoordinator 靠它回到 .idle
+        guard let recognizer = AppCoordinatorShared.deps?.textRecognizer else {
+            restoreFocusRobust()
+            return
+        }
+        Task { @MainActor [weak self] in
+            let result = (try? await recognizer.recognizeStructured(image))
+                ?? StructuredOCRResult(
+                    plainText: "",
+                    qrCodes: [],
+                    markdownTable: nil,
+                    tableRowCount: 0,
+                    tableColumnCount: 0
+                )
+            guard let self else { return }
+            // 直达取字没有工具栏，无避让矩形（`avoidRect: nil`）
+            OCRResultPanel.present(result: result, nearGlobalRect: rect, on: screen, avoidRect: nil)
+            self.restoreFocusAfterSmartDirectOCRPanelCloses()
+            Log.event(.ocr, "ocr.present", [
+                "chars": "\(result.plainText.count)",
+                "qrs": "\(result.qrCodes.count)",
+                "table": result.markdownTable != nil ? "\(result.tableRowCount)x\(result.tableColumnCount)" : "none",
+                "src": "smart.direct",
+            ])
+        }
+    }
+
+    /// 直达取字的浮层关闭监听（`end()` 已把事件循环还给原 App 但不抢焦点）：
+    /// 浮层收走后把键盘焦点优雅还给原 App，而不是让 App 挂着激活却无 key 窗口。
+    private var smartDirectOCRCloseObserver: Any?
+
+    private func restoreFocusAfterSmartDirectOCRPanelCloses() {
+        smartDirectOCRCloseObserver.map { NotificationCenter.default.removeObserver($0) }
+        smartDirectOCRCloseObserver = nil
+        guard let panel = NSApp.keyWindow, panel !== editorWindow() else {
+            Log.event(.overlay, "overlay.smart.directOCR.noPanel")
+            restoreFocusRobust()
+            return
+        }
+        // 会话代际快照：取字浮层开着时用户又按 F1 开新截图 ⇒ 旧回调必须失效，
+        // 否则会把焦点从新会话的遮罩窗抢走
+        let epoch = overlaySessionEpoch
+        smartDirectOCRCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification, object: panel, queue: .main
+        ) { [weak self, weak panel] _ in
+            MainActor.assumeIsolated {
+                // 面板只是暂时失去 key（用户点了别的窗口）不动作；真的收走了才归还焦点
+                guard let panel, !panel.isVisible else { return }
+                guard let self, self.overlaySessionEpoch == epoch else { return }
+                self.smartDirectOCRCloseObserver.map { NotificationCenter.default.removeObserver($0) }
+                self.smartDirectOCRCloseObserver = nil
+                self.restoreFocusRobust()
+            }
+        }
     }
 
     /// 工具栏可见性切换（快捷键 H 走这里）
@@ -1837,8 +2104,13 @@ final class OverlayController {
     func undoAnnotation() { toolbarAction(.undo) }
     func redoAnnotation() { toolbarAction(.redo) }
 
-    /// 热键切工具后刷新工具栏选中态
+    /// 热键切工具 / 标注选中态变化后刷新工具栏（含 `.none` 选择态的样式胶囊显隐）
     func refreshToolbar() {
+        if let view = editorWindow()?.overlayView {
+            toolbar?.annotationSelectionActive = view.hasSelectedAnnotation
+        } else {
+            toolbar?.annotationSelectionActive = false
+        }
         toolbar?.refreshSelectionState()
     }
 
@@ -1936,6 +2208,8 @@ final class OverlayController {
     }
 
     private func enterRecordingPreparing(format: RecordingFormat, rect: CGRect, screen: NSScreen) {
+        // 录屏准备态不再需要智能框选：释放 AX 会话租约
+        endSmartSessionIfNeeded()
         teardownRecordingSession()
         var opts = AppCoordinatorShared.coordinator?.settings.recordingOptions ?? RecordingOptions()
         opts.format = format

@@ -107,11 +107,18 @@ final class DraggableAppIconView: NSImageView {
 @MainActor
 final class PanelContentView: NSView {
     private unowned let overlay: PermissionDragOverlay
+    /// 浮窗服务的权限目标（文案与落点提示按它分流）
+    private let target: PermissionDragOverlay.TargetPermission
     private var title: NSTextField!
     private var subtitle: NSTextField!
 
-    init(frame frameRect: NSRect, overlay: PermissionDragOverlay) {
+    init(
+        frame frameRect: NSRect,
+        overlay: PermissionDragOverlay,
+        target: PermissionDragOverlay.TargetPermission = .screenRecording
+    ) {
         self.overlay = overlay
+        self.target = target
         super.init(frame: frameRect)
         buildSubviews()
     }
@@ -138,20 +145,26 @@ final class PanelContentView: NSView {
         )
         addSubview(icon)
 
-        // 文案（右侧）
+        // 文案（右侧）——宽度：图标列 76 + 最大一行 140pt + 右侧 12pt 安全边
+        // （实测「拖我到「辅助功能」列表」125.5pt @12pt、「已添加 ✓ 重启 Snapcut
+        // 后生效」139.7pt @10pt；宽度不够会被裁切）
         let textX: CGFloat = 76
-        let titleLabel = NSTextField(labelWithString: "拖我到「屏幕录制」列表")
+        let textWidth = bounds.width - textX - 12
+        let titleLabel = NSTextField(labelWithString: titleText)
         titleLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         titleLabel.textColor = .labelColor
-        titleLabel.frame = NSRect(x: textX, y: bounds.midY + 2, width: bounds.width - textX - 24, height: 16)
-        titleLabel.lineBreakMode = .byWordWrapping
+        titleLabel.frame = NSRect(x: textX, y: bounds.midY + 2, width: textWidth, height: 16)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
         addSubview(titleLabel)
         title = titleLabel
 
-        let subtitleLabel = NSTextField(labelWithString: "松手即完成授权")
+        let subtitleLabel = NSTextField(labelWithString: subtitleText)
         subtitleLabel.font = NSFont.systemFont(ofSize: 10)
         subtitleLabel.textColor = .secondaryLabelColor
-        subtitleLabel.frame = NSRect(x: textX, y: bounds.midY - 14, width: bounds.width - textX - 24, height: 13)
+        subtitleLabel.frame = NSRect(x: textX, y: bounds.midY - 14, width: textWidth, height: 13)
+        subtitleLabel.lineBreakMode = .byTruncatingTail
+        subtitleLabel.maximumNumberOfLines = 1
         addSubview(subtitleLabel)
         subtitle = subtitleLabel
 
@@ -167,14 +180,36 @@ final class PanelContentView: NSView {
         addSubview(close)
     }
 
+    /// 初始文案：两档目标各自的拖拽诉求不同
+    private var titleText: String {
+        switch target {
+        case .screenRecording: return "拖我到「屏幕录制」列表"
+        case .accessibility: return "拖我到「辅助功能」列表"
+        }
+    }
+
+    private var subtitleText: String {
+        switch target {
+        case .screenRecording: return "松手即完成授权"
+        case .accessibility: return "拖入并打开开关即可生效"
+        }
+    }
+
     @objc private func closeTapped() {
         overlay.dismiss()
     }
 
-    /// 拖放完成：切换成「已添加，重启生效」提示（App 图标变对勾态）
+    /// 拖放完成：切换成「已添加」提示（App 图标变对勾态/口吻）
+    /// 录屏需重启才生效；辅助功能把开关打开就即时生效，不能误导用户重启
     func updateForDropped() {
-        subtitle.stringValue = "已添加 ✓ 重启 Snapcut 后生效"
+        switch target {
+        case .screenRecording:
+            title.stringValue = "权限已添加，重启即完成"
+            subtitle.stringValue = "已添加 ✓ 重启 Snapcut 后生效"
+        case .accessibility:
+            title.stringValue = "已添加到辅助功能"
+            subtitle.stringValue = "打开开关即生效，无需重启"
+        }
         subtitle.textColor = .systemGreen
-        title.stringValue = "权限已添加，重启即完成"
     }
 }
