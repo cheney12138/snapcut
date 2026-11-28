@@ -34,6 +34,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var permBadgeLabel: NSTextField?
     private var permButtonRef: GlassMiniButton?
     private var permSubtitleLabel: NSTextField?
+    // 辅助功能权限（智能框选表格/控件/网页元素用）
+    private var axPermDot: NSView?
+    private var axPermPill: NSView?
+    private var axPermBadgeLabel: NSTextField?
+    private var axPermButtonRef: GlassMiniButton?
+    private var axPermSubtitleLabel: NSTextField?
     private var updateSwitch: GlassSwitch!
     private var updateSubtitleLabel: NSTextField!
 
@@ -470,13 +476,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             ]
         )
 
-        let contentStack = makePageStack(header: header, sections: [
+        installFixedHeaderPage(header: header, sections: [
             startupSection,
             captureSection,
             historySection,
             notifySection,
-        ])
-        pinScrollable(contentStack, to: generalPane)
+        ], into: generalPane)
     }
 
     // MARK: - 2. 工具栏 Tab
@@ -544,11 +549,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             card: orderCard
         )
 
-        let contentStack = makePageStack(header: header, sections: [
+        installFixedHeaderPage(header: header, sections: [
             appearanceSection,
             orderSection,
-        ])
-        pinScrollable(contentStack, to: toolbarPane)
+        ], into: toolbarPane)
     }
 
     private func populateToolbarOrderRows(into stack: NSStackView) {
@@ -839,13 +843,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             rows: editorRows
         )
 
-        let contentStack = makePageStack(header: header, sections: [
+        installFixedHeaderPage(header: header, sections: [
             hintBanner,
             globalSection,
             spotlightSection,
             editorSection,
-        ])
-        pinScrollable(contentStack, to: hotkeyPane)
+        ], into: hotkeyPane)
     }
 
     /// 双列热键单元：固定 221pt 宽，左侧标签 + 弹性空隙 + 右对齐 96pt 录制器（列内严格对齐）
@@ -1005,35 +1008,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ])
 
         // 权限状态卡（整行左文案右状态胶囊，彻底消除居中偏斜）
-        let dot = NSView()
-        dot.wantsLayer = true
-        dot.layer?.cornerRadius = 3.5
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        dot.widthAnchor.constraint(equalToConstant: 7).isActive = true
-        dot.heightAnchor.constraint(equalToConstant: 7).isActive = true
-        permDot = dot
-
-        let badgeLabel = NSTextField(labelWithString: "检查中…")
-        badgeLabel.font = .systemFont(ofSize: 11.5, weight: .semibold)
-        badgeLabel.translatesAutoresizingMaskIntoConstraints = false
-        permBadgeLabel = badgeLabel
-
-        let pill = NSView()
-        pill.wantsLayer = true
-        pill.layer?.cornerRadius = 11
-        pill.layer?.cornerCurve = .continuous
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        pill.addSubview(dot)
-        pill.addSubview(badgeLabel)
-        NSLayoutConstraint.activate([
-            pill.heightAnchor.constraint(equalToConstant: 22),
-            dot.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 9),
-            dot.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-            badgeLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
-            badgeLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -10),
-            badgeLabel.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-        ])
-        permPill = pill
+        let (permPillView, permDotView, permBadge) = makeStatusPill(initialText: "检查中…")
+        permDot = permDotView
+        permBadgeLabel = permBadge
+        permPill = permPillView
 
         let permButton = GlassMiniButton(title: "去授权…")
         permButton.target = self
@@ -1043,14 +1021,34 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let (permRow, permSub) = settingRowWithMutableSubtitle(
             "屏幕录制权限",
             initialSubtitle: "权限正常，全局热键随时可用",
-            trailing: [pill, permButton]
+            trailing: [permPillView, permButton]
         )
         permSubtitleLabel = permSub
+
+        // 辅助功能权限行（智能框选表格/控件/网页元素的 AX 探测用；
+        // 未授权不影响截图，只降级为纯视觉识别，所以文案要说明后果而不是「必须」）
+        let (axPillView, axDotView, axBadge) = makeStatusPill(initialText: "检查中…")
+        axPermDot = axDotView
+        axPermBadgeLabel = axBadge
+        axPermPill = axPillView
+
+        let axButton = GlassMiniButton(title: "去授权…")
+        axButton.target = self
+        axButton.action = #selector(openAccessibilityPermissionSettings)
+        axPermButtonRef = axButton
+
+        let (axRow, axSub) = settingRowWithMutableSubtitle(
+            "辅助功能权限",
+            initialSubtitle: "开启后可识别表格与网页元素；未开启仅用视觉识别",
+            trailing: [axPillView, axButton]
+        )
+        axPermSubtitleLabel = axSub
+
         let permSection = makeSection(
             title: "系统权限",
             symbol: "checkmark.shield.fill",
             tint: NSColor(srgbRed: 0.06, green: 0.68, blue: 0.44, alpha: 1),
-            rows: [permRow]
+            rows: [permRow, axRow]
         )
 
         // 更新卡
@@ -1081,12 +1079,11 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             rows: [checkRow, autoCheckRow]
         )
 
-        let contentStack = makePageStack(header: header, sections: [
+        installFixedHeaderPage(header: header, sections: [
             heroCard,
             permSection,
             updateSection,
-        ])
-        pinScrollable(contentStack, to: aboutPane)
+        ], into: aboutPane)
         refreshPermissionStatus()
     }
 
@@ -1210,6 +1207,42 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         TCCPermission.openSystemSettings()
     }
 
+    /// 用户主动点击「去授权…」才请求（全局纪律：绝不在启动/悬停路径弹系统模态框）
+    @objc private func openAccessibilityPermissionSettings() {
+        AccessibilityPermission.requestAndOpenSettings()
+    }
+
+    /// 状态胶囊（7pt 圆点 + 11.5pt 文案，22pt 高）。圆点/文案由调用方持引用动态刷新。
+    private func makeStatusPill(initialText: String) -> (pill: NSView, dot: NSView, label: NSTextField) {
+        let dot = NSView()
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3.5
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.widthAnchor.constraint(equalToConstant: 7).isActive = true
+        dot.heightAnchor.constraint(equalToConstant: 7).isActive = true
+
+        let badgeLabel = NSTextField(labelWithString: initialText)
+        badgeLabel.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        badgeLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 11
+        pill.layer?.cornerCurve = .continuous
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(dot)
+        pill.addSubview(badgeLabel)
+        NSLayoutConstraint.activate([
+            pill.heightAnchor.constraint(equalToConstant: 22),
+            dot.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 9),
+            dot.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+            badgeLabel.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 5),
+            badgeLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -10),
+            badgeLabel.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+        ])
+        return (pill, dot, badgeLabel)
+    }
+
     @MainActor
     private func refreshPermissionStatus() {
         let granted = AppCoordinatorShared.deps?.permission.isGranted() ?? false
@@ -1230,6 +1263,25 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             permSubtitleLabel?.stringValue = "未授权时无法截屏；授权后需重启 Snapcut"
             Log.event(.app, "settings.permission", ["state": "denied"])
         }
+
+        // 辅助功能权限：只查不弹（AXIsProcessTrusted 不触发任何系统弹窗）
+        let axGranted = AccessibilityPermission.isTrusted()
+        if axGranted {
+            axPermDot?.layer?.backgroundColor = DesignTokens.statusOK.cgColor
+            axPermBadgeLabel?.stringValue = "已授权"
+            axPermBadgeLabel?.textColor = NSColor(srgbRed: 0.08, green: 0.56, blue: 0.22, alpha: 1)
+            axPermPill?.layer?.backgroundColor = DesignTokens.statusOK.withAlphaComponent(0.14).cgColor
+            axPermButtonRef?.isHidden = true
+            axPermSubtitleLabel?.stringValue = "权限正常，智能框选可精准识别表格、控件与网页区块"
+        } else {
+            axPermDot?.layer?.backgroundColor = DesignTokens.statusWarn.cgColor
+            axPermBadgeLabel?.stringValue = "未授权"
+            axPermBadgeLabel?.textColor = NSColor(srgbRed: 0.72, green: 0.40, blue: 0.0, alpha: 1)
+            axPermPill?.layer?.backgroundColor = DesignTokens.statusWarn.withAlphaComponent(0.15).cgColor
+            axPermButtonRef?.isHidden = false
+            axPermSubtitleLabel?.stringValue = "开启后可识别表格与网页元素；未开启仅用视觉识别"
+        }
+        Log.event(.app, "settings.permission.accessibility", ["state": axGranted ? "granted" : "denied"])
     }
 
     @MainActor
@@ -1489,7 +1541,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         row.alignment = .centerY
         row.spacing = 12
         row.translatesAutoresizingMaskIntoConstraints = false
-        row.widthAnchor.constraint(equalToConstant: Self.cardWidth).isActive = true
+        // 宽度不在这里钉死：页头现在被 installFixedHeaderPage 直接左右贴 pane
+        // （pane 宽 544 - 两侧 28 = 488 = cardWidth），再叠一条常量宽度只会白多一条等价约束。
         return row
     }
 
@@ -1673,22 +1726,20 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return spacer
     }
 
-    private func makePageStack(header: NSView, sections: [NSView]) -> NSStackView {
-        let outer = NSStackView(views: [header] + sections)
-        outer.orientation = .vertical
-        outer.alignment = .leading
-        outer.spacing = 14
-        outer.setCustomSpacing(16, after: header)
-        outer.edgeInsets = NSEdgeInsets(
-            top: 40,
-            left: Self.contentPaddingH,
-            bottom: 24,
-            right: Self.contentPaddingH
-        )
-        return outer
-    }
+    /// 固定页头 + 只滚卡片区。
+    ///
+    /// 页头（大标题 / 副标题 / 可选右侧按钮）钉死在 pane 顶部 `46pt`——与左侧栏「设置」
+    /// 大标题（`titleLabel.top == sidebar.top + 46`）严格同一基线，四个 Tab 切来切去顶部都不跑；
+    /// 页头下方 14pt 一条 0.5pt 发丝线，再往下才是 `NSScrollView`，只有设置卡片会滚，
+    /// 长页面滚到顶也不会把标题推进红绿灯区域。
+    private func installFixedHeaderPage(header: NSView, sections: [NSView], into pane: NSView) {
+        header.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(header)
 
-    private func pinScrollable(_ stack: NSStackView, to pane: NSView) {
+        let hairline = SettingsHairlineView()
+        hairline.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(hairline)
+
         let scroll = NSScrollView()
         scroll.drawsBackground = false
         scroll.borderType = .noBorder
@@ -1697,17 +1748,41 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         scroll.autohidesScrollers = true
         scroll.scrollerStyle = .overlay
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        // .fullSizeContentView 窗口下系统会自动往 scrollView 顶部塞约 28pt contentInset，
+        // 不关掉的话卡片区凭空下坠一截，页头与卡片之间的间距就变成「随系统版本漂移」的量。
+        scroll.automaticallyAdjustsContentInsets = false
+        scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+        pane.addSubview(scroll)
+
+        let content = NSStackView(views: sections)
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 14
+        content.edgeInsets = NSEdgeInsets(
+            top: 14,
+            left: Self.contentPaddingH,
+            bottom: 24,
+            right: Self.contentPaddingH
+        )
+        content.translatesAutoresizingMaskIntoConstraints = false
 
         let doc = SettingsFlippedDocumentView()
         doc.translatesAutoresizingMaskIntoConstraints = false
-        doc.addSubview(stack)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
+        doc.addSubview(content)
         scroll.documentView = doc
-        pane.addSubview(scroll)
 
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: pane.topAnchor),
+            // 页头：与左侧「设置」大标题（46pt）水平齐平
+            header.topAnchor.constraint(equalTo: pane.topAnchor, constant: 46),
+            header.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: Self.contentPaddingH),
+            header.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -Self.contentPaddingH),
+
+            hairline.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
+            hairline.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: Self.contentPaddingH),
+            hairline.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -Self.contentPaddingH),
+            hairline.heightAnchor.constraint(equalToConstant: 0.5),
+
+            scroll.topAnchor.constraint(equalTo: hairline.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
@@ -1716,10 +1791,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             doc.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
 
-            stack.topAnchor.constraint(equalTo: doc.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
-            stack.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
+            content.topAnchor.constraint(equalTo: doc.topAnchor),
+            content.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
         ])
     }
 

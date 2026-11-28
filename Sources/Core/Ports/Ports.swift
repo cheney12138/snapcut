@@ -187,6 +187,55 @@ public protocol ScreenRecording: AnyObject {
     func cancel() async
 }
 
+// MARK: - 录屏后处理（头尾裁剪 / MP4 → GIF）
+
+/// 录制产物后处理端口（裁剪与转 GIF 都是「拿一个文件换另一个文件」）。
+/// 适配器：`VideoPostProcessor`（AVFoundation + ImageIO）
+///
+/// 为什么独立于 `ScreenRecording`：录制会话有生命周期与实时状态，后处理是纯文件变换，
+/// 可以在录制结束很久之后（甚至对历史文件）独立调用，两者混在一个端口里会让
+/// 内存录制器背上传导出责任。
+public protocol VideoPostProcessing: Sendable {
+    /// 裁剪 MP4 头尾：输出新文件到 destinationURL
+    ///
+    /// - 若 `destinationURL` 与 `sourceURL` 相同：实现必须先写同目录临时文件再原子替换
+    ///   （直接就地写会读到正在被自己截断的文件，产出损坏视频）
+    /// - 优先无损快裁（passthrough），失败时实现可降级重导出
+    func trimMP4(
+        sourceURL: URL,
+        range: VideoTrimRange,
+        destinationURL: URL
+    ) async throws -> RecordingResult
+
+    /// 将 MP4（或其中指定裁剪区间）转为循环 GIF，回调进度 0...1
+    func convertMP4ToGIF(
+        sourceURL: URL,
+        range: VideoTrimRange,
+        options: GIFConversionOptions,
+        destinationURL: URL,
+        onProgress: (@Sendable (Double) -> Void)?
+    ) async throws -> RecordingResult
+}
+
+public extension VideoPostProcessing {
+    /// 不关心进度的调用点用这个重载（协议要求不能带默认参数，
+    /// 所以用协议扩展把 `onProgress` 变成真正可选）
+    func convertMP4ToGIF(
+        sourceURL: URL,
+        range: VideoTrimRange,
+        options: GIFConversionOptions,
+        destinationURL: URL
+    ) async throws -> RecordingResult {
+        try await convertMP4ToGIF(
+            sourceURL: sourceURL,
+            range: range,
+            options: options,
+            destinationURL: destinationURL,
+            onProgress: nil
+        )
+    }
+}
+
 // MARK: - 自动更新
 
 /// 应用更新端口。适配器：`SparkleUpdater`（Sparkle 2 + EdDSA 签名的 appcast）
@@ -204,6 +253,79 @@ public protocol AppUpdating: AnyObject {
     var lastCheckDescription: String? { get }
 }
 
+// MARK: - 智能框选
+
+/// 视觉识别快照：一次截屏后 Vision 给出的文本行与视觉矩形（均为 AppKit 全局坐标，Y 向上）。
+///
+/// 为什么打成快照而不是让端口按需回调：智能框选要靠鼠标移动高频取候选，
+/// 每次移动都重新跑一遍 Vision 会卡主线程；正确做法是「截一次屏 → 出一份快照 →
+/// 之后纯几何查询」。快照只承载坐标，不承载图像，跨并发安全。
+public struct SmartVisionSnapshot: Sendable, Equatable {
+    /// 文本行矩形（全局 Y-up）
+    public let textLines: [CGRect]
+    /// 版面视觉矩形（全局 Y-up）
+    public let visualRects: [CGRect]
+    /// 视觉表格结构（整表 / 行 / 列 / 单元格，全局 Y-up）
+    public let visualTables: [DetectedVisualTable]
+
+    public init(
+        textLines: [CGRect],
+        visualRects: [CGRect],
+        visualTables: [DetectedVisualTable] = []
+    ) {
+        self.textLines = textLines
+        self.visualRects = visualRects
+        self.visualTables = visualTables
+    }
+
+    public static let empty = SmartVisionSnapshot(textLines: [], visualRects: [])
+}
+
+/// 辅助功能元素探测端口。适配器：`AXElementProber`（ApplicationServices / AXUIElement）
+///
+/// 会话纪律：`beginSession()` / `endSession()` 成对包住一次框选交互（拖动期间
+/// 高频 hit-test 不该每次都重新建立 AX 连接；退出交互必须及时释放，否则会影响
+/// 目标 App 的响应）。
+public protocol SmartElementProbing: Sendable {
+    /// 是否已获得辅助功能授权（只查不弹，弹窗由引导流程负责）
+    func isAccessibilityTrusted() -> Bool
+    /// 开始一次交互会话（可重复调用，实现需幂等）
+    func beginSession()
+    /// 结束会话并释放资源
+    func endSession()
+    /// 探测光标处的 AX 元素链（由内到外），返回全局 Y-up 坐标候选。
+    /// - Parameters:
+    ///   - point: 全局坐标（Y 向上）
+    ///   - mainScreenHeight: 主屏高度，用于把 AX 的 Y-down 转成 Y-up（多屏/异形屏由适配器统一处理）
+    ///   - pid: 需要排除的进程（通常是 Snapcut 自己，避免框到自己）
+    func probe(
+        atGlobalPoint point: CGPoint,
+        mainScreenHeight: CGFloat,
+        excludingPID pid: Int32
+    ) async -> [SmartSelectionCandidate]
+}
+
+/// 视觉版面识别端口。适配器：`VisionLayoutDetector`（Vision，本地离线）
+///
+/// 返回的矩形一律是 AppKit 全局坐标（Y 向上），像素 → 全局的换算在适配器内完成。
+public protocol SmartVisionDetecting: Sendable {
+    /// 识别文本行（用于「先选一行字」的默认层级）
+    func detectTextLines(in image: CGImage, screenFrame: CGRect) async -> [CGRect]
+    /// 识别版面视觉矩形（卡片/图片/分区块，用于 AX 不可用时的兜底）
+    func detectVisualRects(in image: CGImage, screenFrame: CGRect) async -> [CGRect]
+    /// 识别表格结构（整表 / 行 / 列 / 单元格）。
+    /// - Parameters:
+    ///   - image: 整屏截图
+    ///   - screenFrame: 该屏全局 frame（像素 → 全局坐标换算用）
+    ///   - candidateRects: 候选区域（视觉矩形），限定在这些区域内找横竖线，避免全图开销与误检
+    /// - Returns: 全局 Y-up 坐标的表格结构；未识别到返回空数组
+    func detectVisualTables(
+        in image: CGImage,
+        screenFrame: CGRect,
+        candidateRects: [CGRect]
+    ) async -> [DetectedVisualTable]
+}
+
 // MARK: - 依赖容器（合成根用）
 
 /// 依赖集合：只在合成根（`AppCoordinator`）构造一次，向下注入。
@@ -219,6 +341,9 @@ public struct Dependencies {
     public let pinning: PinningPresenting
     public let updating: AppUpdating
     public let recording: ScreenRecording
+    public let smartElementProber: SmartElementProbing
+    public let smartVisionDetector: SmartVisionDetecting
+    public let videoPostProcessor: any VideoPostProcessing
 
     public init(
         screen: ScreenCapturing,
@@ -229,7 +354,10 @@ public struct Dependencies {
         permission: ScreenPermissionChecking,
         pinning: PinningPresenting,
         updating: AppUpdating,
-        recording: ScreenRecording
+        recording: ScreenRecording,
+        smartElementProber: SmartElementProbing,
+        smartVisionDetector: SmartVisionDetecting,
+        videoPostProcessor: any VideoPostProcessing
     ) {
         self.screen = screen
         self.clipboard = clipboard
@@ -240,5 +368,8 @@ public struct Dependencies {
         self.pinning = pinning
         self.updating = updating
         self.recording = recording
+        self.smartElementProber = smartElementProber
+        self.smartVisionDetector = smartVisionDetector
+        self.videoPostProcessor = videoPostProcessor
     }
 }

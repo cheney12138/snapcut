@@ -21,6 +21,8 @@ final class HistorySpotlightPanel: NSObject {
         var onReopenEdit: @MainActor (HistoryRecord) -> Void
         var onPin: @MainActor (HistoryRecord) -> Void
         var onCopyOCRText: @MainActor (HistoryRecord) -> Void
+        /// 记录主图片的文件路径（拖出到第三方 App 用）；未注入或文件已清则卡片不可拖出
+        var fileURLForRecord: (@MainActor (HistoryRecord) -> URL?)? = nil
         var onDismiss: (@MainActor () -> Void)?
 
         init(
@@ -31,6 +33,7 @@ final class HistorySpotlightPanel: NSObject {
             onReopenEdit: @escaping @MainActor (HistoryRecord) -> Void,
             onPin: @escaping @MainActor (HistoryRecord) -> Void,
             onCopyOCRText: @escaping @MainActor (HistoryRecord) -> Void,
+            fileURLForRecord: (@MainActor (HistoryRecord) -> URL?)? = nil,
             onDismiss: (@MainActor () -> Void)? = nil
         ) {
             self.loadRecords = loadRecords
@@ -40,6 +43,7 @@ final class HistorySpotlightPanel: NSObject {
             self.onReopenEdit = onReopenEdit
             self.onPin = onPin
             self.onCopyOCRText = onCopyOCRText
+            self.fileURLForRecord = fileURLForRecord
             self.onDismiss = onDismiss
         }
     }
@@ -96,6 +100,8 @@ final class HistorySpotlightPanel: NSObject {
 
     private var isPresented = false
     private var isContextMenuOpen = false
+    /// 卡片拖出会话进行中：挂起「失焦/外部点击自动关闭」，否则一拖出面板就没了
+    private var isDragSuspended = false
     private var presentationEpoch = 0
     private var previousApp: NSRunningApplication?
     private var previousAppPID: Int?
@@ -647,6 +653,9 @@ final class HistorySpotlightPanel: NSObject {
                 self?.selectCard(at: idx, ensureVisible: false)
                 self?.presentContextMenu(for: idx, event: event, in: sourceView)
             }
+            card.onBeginDrag = { [weak self] idx, event, sourceView in
+                self?.beginCardDragOut(at: idx, event: event, from: sourceView)
+            }
             gridDocumentView.addSubview(card)
             cardPool.append(card)
         }
@@ -858,6 +867,50 @@ final class HistorySpotlightPanel: NSObject {
         Log.event(.history, "spotlight.action.copyOCR", ["id": record.id])
     }
 
+    // MARK: - 卡片拖出（功能 #2「随手拖拽出图」）
+
+    /// 卡片拖出：把该记录的**原图文件**拖给 Finder / 飞书 / Slack / 微信 等。
+    ///
+    /// 会话进行中挂起「失焦/外部点击自动关闭」（`isDragSuspended` + 底座 isDragging 双闸），
+    /// 否则拖到一半面板自己消失；拖放成功才优雅关闭面板，取消则原样留着。
+    private func beginCardDragOut(at index: Int, event: NSEvent, from view: NSView) {
+        guard matches.indices.contains(index) else { return }
+        let record = matches[index].record
+        guard let fileURL = callbacks?.fileURLForRecord?(record) else {
+            // 没注入 / 文件已被清理：静默不动（拖出一事不能把面板或记录弄脏）
+            Log.event(.history, "spotlight.drag.skip", ["id": record.id])
+            return
+        }
+
+        isDragSuspended = true
+        let started = ImageDragCoordinator.shared.beginFileDrag(
+            fileURL: fileURL,
+            previewImage: thumbnailCache[record.id],
+            from: view,
+            event: event,
+            onEnd: { [weak self] dropped in
+                guard let self else { return }
+                self.isDragSuspended = false
+                guard dropped else {
+                    Log.event(.history, "spotlight.drag.cancel", ["id": record.id])
+                    return
+                }
+                Log.event(.history, "spotlight.drag.done", ["id": record.id])
+                // 拖放成功 = 本轮任务完成，面板优雅退场（还原上一个 App 焦点）
+                self.dismiss()
+            }
+        )
+        if !started {
+            isDragSuspended = false
+            Log.error(.history, "spotlight.drag.fail", ["id": record.id])
+        }
+    }
+
+    /// 拖拽会话进行中（自己发起或任意模块发起）：一切自动关闭都要让路
+    private var isDragSessionActive: Bool {
+        isDragSuspended || ImageDragCoordinator.shared.isDragging
+    }
+
     // MARK: - 右键菜单
 
     private func presentContextMenu(for index: Int, event: NSEvent, in view: NSView) {
@@ -1054,6 +1107,8 @@ final class HistorySpotlightPanel: NSObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isVisible, !self.isContextMenuOpen else { return }
+                // 拖出会话进行中不关：否则拖到一半面板就消失了
+                guard !self.isDragSessionActive else { return }
                 self.dismissInternal(restoreFocus: false, notifyDismiss: true)
             }
         }
@@ -1133,6 +1188,7 @@ final class HistorySpotlightPanel: NSObject {
         guard isPresented || (panel?.isVisible ?? false) else { return }
         isPresented = false
         isContextMenuOpen = false
+        isDragSuspended = false
         presentationEpoch += 1
         let epoch = presentationEpoch
 
@@ -1203,6 +1259,8 @@ final class HistorySpotlightPanel: NSObject {
 extension HistorySpotlightPanel: NSWindowDelegate {
     func windowDidResignKey(_ notification: Notification) {
         guard isVisible, !isContextMenuOpen else { return }
+        // 拖出会话进行中（焦点交给接收方 App）不关：否则拖到一半面板就消失了
+        guard !isDragSessionActive else { return }
         dismissInternal(restoreFocus: true, notifyDismiss: true)
     }
 }
@@ -1651,9 +1709,19 @@ private final class SpotlightEmptyStateView: NSView {
 
 @MainActor
 private final class HistoryCardView: NSView {
+    /// 起拖位移阈值：< 6pt 算单击（选卡片），≥ 6pt 算拖出文件
+    private static let dragThreshold: CGFloat = 6
+
     var onSelect: ((Int) -> Void)?
     var onDoubleClick: ((Int) -> Void)?
     var onRightClick: ((Int, NSEvent, NSView) -> Void)?
+    /// 拖出：位移 ≥6pt 时交给面板拿记录文件路径并发起原生文件拖拽
+    var onBeginDrag: ((Int, NSEvent, NSView) -> Void)?
+
+    /// 按下点（卡片坐标）与按下事件（起拖热点用）
+    private var pressOrigin: CGPoint?
+    private var pressEvent: NSEvent?
+    private var dragStarted = false
 
     private var index: Int = 0
     private var currentRecordID: String?
@@ -1861,11 +1929,31 @@ private final class HistoryCardView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        // 按下只记录起点：拖动判定推到 mouseDragged（拖出文件 / 单击选中 / 双击复制三条路不打架）
+        pressOrigin = convert(event.locationInWindow, from: nil)
+        pressEvent = event
+        dragStarted = false
         if event.clickCount >= 2 {
             onDoubleClick?(index)
         } else {
             onSelect?(index)
         }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let origin = pressOrigin, let startEvent = pressEvent, !dragStarted else { return }
+        let current = convert(event.locationInWindow, from: nil)
+        guard hypot(current.x - origin.x, current.y - origin.y) >= Self.dragThreshold else { return }
+        dragStarted = true
+        // 交给面板：它知道当前记录与它的原图文件路径（UI 层不直连 HistoryStore）
+        onBeginDrag?(index, startEvent, self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        pressOrigin = nil
+        pressEvent = nil
+        dragStarted = false
+        super.mouseUp(with: event)
     }
 
     override func rightMouseDown(with event: NSEvent) {

@@ -206,6 +206,72 @@ final class AnnotationStore {
         return false
     }
 
+    // MARK: - 已画标注二次编辑（拖拽预览 / 单步提交 / 删除 / 改样式）
+
+    /// 拖拽实时预览：只原地替换，不压撤销栈（一帧一个快照会把 200 步栈瞬间冲干净）
+    ///
+    /// 生命周期：mouseDown 记 `snapshot = annotations` → 每帧 previewReplace → mouseUp 调
+    /// commitMutation(previousAnnotations: snapshot)，整段拖拽只占一个撤销步。
+    func previewReplace(at index: Int, with annotation: AnnotationModel) {
+        guard annotations.indices.contains(index) else { return }
+        annotations[index] = annotation
+    }
+
+    /// 拖拽结束提交：只有真发生了变化才把「拖拽前快照」压栈（单步 ⌘Z 撤回整段拖拽）
+    func commitMutation(previousAnnotations: [AnnotationModel]) {
+        guard annotations != previousAnnotations else { return }
+        undoStack.append(previousAnnotations)
+        redoStack.removeAll()
+        if undoStack.count > 200 { undoStack.removeFirst() }
+    }
+
+    /// 单步替换（改字 / 改色 / 改粗 / 微调几何）：与当前值无差异时不污染撤销栈
+    func replace(at index: Int, with annotation: AnnotationModel) {
+        guard annotations.indices.contains(index), annotations[index] != annotation else { return }
+        pushUndo()
+        annotations[index] = annotation
+    }
+
+    /// 删除某条标注（压入撤销栈，误删可 ⌘Z 恢复）；越界返回 false
+    @discardableResult
+    func remove(at index: Int) -> Bool {
+        guard annotations.indices.contains(index) else { return false }
+        pushUndo()
+        annotations.remove(at: index)
+        return true
+    }
+
+    /// 修改选中标注的样式（颜色 / 线宽 / 字号）；只有实际变化才压栈并返回 true
+    ///
+    /// 颜色按**调色板生效值**比较（colorIndex 取模后同色视为无变化），线宽按 0.01pt 容差（float 噪声不计）。
+    @discardableResult
+    func updateStyle(
+        at index: Int,
+        colorIndex: Int? = nil,
+        strokeWidth: CGFloat? = nil,
+        fontSize: CGFloat? = nil
+    ) -> Bool {
+        guard annotations.indices.contains(index) else { return false }
+        let current = annotations[index]
+        var updated = current
+        if let colorIndex {
+            // 取模归一（防负索引越界），与 AnnotationModel.color 同一映射
+            let slot = ((colorIndex % AnnotationModel.palette.count) + AnnotationModel.palette.count)
+                % AnnotationModel.palette.count
+            if AnnotationModel.palette[slot] != current.color { updated.colorIndex = colorIndex }
+        }
+        if let strokeWidth, abs(strokeWidth - current.strokeWidth) > 0.01 {
+            updated.strokeWidth = strokeWidth
+        }
+        if let fontSize, abs(fontSize - current.fontSize) > 0.01 {
+            updated.fontSize = fontSize
+        }
+        guard updated != current else { return false }
+        pushUndo()
+        annotations[index] = updated
+        return true
+    }
+
     func undo() {
         guard canUndo else { return }
         redoStack.append(annotations)

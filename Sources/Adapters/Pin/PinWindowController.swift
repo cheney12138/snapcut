@@ -781,6 +781,32 @@ final class PinWindowController {
         showHUD(hudText)
     }
 
+    // MARK: - 拖出图片文件（功能 #2「随手拖拽出图」）
+
+    /// 把当前贴图作为一个 PNG 文件拖给其他 App（Finder / 飞书 / Slack / 微信 / Chrome / Figma）。
+    /// 入口：左上角悬停「拖出」胶囊（按住拖 ≥4pt）、⌃+拖动贴图本体（≥5pt）。
+    /// 只负责出图，不打断贴图自身状态（窗口不动、不进拖动状态机）。
+    func beginImageFileDrag(from view: NSView, event: NSEvent) {
+        let started = ImageDragCoordinator.shared.beginImageDrag(
+            cgImage: image,
+            suggestedName: "Snapcut_\(ExportCoordinator.timestampName())",
+            from: view,
+            event: event,
+            onEnd: { [weak self] dropped in
+                guard let self else { return }
+                // 松手后回到贴图闪一下反馈（被接收方拒收/取消则无声：不打扰）
+                if dropped { self.showHUD("已拖出图片") }
+                Log.event(Self.logCategory, "pin.dragout.end", ["dropped": "\(dropped)"])
+            }
+        )
+        if !started {
+            showHUD("拖出失败，请重试")
+            Log.error(Self.logCategory, "pin.dragout.fail", [
+                "pxW": "\(image.width)", "pxH": "\(image.height)",
+            ])
+        }
+    }
+
     // MARK: - 右键菜单动作
 
     func copyImageToPasteboard() {

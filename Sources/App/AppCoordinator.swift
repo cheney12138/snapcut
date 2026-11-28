@@ -490,12 +490,68 @@ final class AppCoordinator {
                             )
                         )
                     } else {
+                        // 裁剪 / 转 GIF 都在本机文件层面完成：
+                        // - MP4 原地原子替换（导出会话自己先写临时文件，不留任何垃圾）；
+                        // - GIF 与源文件同目录同名（`foo.mp4` → `foo.gif`，重名才追加时间戳）。
+                        let deps = self.deps
+                        let recordingOptions = self.settings.recordingOptions
+                        let gifOptions = GIFConversionOptions(
+                            fps: max(10, min(20, recordingOptions.gifFPS)),
+                            maxDimension: recordingOptions.gifScale1x ? 960 : 1440
+                        )
+                        let gifDestination: @MainActor (URL) -> URL = { sourceURL in
+                            let base = sourceURL.deletingPathExtension()
+                            let plain = base.appendingPathExtension("gif")
+                            guard FileManager.default.fileExists(atPath: plain.path) else { return plain }
+                            let suffix = "\(Int(Date().timeIntervalSince1970))-\(Int.random(in: 100...999))"
+                            return base.deletingLastPathComponent()
+                                .appendingPathComponent("\(base.lastPathComponent)-\(suffix)")
+                                .appendingPathExtension("gif")
+                        }
+                        let openGIFPreview: @MainActor (RecordingResult) -> Void = { gifResult in
+                            GIFPreviewPanel.shared.show(
+                                result: gifResult,
+                                callbacks: GIFPreviewPanel.Callbacks(
+                                    onCopyFile: copyFile,
+                                    onRevealInFinder: revealInFinder,
+                                    onDiscard: discardFile
+                                )
+                            )
+                        }
                         VideoPreviewPanel.shared.show(
                             result: finalResult,
                             callbacks: VideoPreviewPanel.Callbacks(
                                 onCopyFile: copyFile,
                                 onRevealInFinder: revealInFinder,
-                                onDiscard: discardFile
+                                onDiscard: discardFile,
+                                onTrim: { result, range in
+                                    let trimmed = try await deps.videoPostProcessor.trimMP4(
+                                        sourceURL: result.fileURL,
+                                        range: range,
+                                        destinationURL: result.fileURL
+                                    )
+                                    Log.event(.recording, "recording.trim.rewrite", [
+                                        "duration": String(format: "%.2f", trimmed.duration),
+                                        "bytes": "\(trimmed.fileSizeBytes)",
+                                    ])
+                                    return trimmed
+                                },
+                                onConvertToGIF: { result, range, progress in
+                                    let destination = gifDestination(result.fileURL)
+                                    let gifResult = try await deps.videoPostProcessor.convertMP4ToGIF(
+                                        sourceURL: result.fileURL,
+                                        range: range,
+                                        options: gifOptions,
+                                        destinationURL: destination,
+                                        onProgress: progress
+                                    )
+                                    Log.event(.recording, "recording.convertGIF.write", [
+                                        "bytes": "\(gifResult.fileSizeBytes)",
+                                        "frames": "\(gifResult.frameCount)",
+                                    ])
+                                    return gifResult
+                                },
+                                onOpenGIFPreview: openGIFPreview
                             )
                         )
                     }
@@ -601,6 +657,10 @@ final class AppCoordinator {
                 } else {
                     CaptureToast.show(message: "该截图暂无可复制文字", status: .warn)
                 }
+            },
+            // 拖出到 Finder/飞书等：只给文件路径，UI 层不直连 HistoryStore
+            fileURLForRecord: { record in
+                HistoryStore.shared.imageFileURL(for: record.id)
             }
         )
         HistorySpotlightPanel.shared.toggle(callbacks: callbacks)

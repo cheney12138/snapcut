@@ -299,6 +299,13 @@ final class HistoryStore {
         return image
     }
 
+    /// 记录主图片文件路径（`<id>.png`，用于拖出到 Finder/飞书等）；文件不存则返回 nil
+    func imageFileURL(for id: String) -> URL? {
+        let url = HistoryPaths.imageURL(for: id)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return url
+    }
+
     /// 读取可重编会话（`<id>.base.png` + `<id>.annotations.json`）；任一缺失或损坏返回 `nil`
     func loadEditableSession(for id: String) -> (baseImage: CGImage, payload: EditableSessionPayload)? {
         let baseURL = HistoryPaths.baseImageURL(for: id)

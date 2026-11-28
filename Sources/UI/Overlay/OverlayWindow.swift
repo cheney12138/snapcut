@@ -172,6 +172,23 @@ final class OverlayWindow: NSWindow {
     func pickFullDisplay() {
         overlayView.pickFullDisplayExternally()
     }
+
+    // MARK: - 智能框选（异步视觉探测回填，Controller 唯一入口）
+
+    /// 文本行探测回填（最先就绪的一层：20-40ms 即可高亮文字行）
+    func updateSmartVisionTextLines(_ lines: [CGRect]) {
+        overlayView.updateSmartVisionTextLines(lines)
+    }
+
+    /// 控件/区域识别回填
+    func updateSmartVisionRects(_ rects: [CGRect]) {
+        overlayView.updateSmartVisionRects(rects)
+    }
+
+    /// 表格结构识别回填（单元格 / 行 / 列）
+    func updateSmartVisionTables(_ tables: [DetectedVisualTable]) {
+        overlayView.updateSmartVisionTables(tables)
+    }
 }
 
 /// 覆盖层视图：蒙层 / 橡皮筋选框 / 尺寸角标 + 编辑态（冻结底图 + 标注 + 手势）
@@ -232,11 +249,20 @@ final class OverlayView: NSView {
     /// 冻结帧（会话开始时的整屏静态画面；有它就不再实时看桌面）
     private var frozenImage: CGImage?
 
-    /// 编辑态手势（改选区尺寸 / 整体移动）
+    /// 编辑态手势（改选区尺寸 / 整体移动 / 已画标注二次编辑）
     private enum EditGesture {
         case none
         case resize(edge: SelectionEdge, startRect: CGRect)
         case move(startRect: CGRect, startPoint: CGPoint)
+        /// 已画标注二次编辑：`initialAnnotation` 是按下瞬间的快照（每帧由「快照 + 累计 delta」重算，
+        /// 幂等无漂移）；`preMutationSnapshot` 是整条列表快照，mouseUp 时整体压一步撤销（单步 ⌘Z）
+        case editAnnotation(
+            index: Int,
+            handle: AnnotationHandle,
+            startPoint: CGPoint,
+            initialAnnotation: AnnotationModel,
+            preMutationSnapshot: [AnnotationModel]
+        )
     }
     private var editGesture: EditGesture = .none
     private var draggedEventCount = 0
@@ -244,13 +270,46 @@ final class OverlayView: NSView {
     private var spacePressed = false
     /// 悬停中的手柄（绘制手柄高亮 + 光标反馈）
     private var hoverEdge: SelectionEdge?
+
+    // MARK: 已画标注二次编辑（选中 / 悬停 / 原地改字）
+    /// 编辑态当前选中的标注下标（nil = 未选中）
+    private var selectedAnnotationIndex: Int?
+    /// 悬停反馈：命中的标注下标与操控柄（决定光标与悬停虚线）
+    private var hoveredAnnotationIndex: Int?
+    private var hoveredAnnotationHandle: AnnotationHandle?
+    /// 双击原地改字时正在编辑的原文字标注下标（绘制已落盘标注时跳过，防输入框底下重影）
+    private var editingTextAnnotationIndex: Int?
+    /// 选中标注改样式的「拖动前快照」（绑下标：滑杆连续拖动只占一步撤销，且绝不错用到别的标注）
+    private var stylePreviewSnapshot: (index: Int, annotations: [AnnotationModel])?
+    /// 最近一次已知工具（供工具栏回调判断「工具真的换了」而非仅改颜色/线宽）
+    private var lastKnownTool: EditorSession.Tool = .none
+    /// 取色复制格式（HEX → RGB → HSL，⇧C 轮换后落盘，下次沿用）
+    private var colorCopyFormat: ColorCopyFormat = ColorCopyFormat.persisted
     /// 放大镜采样器（安装冻结帧时构建一次）
     private var frozenSampler: FrozenSampler?
     /// 光标本地坐标（放大镜跟随；Y 向下）
     private var cursorLocal: CGPoint = .zero
 
-    /// 悬停命中的窗口（窗口截图预览 + 单击整窗；近似全屏的大窗默认不高亮）
-    private var hovered: HoveredWindow?
+    /// 智能框选：视觉探测缓存（文本行 / 识别区域，均为 AppKit 全局坐标 Y 向上）
+    private var smartTextLines: [CGRect] = []
+    private var smartVisualRects: [CGRect] = []
+    /// 智能框选：视觉表格结构缓存（单元格 / 行 / 列，AppKit 全局坐标 Y 向上）
+    private var smartVisualTables: [DetectedVisualTable] = []
+    /// 智能框选：最近一次 AX 探测结果 + 防乱序代际
+    private var smartProbeTask: Task<Void, Never>?
+    private var smartProbeEpoch: UInt64 = 0
+    private var latestAXCandidates: [SmartSelectionCandidate] = []
+    private var latestWindowCandidate: SmartSelectionCandidate?
+    /// 当前候选栈（滚轮切层）与层级下标 / 滚轮累加器 / 用户是否手动滚轮锁定过层级
+    private var smartStack: SmartCandidateStack = .empty
+    private var smartCandidateIndex: Int = 0
+    private var smartLayerUserPinned = false
+    private var smartScrollAccumulator: CGFloat = 0
+    /// 当前层级对应的智能候选（nil = 无候选，落到纯手拖）
+    private var smartActiveCandidate: SmartSelectionCandidate? {
+        smartStack.candidate(at: smartCandidateIndex)
+    }
+    /// 悬停高亮的本地矩形（智能候选 / 边缘全屏共用，Y 向下）
     private var hoveredLocalRect: CGRect?
     /// 鼠标移到屏幕边缘（≤14pt）时进入整屏预览，框体平滑变形为整个屏幕
     private var edgeFullScreenHover = false
@@ -258,9 +317,29 @@ final class OverlayView: NSView {
     private var hoverMorphStart: CFTimeInterval = 0
     private var hoverProbePoint: CGPoint = .zero
     private var hoverProbeTime: CFTimeInterval = 0
-    /// 单击整窗的延迟任务（220ms 双击宽限：双击=全屏，单击=整窗）
-    private var pendingWindowCapture: DispatchWorkItem?
     private var trackingAreaRef: NSTrackingArea?
+
+    // MARK: 辅助功能权限轻提示条
+    /// 用户关掉后不再提示（跨会话持久）
+    private static let axHintDismissedKey = "smart.axHint.dismissed"
+    /// 本次会话缓存的授权状态（AXIsProcessTrusted 是同步 TCC 查询，不能每帧 draw 里调）
+    private var axTrusted = true
+    private var axHintDismissed = false
+    /// 命中矩形缓存（视图本地 Y 向下；nil = 当前未绘制）
+    private var axHintBannerRect: CGRect?
+    private var axHintCloseRect: CGRect?
+    /// 光标是否悬在提示条上（用于进出时切换 hand/crosshair）
+    private var axHintHovered = false
+    /// 只有「唤起截图那一屏」显示轻提示（多屏时不在每块屏都糊一条）
+    private var axHintHostFrame: CGRect?
+
+    /// 未授权 + 用户没关过 + 选区悬停态（不打扰滚动/录制）才显示
+    private var shouldShowAXHint: Bool {
+        guard phase == .waitingForDrag, !scrollMode, recordingMode == .none else { return false }
+        guard !axHintDismissed else { return false }
+        guard let host = axHintHostFrame, window?.screen?.frame == host else { return false }
+        return !axTrusted
+    }
 
     // 视觉常量
     /// 蒙层：0.22（审查：0.25 → 轻 12%，选区提亮不变）
@@ -276,6 +355,12 @@ final class OverlayView: NSView {
         self.controller = controller
         super.init(frame: frameRect)
         wantsLayer = true
+        axTrusted = AccessibilityPermission.isTrusted()
+        axHintDismissed = UserDefaults.standard.bool(forKey: Self.axHintDismissedKey)
+        // 新建窗（非池化路径）也要能显示提示条：按当前光标所在屏定屏
+        axHintHostFrame = NSScreen.screens
+            .first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }?
+            .frame
     }
 
     @available(*, unavailable)
@@ -289,8 +374,7 @@ final class OverlayView: NSView {
 
     /// 复用重置：彻底清空上一轮选区/编辑/滚动/悬停状态，避免销毁重建 4K OverlayWindow
     func resetForReuse() {
-        pendingWindowCapture?.cancel()
-        pendingWindowCapture = nil
+        resetSmartSelectionState()
         standaloneZoomHudWork?.cancel()
         standaloneZoomHudWork = nil
         standaloneZoomHudText = nil
@@ -321,21 +405,33 @@ final class OverlayView: NSView {
         draggedEventCount = 0
         spacePressed = false
         hoverEdge = nil
+        selectedAnnotationIndex = nil
+        hoveredAnnotationIndex = nil
+        hoveredAnnotationHandle = nil
+        editingTextAnnotationIndex = nil
+        stylePreviewSnapshot = nil
+        lastKnownTool = .none
         frozenImage = nil
         frozenSampler = nil
-        hovered = nil
-        hoveredLocalRect = nil
-        edgeFullScreenHover = false
-        hoverMorphFromRect = nil
-        hoverMorphStart = 0
-        hoverFadeStart = 0
         ignoreNextMouseUpAfterEarlyCommit = false
+        // 轻提示条显示资格：每轮截图重新问一次（用户刚去授权回来则自动消失）
+        axTrusted = AccessibilityPermission.isTrusted()
+        axHintDismissed = UserDefaults.standard.bool(forKey: Self.axHintDismissedKey)
+        // 只在这一屏显示：按唤起时的光标位置定屏（与 OverlayController 选屏口径一致）
+        axHintHostFrame = NSScreen.screens
+            .first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }?
+            .frame
+        axHintBannerRect = nil
+        axHintCloseRect = nil
+        axHintHovered = false
         needsDisplay = true
     }
 
     // MARK: - 编辑态切入
 
     func enterEditorMode(session: EditorSession) {
+        // 进编辑态：悬停高亮/候选栈不再适用（AX 会话已由 controller 释放）
+        clearHover()
         editorSession = session
         phase = .editing
         // 全局选区 → 本地坐标（Y 向下）
@@ -350,6 +446,13 @@ final class OverlayView: NSView {
         if isStandaloneImage {
             standaloneFitRectLocal = editorRectLocal
         }
+        // 新会话：清掉上一轮标注选中/悬停/改字状态
+        selectedAnnotationIndex = nil
+        hoveredAnnotationIndex = nil
+        hoveredAnnotationHandle = nil
+        editingTextAnnotationIndex = nil
+        stylePreviewSnapshot = nil
+        lastKnownTool = session.currentTool
         needsDisplay = true
     }
 
@@ -445,6 +548,12 @@ final class OverlayView: NSView {
 
     /// 退出编辑模式（enterEditor 幂等重入用）：phase 回蒙层态
     func exitEditorIfNeeded() {
+        selectedAnnotationIndex = nil
+        hoveredAnnotationIndex = nil
+        hoveredAnnotationHandle = nil
+        editingTextAnnotationIndex = nil
+        stylePreviewSnapshot = nil
+        lastKnownTool = .none
         if case .editing = phase {
             phase = .waitingForDrag
             needsDisplay = true
@@ -516,7 +625,7 @@ final class OverlayView: NSView {
             y: min(max(win.frame.maxY - mouse.y, 0), bounds.height)
         )
         cursorLocal = local
-        updateHover(at: local)
+        updateHover(at: local, force: true)
         win.invalidateCursorRects(for: self)
         NSCursor.crosshair.set()
         needsDisplay = true
@@ -549,14 +658,195 @@ final class OverlayView: NSView {
         if case .active = recordingMode { return }
         switch phase {
         case .waitingForDrag:
+            // 轻提示条上：手型光标（可点），且不抢占下方框选逻辑
+            let overHint = shouldShowAXHint && axHintBannerRect?.contains(local) == true
+            if overHint != axHintHovered {
+                axHintHovered = overHint
+                (overHint ? NSCursor.pointingHand : NSCursor.crosshair).set()
+            } else if overHint {
+                NSCursor.pointingHand.set()
+            }
             updateHover(at: local)
             needsDisplay = true      // 放大镜跟随
         case .editing:
             updateHoverEdge(at: local)
             updateHoverAutoRedact(at: local)
+            updateAnnotationHover(at: local)
         default:
             break
         }
+    }
+
+    // MARK: - 已画标注二次编辑（悬停 / 选中 / 操控柄 / 样式）
+
+    /// 文字命中框实测尺寸（宽 + 字形高）：与 `CGRenderer.drawText` 完全同字体，保证命中框与视觉像素 100% 对齐
+    /// （Core 侧不碰字体，尺寸由 UI 量好传回；空文本返回 nil 让 Core 走启发式估宽）
+    /// 唯一真源是 `measuredTextMetrics(for:)`，不另外再用 `NSString.size` 量（那还含行距，口径会漂）
+    nonisolated private func measuredTextSize(for annotation: AnnotationModel) -> CGSize? {
+        guard let metrics = measuredTextMetrics(for: annotation) else { return nil }
+        return CGSize(width: metrics.width, height: metrics.height)
+    }
+
+    /// 文字排版度量（宽 + 上伸 + 下伸）：与 `CGRenderer.drawText` **完全一致**的字体与 CTLine 量法
+    ///
+    /// 病例：`.text` 的 anchor 是 CoreText 的**基线**，字形向上延伸 ascent、向下延伸 descent。
+    /// 旧实现把 anchor 当左上角 ⇒ 蓝色选中虚线框/悬停框/命中框整体比文字低一整个字高，永远对不齐。
+    /// 这里用同一支 `NSFont.systemFont(ofSize:weight: .semibold)` + `CTLineGetTypographicBounds`
+    /// 量出精确的 (width, ascent, descent)，交给 Core 按基线口径出框，蓝框与字形像素 1:1 严丝合缝。
+    nonisolated private func measuredTextMetrics(for annotation: AnnotationModel) -> AnnotationTextMetrics? {
+        guard case .text = annotation.shape,
+              let text = annotation.text, !text.isEmpty else { return nil }
+        let font = NSFont.systemFont(ofSize: annotation.fontSize, weight: .semibold)
+        let attributed = NSAttributedString(string: text, attributes: [.font: font])
+        let line = CTLineCreateWithAttributedString(attributed)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
+        return AnnotationTextMetrics(width: width, ascent: ascent, descent: descent)
+    }
+
+    /// 是否有「已选中标注」（工具栏据此在 `.none` 选择态也浮出颜色/线宽样式胶囊）
+    var hasSelectedAnnotation: Bool {
+        guard phase == .editing, editingTextAnnotationIndex == nil else { return false }
+        return selectedAnnotationIndex != nil
+    }
+
+    /// `.none`（选择与移动态）下的悬停反馈：选中标注的操控柄 → `.crosshair`，本体 → `.openHand`
+    private func updateAnnotationHover(at local: CGPoint) {
+        guard let session = editorSession,
+              session.currentTool == .none,
+              case .none = editGesture,
+              hoverEdge == nil,
+              hoveredAutoRedactRect == nil,
+              editorRectLocal.contains(local) else {
+            clearAnnotationHover()
+            return
+        }
+        let annotPt = localToAnnotation(local)
+        var nextHandle: AnnotationHandle?
+        var nextIndex: Int?
+        if let sel = selectedAnnotationIndex, session.store.annotations.indices.contains(sel) {
+            let annot = session.store.annotations[sel]
+            if let handle = AnnotationEditorGeometry.hitTestHandle(
+                at: annotPt, for: annot, textSize: measuredTextSize(for: annot)
+            ) {
+                nextIndex = sel
+                nextHandle = handle
+            }
+        }
+        if nextHandle == nil,
+           let idx = AnnotationEditorGeometry.hitTestBody(
+                at: annotPt,
+                in: session.store.annotations,
+                textMetricsProvider: { [self] in self.measuredTextMetrics(for: $0) }
+           ) {
+            nextIndex = idx
+            nextHandle = .body
+        }
+        let hadHover = hoveredAnnotationIndex != nil || hoveredAnnotationHandle != nil
+        let changed = nextIndex != hoveredAnnotationIndex || nextHandle != hoveredAnnotationHandle
+        hoveredAnnotationIndex = nextIndex
+        hoveredAnnotationHandle = nextHandle
+        if let nextHandle {
+            if case .body = nextHandle {
+                NSCursor.openHand.set()
+            } else {
+                NSCursor.crosshair.set()
+            }
+        } else if hadHover, hoverEdge == nil, hoveredAutoRedactRect == nil {
+            // 刚离开标注：只把光标恢复成准星，不碰「独立图内 openHand」等其它态
+            NSCursor.crosshair.set()
+        }
+        if changed { needsDisplay = true }
+    }
+
+    private func clearAnnotationHover() {
+        guard hoveredAnnotationIndex != nil || hoveredAnnotationHandle != nil else { return }
+        hoveredAnnotationIndex = nil
+        hoveredAnnotationHandle = nil
+        if hoverEdge == nil, hoveredAutoRedactRect == nil { NSCursor.crosshair.set() }
+        needsDisplay = true
+    }
+
+    /// 会话级 Esc 路由调用：已选中标注则先只取消选中（不关截图），返回 true = 吃掉了这次 Esc
+    func dismissAnnotationSelectionIfNeeded() -> Bool {
+        guard phase == .editing, selectedAnnotationIndex != nil else { return false }
+        selectedAnnotationIndex = nil
+        hoveredAnnotationIndex = nil
+        hoveredAnnotationHandle = nil
+        needsDisplay = true
+        controller.refreshToolbar()
+        Log.event(.editor, "editor.annotation.deselect", ["via": "esc"])
+        return true
+    }
+
+    /// undo / redo / 删除后做边界校验（下标漂移越界就清选中，绝不画 ghost 手柄）
+    func clampAnnotationSelection() {
+        guard let idx = selectedAnnotationIndex else { return }
+        guard let session = editorSession, session.store.annotations.indices.contains(idx) else {
+            selectedAnnotationIndex = nil
+            hoveredAnnotationIndex = nil
+            hoveredAnnotationHandle = nil
+            needsDisplay = true
+            controller.refreshToolbar()
+            return
+        }
+    }
+
+    /// 工具栏换工具：真正换成「画图工具」时清掉标注选中（避免虚线框与新手势抢优先）
+    func handleToolbarToolChange() {
+        guard let session = editorSession else { return }
+        let tool = session.currentTool
+        guard tool != lastKnownTool else { return }
+        lastKnownTool = tool
+        clampAnnotationSelection()
+        if tool != .none {
+            selectedAnnotationIndex = nil
+            hoveredAnnotationIndex = nil
+            hoveredAnnotationHandle = nil
+            needsDisplay = true
+            controller.refreshToolbar()
+        }
+    }
+
+    /// 工具栏改颜色 / 线宽 → 实时套到当前选中的标注（可单步 ⌘Z 撤销）
+    /// - `commit == false`：滑杆拖动中的逐帧预览（不压撤销栈）
+    /// - `commit == true`：颜色点选 / 滑杆松手，整段拖动只占一步撤销
+    func applyStyleChangeToSelectedAnnotation(
+        colorIndex: Int? = nil,
+        strokeWidth: CGFloat? = nil,
+        commit: Bool = true
+    ) {
+        guard let session = editorSession,
+              let index = selectedAnnotationIndex,
+              session.store.annotations.indices.contains(index) else {
+            stylePreviewSnapshot = nil
+            return
+        }
+        var updated = session.store.annotations[index]
+        if let colorIndex { updated.colorIndex = colorIndex }
+        if let strokeWidth { updated.strokeWidth = strokeWidth }
+
+        guard commit else {
+            if stylePreviewSnapshot?.index != index { stylePreviewSnapshot = (index, session.store.annotations) }
+            if updated != session.store.annotations[index] {
+                session.store.previewReplace(at: index, with: updated)
+                needsDisplay = true
+            }
+            return
+        }
+
+        if let snapshot = stylePreviewSnapshot, snapshot.index == index {
+            // 拖动中：先把最终值落到预览（不压栈），再把「拖动前快照」整体压一步
+            session.store.previewReplace(at: index, with: updated)
+            session.store.commitMutation(previousAnnotations: snapshot.annotations)
+            stylePreviewSnapshot = nil
+        } else {
+            stylePreviewSnapshot = nil
+            session.store.updateStyle(at: index, colorIndex: colorIndex, strokeWidth: strokeWidth)
+        }
+        controller.refreshToolbar()
+        needsDisplay = true
     }
 
     /// 马赛克工具下悬停在自动脱敏块上时，高亮轻虚线轮廓并切换手型光标，直觉提示「单击可取消该处脱敏」
@@ -650,6 +940,12 @@ final class OverlayView: NSView {
     // MARK: - 独立外源图滚轮/捏合缩放与平移
 
     override func scrollWheel(with event: NSEvent) {
+        // 智能框选态：滚轮 = 切候选层级（向内缩 / 向外扩），不让滚轮穿透
+        if phase == .waitingForDrag, !scrollMode, recordingMode == .none,
+           !edgeFullScreenHover, smartStack.candidates.count > 1 {
+            handleSmartLayerScroll(event)
+            return
+        }
         guard phase == .editing, !scrollMode, isStandaloneImage else {
             super.scrollWheel(with: event)
             return
@@ -673,6 +969,38 @@ final class OverlayView: NSView {
             factor = pow(1.12, clamped)
         }
         applyStandaloneZoom(factor: factor, anchor: anchor)
+    }
+
+    /// 滚轮切层：向上滚动 = 增大层级（向外扩，如 文字行 → 控件 → 区域 → 窗口），
+    /// 向下滚动 = 减小层级（向内缩）。惯性尾帧直接忽略，避免一滑跳好几层。
+    private func handleSmartLayerScroll(_ event: NSEvent) {
+        guard event.momentumPhase.isEmpty else { return }
+        let deltaY = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12
+        guard deltaY != 0 else { return }
+        smartScrollAccumulator += deltaY
+        let threshold: CGFloat = 12
+        guard abs(smartScrollAccumulator) >= threshold else { return }
+        let step: Int = smartScrollAccumulator > 0 ? 1 : -1
+        smartScrollAccumulator = 0
+        stepSmartLayer(by: step, via: "scroll")
+    }
+
+    /// 智能框选切层（滚轮 / ↑↓ 共用）：step > 0 向外扩一层，step < 0 向内缩一层。
+    /// 切层后置 `smartLayerUserPinned`——后续异步 AX/Vision 回填不再把层级抢回默认值。
+    private func stepSmartLayer(by step: Int, via source: String) {
+        let count = smartStack.candidates.count
+        guard count > 1 else { return }
+        let next = min(max(smartCandidateIndex + step, 0), count - 1)
+        guard next != smartCandidateIndex else { return }
+        smartCandidateIndex = next
+        smartLayerUserPinned = true
+        applySmartHoverTarget(animate: true)
+        needsDisplay = true
+        Log.event(.overlay, "overlay.smart.layer", [
+            "index": "\(next + 1)/\(count)",
+            "kind": smartActiveCandidate?.kind.displayName ?? "?",
+            "via": source,
+        ])
     }
 
     override func magnify(with event: NSEvent) {
@@ -766,14 +1094,141 @@ final class OverlayView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         super.mouseExited(with: event)
-        guard hovered != nil else { return }
+        guard hoveredLocalRect != nil || !smartStack.isEmpty else { return }
         clearHover()
     }
 
-    /// 鼠标位置的选区探测：
-    /// - 鼠标靠近屏幕四边（≤14pt）：框体平滑变形为整屏预览（点击/Enter 框选整屏）；
-    /// - 鼠标在屏幕内部：默认不自动框选全屏（近似满屏的最大化窗口不高亮），只高亮非满屏的独立小窗，随时可直接拖选任意区域。
-    private func updateHover(at local: CGPoint) {
+    // MARK: - 智能框选（实时候选栈 / 滚轮切层）
+
+    /// 智框状态彻底重置（窗口复用：新会话新冻结帧，视觉缓存一并清空）
+    private func resetSmartSelectionState() {
+        smartProbeTask?.cancel()
+        smartProbeTask = nil
+        smartProbeEpoch &+= 1
+        latestAXCandidates = []
+        latestWindowCandidate = nil
+        smartStack = .empty
+        smartCandidateIndex = 0
+        smartLayerUserPinned = false
+        smartScrollAccumulator = 0
+        smartTextLines = []
+        smartVisualRects = []
+        smartVisualTables = []
+        hoveredLocalRect = nil
+        edgeFullScreenHover = false
+        hoverMorphFromRect = nil
+        hoverMorphStart = 0
+        hoverFadeStart = 0
+    }
+
+    /// 视觉探测回填：文本行（最早就绪的一层）
+    func updateSmartVisionTextLines(_ lines: [CGRect]) {
+        smartTextLines = lines
+        refreshSmartStackAfterVisionUpdate()
+    }
+
+    /// 视觉探测回填：控件 / 区域
+    func updateSmartVisionRects(_ rects: [CGRect]) {
+        smartVisualRects = rects
+        refreshSmartStackAfterVisionUpdate()
+    }
+
+    /// 视觉探测回填：表格结构（单元格 / 行 / 列）
+    func updateSmartVisionTables(_ tables: [DetectedVisualTable]) {
+        smartVisualTables = tables
+        refreshSmartStackAfterVisionUpdate()
+    }
+
+    /// 新视觉结果到达时，若仍在选区悬停态，立即用缓存重算当前光标处候选栈并平滑过渡
+    private func refreshSmartStackAfterVisionUpdate() {
+        guard phase == .waitingForDrag, !edgeFullScreenHover, recordingMode == .none else { return }
+        guard !NSEvent.modifierFlags.contains(.option), let frame = window?.frame else { return }
+        let global = CGPoint(x: frame.minX + cursorLocal.x, y: frame.maxY - cursorLocal.y)
+        rebuildSmartStack(atGlobalPoint: global, screenFrame: frame, resetIndex: false)
+    }
+
+    /// 用「当前缓存的文本行 + 识别区域 + 表格结构 + AX 控件 + 窗口」重算候选栈，并平滑变形到当前层级
+    private func rebuildSmartStack(atGlobalPoint global: CGPoint, screenFrame: CGRect, resetIndex: Bool) {
+        let stack = SmartCandidateResolver.buildStack(
+            atGlobalPoint: global,
+            screenFrame: screenFrame,
+            textLines: smartTextLines,
+            visualRects: smartVisualRects,
+            visualTables: smartVisualTables,
+            axCandidates: latestAXCandidates,
+            windowCandidate: latestWindowCandidate
+        )
+        let count = stack.candidates.count
+        if resetIndex {
+            smartLayerUserPinned = false
+            smartCandidateIndex = count > 0 ? min(max(stack.defaultIndex, 0), count - 1) : 0
+        } else if !smartLayerUserPinned {
+            // 异步 AX / Vision 到达且用户尚未滚轮切层时，跟随解析器算出的最优默认层级
+            smartCandidateIndex = count > 0 ? min(max(stack.defaultIndex, 0), count - 1) : 0
+        } else {
+            smartCandidateIndex = count > 0 ? min(max(smartCandidateIndex, 0), count - 1) : 0
+        }
+        smartStack = stack
+        applySmartHoverTarget(animate: true)
+    }
+
+    /// 当前层级候选 → 悬停高亮矩形（160ms 平滑变形，60fps 重绘由 drawSelection 自行排程）
+    private func applySmartHoverTarget(animate: Bool) {
+        let prevRect = currentHoverVisualRect()
+        guard let candidate = smartActiveCandidate, let frame = window?.frame else {
+            hoverMorphFromRect = nil
+            hoveredLocalRect = nil
+            hoverFadeStart = 0
+            needsDisplay = true
+            return
+        }
+        let next = localRect(fromGlobal: candidate.rectGlobal, frame: frame)
+        guard next != hoveredLocalRect else {
+            // 矩形未变但候选总数可能已更新（异步补齐），仍刷新角标文案
+            needsDisplay = true
+            return
+        }
+        hoverMorphFromRect = animate ? prevRect : nil
+        hoverMorphStart = CACurrentMediaTime()
+        hoverFadeStart = hoverMorphStart
+        hoveredLocalRect = next
+        needsDisplay = true
+    }
+
+    /// 异步 AX 探测控件候选（防乱序：代际 + 态 + Option 校验，过期结果一律丢弃）
+    private func startSmartProbeTask(atGlobalPoint global: CGPoint) {
+        smartProbeEpoch &+= 1
+        let epoch = smartProbeEpoch
+        smartProbeTask?.cancel()
+        smartProbeTask = nil
+        guard let prober = AppCoordinatorShared.deps?.smartElementProber else { return }
+        let mainHeight = NSScreen.screens.first?.frame.height ?? bounds.height
+        smartProbeTask = Task { [weak self] in
+            let axCandidates = await prober.probe(
+                atGlobalPoint: global,
+                mainScreenHeight: mainHeight,
+                excludingPID: getpid()
+            )
+            guard let self, !Task.isCancelled, epoch == self.smartProbeEpoch,
+                  self.phase == .waitingForDrag,
+                  !self.edgeFullScreenHover,
+                  !NSEvent.modifierFlags.contains(.option),
+                  let frame = self.window?.frame else { return }
+            self.latestAXCandidates = axCandidates
+            self.rebuildSmartStack(atGlobalPoint: global, screenFrame: frame, resetIndex: false)
+        }
+    }
+
+    /// 鼠标位置的智能候选探测（三层融合，越内层越优先，滚轮可切层）：
+    /// - 鼠标靠近屏幕四边（≤14pt）：框体平滑变形为整屏预览（单击/Enter 框选整屏）；
+    /// - 屏内：文本行 / AX 控件 / 识别区域 / 窗口 由 SmartCandidateResolver 融合成候选栈，
+    ///   视觉结果与窗口候选都走同步缓存（0ms 响应），只有 AX 探测是异步回填。
+    private func updateHover(at local: CGPoint, force: Bool = false) {
+        // Option 按住 = 临时禁用智能框选（保留手动拖选）
+        if NSEvent.modifierFlags.contains(.option) {
+            clearHover()
+            return
+        }
         let edgeMargin: CGFloat = 14
         let nearEdge = local.x <= edgeMargin
             || local.x >= bounds.width - edgeMargin
@@ -788,7 +1243,15 @@ final class OverlayView: NSView {
                 hoverMorphStart = CACurrentMediaTime()
                 hoverFadeStart = hoverMorphStart
                 edgeFullScreenHover = true
-                hovered = nil
+                // 整屏预览是最高层级：撤掉智能候选与在途 AX 探测
+                smartProbeTask?.cancel()
+                smartProbeTask = nil
+                smartProbeEpoch &+= 1
+                latestAXCandidates = []
+                latestWindowCandidate = nil
+                smartStack = .empty
+                smartCandidateIndex = 0
+                smartScrollAccumulator = 0
                 hoveredLocalRect = bounds
                 needsDisplay = true
             }
@@ -801,40 +1264,71 @@ final class OverlayView: NSView {
         }
 
         let now = CACurrentMediaTime()
-        let moved = abs(local.x - hoverProbePoint.x) > 1.5 || abs(local.y - hoverProbePoint.y) > 1.5
-        guard leavingEdge || moved || now - hoverProbeTime > 0.08 else { return }
+        let moved = abs(local.x - hoverProbePoint.x) > 2.5 || abs(local.y - hoverProbePoint.y) > 2.5
+        guard leavingEdge || moved || force || now - hoverProbeTime > 0.08 else { return }
         hoverProbePoint = local
         hoverProbeTime = now
         guard let frame = window?.frame else { return }
         let global = CGPoint(x: frame.minX + local.x, y: frame.maxY - local.y)
-        let rawFound = WindowLocator.window(atGlobalPoint: global, excludingPID: getpid())
-        // 近似占满整屏的最大化窗口默认不自动框选（避免唤起截图即全屏框住），
-        // 仅在鼠标移动到屏幕边缘时变形框选整屏
-        let found: HoveredWindow? = rawFound.flatMap { win in
-            let nearlyFull = win.rectGlobal.width >= bounds.width * 0.88
-                && win.rectGlobal.height >= bounds.height * 0.86
-            return nearlyFull ? nil : win
+
+        // ① 窗口命中最便宜（纯 CGWindowList 查询）——同步算出，0ms 即可给出窗口层候选
+        // 近似满屏大窗的剪枝交给 SmartCandidateResolver（“无更细目标才剔除 / 有更细目标留在栈顶供滚轮切出”），
+        // 这里不做任何预筛，否则最大化窗口永远没法滚轮切到整窗
+        latestWindowCandidate = WindowLocator
+            .window(atGlobalPoint: global, excludingPID: getpid())
+            .map { win in
+                SmartSelectionCandidate(
+                    rectGlobal: win.rectGlobal,
+                    kind: .window,
+                    windowID: win.windowID,
+                    ownerName: win.ownerName,
+                    title: win.title
+                )
+            }
+
+        // ② 点已移出上一轮 AX 候选范围：立刻丢弃，绝不让过期控件框跟着光标跑
+        if !latestAXCandidates.isEmpty,
+           !latestAXCandidates.contains(where: { $0.rectGlobal.contains(global) }) {
+            latestAXCandidates = []
         }
-        guard leavingEdge || found != hovered else { return }
-        let prevRect = currentHoverVisualRect()
-        hovered = found
-        if let f = found {
-            let nextRect = CGRect(
-                x: f.rectGlobal.minX - frame.minX,
-                y: frame.maxY - f.rectGlobal.maxY,
-                width: f.rectGlobal.width,
-                height: f.rectGlobal.height
-            )
-            hoverMorphFromRect = prevRect
-            hoverMorphStart = CACurrentMediaTime()
-            hoverFadeStart = hoverMorphStart
-            hoveredLocalRect = nextRect
-        } else {
-            hoverMorphFromRect = nil
+
+        // ③ 文本行 / 识别区域 / 窗口都是已缓存结果：同步重算，0ms 出框
+        rebuildSmartStack(atGlobalPoint: global, screenFrame: frame, resetIndex: true)
+        // ④ AX 控件候选异步补齐（同点同代位合并后仍走平滑过渡）
+        startSmartProbeTask(atGlobalPoint: global)
+    }
+
+    /// AppKit 全局矩形（Y 向上）→ 视图本地矩形（Y 向下）
+    private func localRect(fromGlobal rect: CGRect, frame: CGRect) -> CGRect {
+        CGRect(
+            x: rect.minX - frame.minX,
+            y: frame.maxY - rect.maxY,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    /// Option 键：按住临时禁用智能框选（立刻清智能高亮，保留手动拖选），松开后重算悬停
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        guard phase == .waitingForDrag, !scrollMode, recordingMode == .none else { return }
+        if event.modifierFlags.contains(.option) {
+            smartProbeTask?.cancel()
+            smartProbeTask = nil
+            smartProbeEpoch &+= 1
+            latestAXCandidates = []
+            latestWindowCandidate = nil
+            smartStack = .empty
+            smartCandidateIndex = 0
+            smartScrollAccumulator = 0
             hoveredLocalRect = nil
+            edgeFullScreenHover = false
+            hoverMorphFromRect = nil
             hoverFadeStart = 0
+            needsDisplay = true
+        } else {
+            updateHover(at: cursorLocal, force: true)
         }
-        needsDisplay = true
     }
 
     private func currentHoverVisualRect() -> CGRect? {
@@ -852,8 +1346,18 @@ final class OverlayView: NSView {
     }
 
     private func clearHover() {
+        smartProbeTask?.cancel()
+        smartProbeTask = nil
+        smartProbeEpoch &+= 1
+        latestAXCandidates = []
+        latestWindowCandidate = nil
+        smartStack = .empty
+        smartCandidateIndex = 0
+        smartLayerUserPinned = false
+        smartScrollAccumulator = 0
+        // 文本行/识别区域是「冻结帧级」缓存，与光标无关——这里刻意保留，
+        // 否则 Option 临时开关或鼠标移出再回来就要重新等 20-40ms 才出框
         edgeFullScreenHover = false
-        hovered = nil
         hoveredLocalRect = nil
         hoverMorphFromRect = nil
         hoverMorphStart = 0
@@ -911,13 +1415,19 @@ final class OverlayView: NSView {
         }
         switch phase {
         case .waitingForDrag:
-            // 双击 = 当前显示器全屏截图（与单击整窗共用鼠标时靠宽限区分）
-            if event.clickCount >= 2 {
-                pendingWindowCapture?.cancel()
-                pendingWindowCapture = nil
-                pickFullDisplay()
+            // 辅助功能轻提示条优先吃点击：点主区 = 退出截图并直达授权；点 × = 不再提示
+            // （两条路径都不进入拖选，也不影响后续继续截图）
+            if shouldShowAXHint, let banner = axHintBannerRect, banner.contains(point) {
+                if let closeRect = axHintCloseRect, closeRect.contains(point) {
+                    dismissAccessibilityHint()
+                } else {
+                    activateAccessibilityHint()
+                }
                 return
             }
+            // 智能框选（用户裁定）：单击 = 直接确认当前智能候选 0ms 秒进编辑态，
+            // 因此这里不再做「双击=全屏」的双击分流（全屏走边缘 ≤14pt 悬停单击 / Enter / 快捷键）；
+            // 按下即进入框选，拖动仍可自由改选区。
             phase = .dragging(start: point)
             selectionLocal = CGRect(origin: point, size: .zero)
             window?.makeKey()
@@ -951,7 +1461,7 @@ final class OverlayView: NSView {
             case .move(let startRect, let startPoint):
                 let delta = CGSize(width: point.x - startPoint.x, height: point.y - startPoint.y)
                 recordingRectLocal = SelectionGeometry.moved(startRect, by: delta, limit: bounds)
-            case .none:
+            case .none, .editAnnotation:
                 return
             }
             if let screen = window?.screen {
@@ -1014,11 +1524,11 @@ final class OverlayView: NSView {
                 phase = .waitingForDrag
                 selectionLocal = .zero
                 needsDisplay = true
-                // 单击（未拖动）：在屏幕边缘全屏预览态 → 直接整屏；命中独立小窗 → 220ms 宽限后整窗截图
+                // 单击（未拖动）确认：边缘全屏 → 整屏；否则当前智能候选 → 0ms 秒进编辑态
                 if edgeFullScreenHover {
                     pickFullDisplay()
-                } else if let target = hovered {
-                    scheduleWindowCapture(target)
+                } else if let candidate = smartActiveCandidate {
+                    pickSmartCandidate(candidate)
                 }
                 return
             }
@@ -1068,38 +1578,37 @@ final class OverlayView: NSView {
 
     // MARK: - 整窗 / 全屏采集
 
-    private func scheduleWindowCapture(_ target: HoveredWindow) {
-        pendingWindowCapture?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.phase == .waitingForDrag else { return }
-            self.pickWindow(target)
-        }
-        pendingWindowCapture = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
-    }
-
-    private func pickWindow(_ target: HoveredWindow) {
+    /// 智能候选确认（单击 / Enter 共用）：
+    /// - 直接裁冻结帧（windowID=nil）= 0ms 秒进编辑态，不用等屏捕；
+    /// - 只有 `.window` 层拿 windowID 走 SCK 单窗口滤镜（被遮挡也正确）。
+    private func pickSmartCandidate(_ target: SmartSelectionCandidate) {
         guard let screen = window?.screen else { return }
-        pendingWindowCapture = nil
         if let frame = window?.frame {
-            selectionLocal = CGRect(
+            selectionLocal = snapToPixelGrid(CGRect(
                 x: target.rectGlobal.minX - frame.minX,
                 y: frame.maxY - target.rectGlobal.maxY,
                 width: target.rectGlobal.width,
                 height: target.rectGlobal.height
-            )
+            ))
         }
         phase = .confirmed
         needsDisplay = true
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
-        Log.event(.overlay, "overlay.pick.window", [
+        Log.event(.overlay, "overlay.pick.smart", [
+            "kind": target.kind.displayName,
             "owner": target.ownerName,
             "title": target.title,
             "size": "\(Int(target.rectGlobal.width))x\(Int(target.rectGlobal.height))",
+            "layer": "\(smartCandidateIndex + 1)/\(max(1, smartStack.candidates.count))",
         ])
-        controller.didSelect(rect: target.rectGlobal, on: screen, windowID: target.windowID)
+        if Self.isWindowKind(target.kind), let windowID = target.windowID {
+            controller.didSelect(rect: target.rectGlobal, on: screen, windowID: windowID)
+        } else {
+            // 文本行 / 控件 / 区域 / 识别块：直接裁冻结帧，0ms 进编辑态（所见 = 所得）
+            controller.didSelect(rect: target.rectGlobal, on: screen, windowID: nil)
+        }
     }
 
     private func pickFullDisplay() {
@@ -1149,19 +1658,30 @@ final class OverlayView: NSView {
         // 3) 常规标注：点击在选区外忽略（R7：移出选区不生效）
         guard editorRectLocal.contains(point) else { return }
 
+        let annotPt = localToAnnotation(point)
+
+        // 3.5) 双击已有 `.text` 标注 = 原地改字（.none / .text 工具；已有输入框时不抢）
+        if textField == nil,
+           session.currentTool == .none || session.currentTool == .text,
+           event.clickCount >= 2,
+           let idx = AnnotationEditorGeometry.hitTestBody(
+                at: annotPt,
+                in: session.store.annotations,
+                textMetricsProvider: { [self] in self.measuredTextMetrics(for: $0) }
+           ),
+           case .text = session.store.annotations[idx].shape {
+            beginInlineReeditText(atIndex: idx)
+            return
+        }
+
         switch session.currentTool {
         case .none:
-            if isStandaloneImage && event.clickCount >= 2 {
-                toggleStandaloneDoubleClickZoom(at: point)
-                return
-            }
-            // 无工具默认态（用户裁定）：拖动 = 整体移动选区（不用按空格）
-            editGesture = .move(startRect: editorRectLocal, startPoint: point)
+            handleSelectionToolMouseDown(at: point, annotationPoint: annotPt, clickCount: event.clickCount)
         case .text:
-            beginTextEditing(at: localToAnnotation(point))
+            beginTextEditing(at: annotPt)
         case .sequence:
             controller.addAnnotation(AnnotationModel(
-                shape: .sequence(anchor: localToAnnotation(point)),
+                shape: .sequence(anchor: annotPt),
                 colorIndex: session.colorIndex,
                 strokeWidth: session.strokeWidth,
                 index: session.store.nextSequenceNumber()
@@ -1204,6 +1724,69 @@ final class OverlayView: NSView {
         needsDisplay = true
     }
 
+    /// `.none` 工具态：操控柄 → 本体（单击选中 / 按住直接拖走）→ 空白（清选中 + 原有选区行为）
+    private func handleSelectionToolMouseDown(at point: CGPoint, annotationPoint annotPt: CGPoint, clickCount: Int) {
+        guard let session = editorSession else { return }
+        // 新的手势开始：丢掉上一轮可能残留的样式预览快照
+        stylePreviewSnapshot = nil
+        // ① 当前选中标注的操控柄优先（贴着角的拖拽走缩放，不被当成本体平移）
+        if let sel = selectedAnnotationIndex, session.store.annotations.indices.contains(sel) {
+            let annot = session.store.annotations[sel]
+            if let handle = AnnotationEditorGeometry.hitTestHandle(
+                at: annotPt, for: annot, textSize: measuredTextSize(for: annot)
+            ) {
+                selectedAnnotationIndex = sel
+                editGesture = .editAnnotation(
+                    index: sel,
+                    handle: handle,
+                    startPoint: annotPt,
+                    initialAnnotation: annot,
+                    preMutationSnapshot: session.store.annotations
+                )
+                Log.event(.editor, "editor.annotation.handle", ["handle": "\(handle)"])
+                needsDisplay = true
+                controller.refreshToolbar()
+                return
+            }
+        }
+        // ② 本体命中：单击选中（按住同一手势即可直接拖走）
+        if let idx = AnnotationEditorGeometry.hitTestBody(
+            at: annotPt,
+            in: session.store.annotations,
+            textMetricsProvider: { [self] in self.measuredTextMetrics(for: $0) }
+        ) {
+            let annot = session.store.annotations[idx]
+            selectedAnnotationIndex = idx
+            hoveredAnnotationIndex = idx
+            hoveredAnnotationHandle = .body
+            needsDisplay = true
+            editGesture = .editAnnotation(
+                index: idx,
+                handle: .body,
+                startPoint: annotPt,
+                initialAnnotation: annot,
+                preMutationSnapshot: session.store.annotations
+            )
+            Log.event(.editor, "editor.annotation.select", ["index": "\(idx)", "shape": "\(annot.shape)"])
+            controller.refreshToolbar()
+            return
+        }
+        // ③ 空白处：清选中，保持原有行为（独立图双击缩放 / 拖动整体移动选区）
+        if selectedAnnotationIndex != nil {
+            selectedAnnotationIndex = nil
+            hoveredAnnotationIndex = nil
+            hoveredAnnotationHandle = nil
+            needsDisplay = true
+            controller.refreshToolbar()
+        }
+        if isStandaloneImage && clickCount >= 2 {
+            toggleStandaloneDoubleClickZoom(at: point)
+            return
+        }
+        // 无工具默认态（用户裁定）：拖动 = 整体移动选区（不用按空格）
+        editGesture = .move(startRect: editorRectLocal, startPoint: point)
+    }
+
     private func syncToolbarForLiveSelection() {
         guard let screen = window?.screen ?? NSScreen.main else { return }
         controller.repositionToolbar(forLiveSelectionGlobal: convertToGlobalRect(editorRectLocal), on: screen)
@@ -1236,6 +1819,16 @@ final class OverlayView: NSView {
                 editorRectLocal = SelectionGeometry.moved(startRect, by: delta, limit: bounds)
             }
             syncToolbarForLiveSelection()
+            needsDisplay = true
+            return
+        case .editAnnotation(let index, let handle, let startPoint, let initialAnnotation, _):
+            // 已画标注二次编辑：每帧用「按下快照 + 累计 delta」重算，幂等无漂移
+            let annotPt = localToAnnotation(point)
+            let delta = CGSize(width: annotPt.x - startPoint.x, height: annotPt.y - startPoint.y)
+            let updated = AnnotationEditorGeometry.transformed(
+                initialAnnotation, handle: handle, delta: delta
+            )
+            editorSession?.store.previewReplace(at: index, with: updated)
             needsDisplay = true
             return
         case .none:
@@ -1343,16 +1936,64 @@ final class OverlayView: NSView {
     }
 
     /// 取色：采样冻结帧光标处像素 → 写剪贴板（hex）→ 结束会话
+    /// 取色闭环：采样冻结帧光标处像素 → 按当前格式写剪贴板 → 音效 + 色卡轻提示 → 结束会话
     private func copyColorUnderCursor() {
-        guard let sampler = frozenSampler,
-              let frozen = frozenImage else { return }
-        let px = Int(cursorLocal.x / bounds.width * CGFloat(frozen.width))
-        let py = Int(cursorLocal.y / bounds.height * CGFloat(frozen.height))
-        let hex = sampler.hex(x: px, y: py)
-        guard hex.hasPrefix("#"), hex.count == 7 else { return }
-        AppCoordinatorShared.deps?.clipboard.writeText(hex)
-        Log.event(.overlay, "overlay.copyColor", ["hex": hex, "x": "\(px)", "y": "\(py)"])
+        guard let sampler = frozenSampler, let frozen = frozenImage else { return }
+        let px = Int(cursorLocal.x / max(1, bounds.width) * CGFloat(frozen.width))
+        let py = Int(cursorLocal.y / max(1, bounds.height) * CGFloat(frozen.height))
+        guard let rgba = sampler.rgba(x: px, y: py) else { return }
+        let formatted = sampler.formatted(x: px, y: py, format: colorCopyFormat)
+        let secondary = sampler.secondaryInfo(x: px, y: py, format: colorCopyFormat)
+        _ = AppCoordinatorShared.deps?.clipboard.writeText(formatted)
+        CaptureSoundPlayer.play()
+        Log.event(.overlay, "overlay.copyColor", [
+            "format": colorCopyFormat.rawValue,
+            "value": formatted,
+            "x": "\(px)", "y": "\(py)",
+        ])
         controller.perform(action: .cancel)
+        CaptureToast.showColorCopied(
+            formatted: formatted,
+            secondary: secondary,
+            r: rgba.r, g: rgba.g, b: rgba.b
+        )
+    }
+
+    /// ⇧C：轮换取色格式（HEX → RGB → HSL）并落盘，不关遮罩（可直接接着取下一个颜色）
+    private func cycleColorCopyFormat() {
+        colorCopyFormat = colorCopyFormat.next()
+        ColorCopyFormat.persisted = colorCopyFormat
+        needsDisplay = true
+        Log.event(.overlay, "overlay.colorFormat", ["format": colorCopyFormat.rawValue])
+    }
+
+    /// 方向键微调选中标注；返回 true = 吃掉这次方向键（不动整个选区框）
+    @discardableResult
+    private func nudgeSelectedAnnotation(dx: CGFloat, dy: CGFloat) -> Bool {
+        guard let session = editorSession,
+              let idx = selectedAnnotationIndex,
+              session.store.annotations.indices.contains(idx) else { return false }
+        let moved = session.store.annotations[idx].offsetBy(dx: dx, dy: dy)
+        session.store.replace(at: idx, with: moved)
+        controller.refreshToolbar()
+        needsDisplay = true
+        return true
+    }
+
+    /// 删除选中标注（Delete / ⌦）；返回 true = 吃掉这次按键
+    @discardableResult
+    private func deleteSelectedAnnotationIfNeeded() -> Bool {
+        guard let session = editorSession,
+              let idx = selectedAnnotationIndex,
+              session.store.remove(at: idx) else { return false }
+        selectedAnnotationIndex = nil
+        hoveredAnnotationIndex = nil
+        hoveredAnnotationHandle = nil
+        stylePreviewSnapshot = nil
+        controller.refreshToolbar()
+        needsDisplay = true
+        Log.event(.editor, "editor.annotation.delete", ["index": "\(idx)"])
+        return true
     }
 
     /// 键盘微调选区（编辑态方向键）
@@ -1382,6 +2023,16 @@ final class OverlayView: NSView {
     }
 
     private func handleEditorMouseUp(_ point: CGPoint) {
+        // 已画标注二次编辑：拖拽结束 → 整段拖拽只压一步撤销（单步 ⌘Z）
+        if case .editAnnotation(_, _, _, _, let preMutationSnapshot) = editGesture {
+            editorSession?.store.commitMutation(previousAnnotations: preMutationSnapshot)
+            editGesture = .none
+            pendingAnnotation = nil
+            stylePreviewSnapshot = nil
+            controller.refreshToolbar()
+            needsDisplay = true
+            return
+        }
         // 选区调整提交：重裁底图 + 平移标注 + 工具栏跟随
         if case .none = editGesture {} else {
             if case .move = editGesture {
@@ -1427,6 +2078,10 @@ final class OverlayView: NSView {
                 pendingStartPoint = nil
                 // 单击已有「自动脱敏」块：精准取消该处打码（压撤销栈，⌘Z 可恢复）
                 if session.store.removeAutoRedacted(at: a) {
+                    // 删除会让后续下标整体前移：选中态直接清掉（绝不让虚线框套在别的标注上）
+                    selectedAnnotationIndex = nil
+                    hoveredAnnotationIndex = nil
+                    hoveredAnnotationHandle = nil
                     hoveredAutoRedactRect = nil
                     controller.refreshToolbar()
                     showEditorToast("已取消该处脱敏")
@@ -1457,7 +2112,7 @@ final class OverlayView: NSView {
     /// 放弃」drop。正确语义：pendingAnnotation 的 shape 已随每次 drag 更新
     /// （draw 渲染的就是它 = 用户所见），直接提交 pending 即可。
     func flushPendingAnnotationForExport() {
-        guard let pending = pendingAnnotation, let session = editorSession else { return }
+        guard let pending = pendingAnnotation, editorSession != nil else { return }
         // 合法性只对「零尺寸」形状丢弃；已拖出的几何（drag 更新过）直接落库
         var final = pending
         switch pending.shape {
@@ -1509,14 +2164,14 @@ final class OverlayView: NSView {
     /// hudWindow 材质 + 60% 深着色 + 0.5pt 白 16% 描边；点选即改 session 档位并实时套到输入框）
     private var fontSizePicker: FontSizeBarView?
 
-    private func beginTextEditing(at annotationPoint: CGPoint) {
+    private func beginTextEditing(at annotationPoint: CGPoint, prefill: String = "") {
         commitTextFieldIfNeeded()
 
         let pointSize = CGFloat(editorSession?.textFontSize ?? OverlayView.textFontSizes[1])
         let localPoint = annotationToLocal(annotationPoint)
         let font = NSFont.systemFont(ofSize: pointSize, weight: .semibold)
         let fieldHeight = Self.preferredTextFieldHeight(for: font)
-        let initialWidth = Self.preferredTextFieldWidth(text: "", font: font, maxWidth: max(96, editorRectLocal.maxX - localPoint.x - 4))
+        let initialWidth = Self.preferredTextFieldWidth(text: prefill, font: font, maxWidth: max(96, editorRectLocal.maxX - localPoint.x - 4))
         // 使输入框内文字基线与点击处自然对齐，减少提交瞬间的位移跳动
         let originX = min(max(localPoint.x - GlassTextField.padX, editorRectLocal.minX + 2), max(editorRectLocal.minX + 2, editorRectLocal.maxX - initialWidth - 2))
         let originY = min(max(localPoint.y - fieldHeight / 2, editorRectLocal.minY + 2), max(editorRectLocal.minY + 2, editorRectLocal.maxY - fieldHeight - 2))
@@ -1537,10 +2192,63 @@ final class OverlayView: NSView {
         field.delegate = self
         addSubview(field)
         playTextFieldEntrance(field)
-        window?.makeFirstResponder(field)
         textField = field
+        // 原地改字：预填原文字（必须在 becomeFirstResponder 之前写入，fieldEditor 才会带上内容）
+        if !prefill.isEmpty { field.stringValue = prefill }
+        window?.makeFirstResponder(field)
+        if !prefill.isEmpty,
+           let editor = window?.fieldEditor(false, for: field) as? NSTextView {
+            // 全选：直接键入即整段覆盖
+            editor.selectAll(nil)
+        }
         installFontSizePicker(near: field.frame)
         textFieldAnchor = annotationPoint
+    }
+
+    /// 双击已有 `.text` 标注 = 原地改字：预填原文字并全选，Enter 提交（单步可 ⌘Z）/ Esc 原样恢复
+    private func beginInlineReeditText(atIndex index: Int) {
+        guard let session = editorSession, session.store.annotations.indices.contains(index) else { return }
+        let annot = session.store.annotations[index]
+        guard case .text(let anchor) = annot.shape, let text = annot.text, !text.isEmpty else { return }
+
+        // 先收掉可能存在的上一只输入框（幂等），再标记「这一条正在原地改字」
+        commitTextFieldIfNeeded()
+        selectedAnnotationIndex = index
+        editingTextAnnotationIndex = index
+        // 工具栏同步该标注的样式：改字同时可换色 / 改字号
+        let slot = ((annot.colorIndex % AnnotationModel.palette.count) + AnnotationModel.palette.count)
+            % AnnotationModel.palette.count
+        session.colorIndex = slot
+        session.textFontSize = Self.nearestTextFontSize(to: annot.fontSize)
+        controller.refreshToolbar()   // 同步颜色/字号档位，同时收起样式胶囊（改字时输入框+字号条已够）
+
+        // 输入框垂直居中于落点 → 把落点落在文字真实垂直中点上（而不是顶边），改字前后零跳动
+        //
+        // 逆运算（与 `beginTextEditing` / `commitTextFieldIfNeeded` 精确互逆）：
+        //   begin:  originX = placement.x - padX            originY = placement.y - fieldHeight / 2
+        //   commit: anchor.x = field.minX + padX + 2        anchor.y = field.minY + topInset + ascender
+        // 而 topInset = (fieldHeight - (ascender - descender)) / 2，即输入框内文字基线相对框顶的偏移。
+        // 因此零位移落点：
+        //   placement.x = anchor.x - 2
+        //   placement.y = anchor.y - (ascender + descender) / 2   （descender 为负值 ⇒ 正好是基线上方的垂直中点）
+        let placementFont = NSFont.systemFont(ofSize: CGFloat(session.textFontSize), weight: .semibold)
+        let placement = CGPoint(
+            x: anchor.x - 2,
+            y: anchor.y - (placementFont.ascender + placementFont.descender) / 2
+        )
+        beginTextEditing(at: placement, prefill: text)
+        needsDisplay = true
+        Log.event(.editor, "editor.text.reedit", [
+            "index": "\(index)",
+            "chars": "\(text.count)",
+            "size": "\(Int(annot.fontSize))",
+        ])
+    }
+
+    /// 现有字号归一到最近的 4 档（12/14/17/21）
+    private static func nearestTextFontSize(to fontSize: CGFloat) -> Int {
+        textFontSizes.min { abs(CGFloat($0) - fontSize) < abs(CGFloat($1) - fontSize) }
+            ?? textFontSizes[1]
     }
 
     /// 供工具栏点选颜色或字号时实时同步正在输入中的文字颜色、字号与浮条选中态
@@ -1628,6 +2336,13 @@ final class OverlayView: NSView {
 
     /// Esc 取消文字输入：先彻底结束 fieldEditor 编辑态，再让框与字号条 fade 退场
     private func cancelTextEditing() {
+        // 原地改字取消：store 里从未动过原文字，清下标即原样恢复显示（绝不闪一下空框）
+        if editingTextAnnotationIndex != nil {
+            editingTextAnnotationIndex = nil
+            needsDisplay = true
+            controller.refreshToolbar()
+            Log.event(.editor, "editor.text.reedit.cancel", [:])
+        }
         guard let field = textField else {
             removeFontSizePicker()
             return
@@ -1702,6 +2417,9 @@ final class OverlayView: NSView {
             y: field.frame.minY + topInset + font.ascender
         )
         let committedAnchor = localToAnnotation(committedLocal)
+        // 原地改字：记下目标下标（下面的清理会一并清掉这个标记）
+        let reeditIndex = editingTextAnnotationIndex
+        editingTextAnnotationIndex = nil
 
         // 先清空引用并脱离 fieldEditor，防止 endEditing 触发重入，也不让退场动画中的旧输入框残留焦点
         textField = nil
@@ -1712,6 +2430,18 @@ final class OverlayView: NSView {
 
         fadeOutTextField(field)
         removeFontSizePicker()
+
+        if let reeditIndex {
+            commitInlineReeditText(
+                atIndex: reeditIndex,
+                text: text,
+                colorIndex: session.colorIndex,
+                fontSize: CGFloat(session.textFontSize)
+            )
+            reclaimEditorFirstResponderAfterText()
+            return
+        }
+
         if !text.isEmpty {
             controller.addAnnotation(AnnotationModel(
                 shape: .text(anchor: committedAnchor),
@@ -1723,6 +2453,43 @@ final class OverlayView: NSView {
             ))
         }
         reclaimEditorFirstResponderAfterText()
+    }
+
+    /// 原地改字提交：空文本 = 删掉该条；否则用新文字/颜色/字号回写（保留原 anchor，提交瞬间文字零跳动）
+    /// 两条路径都只占一步撤销（remove / replace 内部自己压栈）
+    private func commitInlineReeditText(
+        atIndex index: Int,
+        text: String,
+        colorIndex: Int,
+        fontSize: CGFloat
+    ) {
+        guard let session = editorSession, session.store.annotations.indices.contains(index) else {
+            selectedAnnotationIndex = nil
+            needsDisplay = true
+            return
+        }
+        let original = session.store.annotations[index]
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            session.store.remove(at: index)
+            selectedAnnotationIndex = nil
+            Log.event(.editor, "editor.text.reedit.remove", ["index": "\(index)"])
+        } else {
+            var updated = original
+            updated.text = text
+            updated.colorIndex = colorIndex
+            updated.fontSize = fontSize
+            // shape 保持原 `.text(anchor:)` 不变：锚点不漂移，改完字原位不位移
+            session.store.replace(at: index, with: updated)
+            selectedAnnotationIndex = index
+            Log.event(.editor, "editor.text.reedit.commit", [
+                "index": "\(index)",
+                "chars": "\(text.count)",
+                "size": "\(Int(fontSize))",
+            ])
+        }
+        controller.refreshToolbar()
+        needsDisplay = true
     }
 
     /// 结束文字输入后把键盘焦点稳妥交回 OverlayView（含当前 doCommandBy 回退后的下一个 runloop tick 兜底）
@@ -1776,11 +2543,40 @@ final class OverlayView: NSView {
            commitDraggingSelection(via: "keyEquivalent") {
             ignoreNextMouseUpAfterEarlyCommit = true
         }
+        if phase == .waitingForDrag, handleSmartDirectHotkey(event) {
+            return true
+        }
         if phase == .editing, let action = matchEditorHotkey(event) {
             performEditorHotkeyAction(action)
             return true
         }
         return super.performKeyEquivalent(with: event)
+    }
+
+    /// 智能框选悬停态直达取字（O） / 贴图（P 或用户自定义组合键如 ⌘T）：
+    /// 同时被 `performKeyEquivalent`（⌘ 组合键入口）与 `keyDown`（裸键入口）调用，
+    /// 完整尊重 `settings.editorHotkeys` 的自定义绑定（无论裸键还是带 ⌘/⌥/⌃）。
+    private func handleSmartDirectHotkey(_ event: NSEvent) -> Bool {
+        guard phase == .waitingForDrag, !scrollMode, recordingMode == .none,
+              let screen = window?.screen else { return false }
+        guard let hotkey = EditorKeyRouter.matchHotkey(event),
+              hotkey == "ocr" || hotkey == "pin" else { return false }
+        // 悬停目标：屏幕四边 → 整屏；否则当前智能候选层（窗口候选才带 windowID）
+        var targetRect: CGRect?
+        var windowID: CGWindowID?
+        if edgeFullScreenHover {
+            targetRect = screen.frame
+        } else if let candidate = smartActiveCandidate {
+            targetRect = candidate.rectGlobal
+            windowID = Self.isWindowKind(candidate.kind) ? candidate.windowID : nil
+        }
+        guard let targetRect else { return false }
+        if hotkey == "ocr" {
+            controller.performSmartDirectOCR(rect: targetRect, on: screen, windowID: windowID)
+        } else {
+            controller.performSmartDirectPin(rect: targetRect, on: screen, windowID: windowID)
+        }
+        return true
     }
 
     override func keyDown(with event: NSEvent) {
@@ -1823,7 +2619,32 @@ final class OverlayView: NSView {
         }()
         if Int(event.keyCode) == kVK_ANSI_C, inSelectionPhase,
            !event.modifierFlags.contains(.command) {
-            copyColorUnderCursor()
+            // ⇧C = 轮换取色格式（HEX → RGB → HSL，不关遮罩）；裸 C = 复制光标处颜色
+            if event.modifierFlags.contains(.shift) {
+                cycleColorCopyFormat()
+            } else {
+                copyColorUnderCursor()
+            }
+            return
+        }
+        // 智能框选态：↑ 向外扩一层 / ↓ 向内缩一层（单元格 → 行 → 列 → 整表 → 窗口），
+        // 与滚轮切层同一套语义、同一个 `smartLayerUserPinned` 记忆（切换后不被异步回填抢回默认层）
+        if phase == .waitingForDrag, !scrollMode, recordingMode == .none,
+           !edgeFullScreenHover, smartStack.candidates.count > 1,
+           event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
+            switch Int(event.keyCode) {
+            case kVK_UpArrow:
+                stepSmartLayer(by: 1, via: "key")
+                return
+            case kVK_DownArrow:
+                stepSmartLayer(by: -1, via: "key")
+                return
+            default:
+                break
+            }
+        }
+        // 智能框选态：悬停候选上直接按取字键 / 贴图键一步直达（裸键走这里，⌘ 组合键已由 performKeyEquivalent 接管）
+        if phase == .waitingForDrag, handleSmartDirectHotkey(event) {
             return
         }
         // 空格：编辑态临时切「整体移动」（按下期间有效）
@@ -1831,15 +2652,20 @@ final class OverlayView: NSView {
             if phase == .editing { spacePressed = true }
             return
         }
-        // 方向键：编辑态微调选区（Shift = 10pt）
+        // 方向键：编辑态微调（有选中标注 → 只挪该标注；否则挪整个选区框。Shift = 10pt）
         if phase == .editing, [kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow].contains(Int(event.keyCode)) {
             let step: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
+            var dx: CGFloat = 0
+            var dy: CGFloat = 0
             switch Int(event.keyCode) {
-            case kVK_LeftArrow: nudgeSelection(dx: -step, dy: 0)
-            case kVK_RightArrow: nudgeSelection(dx: step, dy: 0)
-            case kVK_UpArrow: nudgeSelection(dx: 0, dy: -step)
-            case kVK_DownArrow: nudgeSelection(dx: 0, dy: step)
+            case kVK_LeftArrow: dx = -step
+            case kVK_RightArrow: dx = step
+            case kVK_UpArrow: dy = -step
+            case kVK_DownArrow: dy = step
             default: break
+            }
+            if !nudgeSelectedAnnotation(dx: dx, dy: dy) {
+                nudgeSelection(dx: dx, dy: dy)
             }
             return
         }
@@ -1884,7 +2710,13 @@ final class OverlayView: NSView {
                 window?.makeFirstResponder(self)
                 return
             }
+            // 已选中标注：Esc 先只取消选中（不关截图），再按一次才取消整个会话
+            if dismissAnnotationSelectionIfNeeded() { return }
             controller.perform(action: .cancel)
+        case kVK_Delete, kVK_ForwardDelete:
+            // 选中标注 + Delete/⌦ = 删除该条（可 ⌘Z 恢复）
+            if deleteSelectedAnnotationIfNeeded() { return }
+            super.keyDown(with: event)
         case kVK_Return, kVK_ANSI_KeypadEnter:
             if scrollMode {
                 controller.finishScrollForSelfTest()
@@ -1897,8 +2729,8 @@ final class OverlayView: NSView {
                 controller.perform(action: .copy)
             } else if phase == .waitingForDrag, edgeFullScreenHover {
                 pickFullDisplay()
-            } else if phase == .waitingForDrag, let target = hovered {
-                scheduleWindowCapture(target)
+            } else if phase == .waitingForDrag, let candidate = smartActiveCandidate {
+                pickSmartCandidate(candidate)
             }
         case kVK_ANSI_S:
             // ⌘⌥S 快存（内置语义，不走热键体系）；⌘S 保存与裸 S 滚动截图
@@ -1930,6 +2762,7 @@ final class OverlayView: NSView {
             if phase == .editing,
                let tool = toolFor(keyCode: Int(event.keyCode)) {
                 editorSession?.currentTool = (editorSession?.currentTool == tool) ? .none : tool
+                handleToolbarToolChange()
                 controller.refreshToolbar()
                 needsDisplay = true
                 return
@@ -1965,6 +2798,7 @@ final class OverlayView: NSView {
         selectTool: { [weak self] tool in
             guard let self else { return }
             self.editorSession?.currentTool = tool
+            self.handleToolbarToolChange()
             self.controller.refreshToolbar()
             self.needsDisplay = true
         }
@@ -2051,6 +2885,7 @@ final class OverlayView: NSView {
         default:
             drawSelection(ctx: ctx)
             drawSelectionOverlays(ctx: ctx)
+            drawAccessibilityHintIfNeeded(ctx: ctx)
         }
     }
 
@@ -2096,9 +2931,11 @@ final class OverlayView: NSView {
         ctx.setFillColor(NSColor.black.withAlphaComponent(dimAlpha).cgColor)
         ctx.fill(bounds)
 
-        // 1.5 窗口 / 边缘全屏悬停高亮：平滑变形挖空 + 系统蓝描边 + 角标
+        // 1.5 智能候选 / 边缘全屏悬停高亮：平滑变形挖空 + accent 描边 + 角标
         let selectionEmpty = selectionLocal.width <= 0 && selectionLocal.height <= 0
-        if selectionEmpty, let targetRect = hoveredLocalRect, (edgeFullScreenHover || hovered != nil) {
+        let smartCandidate = smartActiveCandidate
+        if selectionEmpty, let targetRect = hoveredLocalRect,
+           (edgeFullScreenHover || smartCandidate != nil) {
             let now = CACurrentMediaTime()
             let elapsed = hoverFadeStart > 0 ? now - hoverFadeStart : 1
             let hoverAlpha = min(1, CGFloat(elapsed / 0.14))
@@ -2109,7 +2946,10 @@ final class OverlayView: NSView {
                     self?.needsDisplay = true
                 }
             }
-            let cornerR: CGFloat = edgeFullScreenHover ? 0 : 10
+            // 圆角按目标类型适配：全屏 0 / 文本行 4 / 控件·区域 6 / 窗口 10
+            let cornerR: CGFloat = edgeFullScreenHover
+                ? 0
+                : Self.smartCornerRadius(for: smartCandidate?.kind)
             let clearPath = CGPath(roundedRect: drawRect, cornerWidth: cornerR, cornerHeight: cornerR, transform: nil)
             ctx.saveGState()
             ctx.setBlendMode(.clear)
@@ -2120,21 +2960,15 @@ final class OverlayView: NSView {
             let strokeRect = drawRect.insetBy(dx: 0.75, dy: 0.75)
             let strokeR = max(0, cornerR - 0.75)
             let strokePath = CGPath(roundedRect: strokeRect, cornerWidth: strokeR, cornerHeight: strokeR, transform: nil)
-            ctx.setFillColor(DesignTokens.accent.withAlphaComponent(0.04 * hoverAlpha).cgColor)
+            let fillAlpha: CGFloat = edgeFullScreenHover || Self.isWindowKind(smartCandidate?.kind) ? 0.04 : 0.05
+            ctx.setFillColor(DesignTokens.accent.withAlphaComponent(fillAlpha * hoverAlpha).cgColor)
             ctx.addPath(strokePath)
             ctx.fillPath()
             ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.88 * hoverAlpha).cgColor)
             ctx.setLineWidth(1.5)
             ctx.addPath(strokePath)
             ctx.strokePath()
-            let label: String
-            if edgeFullScreenHover {
-                label = "全屏 · 点击或回车确认"
-            } else if let target = hovered {
-                label = target.title.isEmpty ? target.ownerName : "\(target.ownerName) · \(target.title)"
-            } else {
-                label = ""
-            }
+            let label = hoverBadgeLabel(candidate: smartCandidate, rect: targetRect)
             if !label.isEmpty {
                 drawWindowBadge(text: label, below: drawRect)
             }
@@ -2164,9 +2998,148 @@ final class OverlayView: NSView {
         }
     }
 
+    /// 智能候选圆角：文本行·表格单元格 4 / 列表项·表格行列 5 / 控件·区域·识别块 6 / 表格 8 / 窗口 10 / 整屏 0
+    private static func smartCornerRadius(for kind: SmartCandidateKind?) -> CGFloat {
+        guard let kind else { return 10 }
+        switch kind {
+        case .textLine, .tableCell: return 4
+        case .listItem, .tableRow, .tableColumn: return 5
+        case .element, .container, .visualRect: return 6
+        case .table: return 8
+        case .window: return 10
+        case .display: return 0
+        }
+    }
+
+    /// 是否为窗口层（不依赖 SmartCandidateKind: Equatable 的隐式约定，用模式匹配更稳）
+    private static func isWindowKind(_ kind: SmartCandidateKind?) -> Bool {
+        guard let kind else { return false }
+        if case .window = kind { return true }
+        return false
+    }
+
+    /// 悬停角标文案：保持极简，只显示尺寸（整屏 / 窗口带精简标识，不铺「区域 / 滚轮切层」等冗长提示污染视线）
+    private func hoverBadgeLabel(candidate: SmartSelectionCandidate?, rect: CGRect) -> String {
+        let scale = window?.screen?.backingScaleFactor ?? 1
+        let pxW = Int((rect.width * scale).rounded())
+        let pxH = Int((rect.height * scale).rounded())
+        if edgeFullScreenHover { return "全屏 · \(pxW) × \(pxH)" }
+        guard let candidate else { return "" }
+        if Self.isWindowKind(candidate.kind), !candidate.ownerName.isEmpty {
+            return "\(candidate.ownerName) · \(pxW) × \(pxH)"
+        }
+        return "\(pxW) × \(pxH)"
+    }
+
     /// 选区阶段收尾：放大镜（独立方法，draw() 里在蒙层/选框之后调用）
     private func drawSelectionOverlays(ctx: CGContext) {
         drawMagnifier(ctx: ctx)
+    }
+
+    // MARK: - 辅助功能权限轻提示条
+
+    /// 未授权时的温和提示（不阻断截图）：点击主区 = 退出遮罩 + 直达系统设置辅助功能页；
+    /// 点 × = 以后不再提示。绘制时顺手缓存两个命中矩形供 mouseDown/mouseMoved 用。
+    private func drawAccessibilityHintIfNeeded(ctx: CGContext) {
+        guard shouldShowAXHint else {
+            axHintBannerRect = nil
+            axHintCloseRect = nil
+            return
+        }
+
+        let text = "未开启辅助功能 · 点击去开启，可精准识别表格与网页元素"
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.94),
+            .paragraphStyle: paragraph,
+        ]
+        let textSize = (text as NSString).size(withAttributes: attrs)
+
+        let height: CGFloat = 32
+        let padLeft: CGFloat = 14
+        let gap: CGFloat = 10
+        let closeWidth: CGFloat = 26
+        let padRight: CGFloat = 6
+        let available = max(80, bounds.width - 24)
+        let textWidth = min(ceil(textSize.width), available - padLeft - gap - 1 - gap - closeWidth - padRight)
+        let width = padLeft + textWidth + gap + 1 + gap + closeWidth + padRight
+        let bannerRect = CGRect(
+            x: ((bounds.width - width) / 2).rounded(),
+            y: 22,
+            width: width,
+            height: height
+        )
+        let dividerX = bannerRect.minX + padLeft + textWidth + gap
+        let closeRect = CGRect(x: dividerX + 1 + gap, y: bannerRect.minY, width: closeWidth, height: height)
+        axHintBannerRect = bannerRect
+        axHintCloseRect = closeRect
+
+        // 1. 深色半透胶囊 + 细白边（与工具栏胶囊同一族，不压住视觉焦点）
+        let path = CGPath(roundedRect: bannerRect, cornerWidth: 16, cornerHeight: 16, transform: nil)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 10, color: NSColor.black.withAlphaComponent(0.26).cgColor)
+        ctx.setFillColor(NSColor(white: 0.10, alpha: 0.84).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        ctx.restoreGState()
+        ctx.setStrokeColor(NSColor(white: 1, alpha: 0.16).cgColor)
+        ctx.setLineWidth(0.5)
+        ctx.addPath(path)
+        ctx.strokePath()
+
+        // 2. 主文案
+        (text as NSString).draw(
+            in: CGRect(
+                x: bannerRect.minX + padLeft,
+                y: bannerRect.minY + (height - textSize.height) / 2,
+                width: textWidth,
+                height: textSize.height
+            ),
+            withAttributes: attrs
+        )
+
+        // 3. 分隔线 + 关闭按钮 ×
+        ctx.setStrokeColor(NSColor(white: 1, alpha: 0.16).cgColor)
+        ctx.setLineWidth(1)
+        ctx.move(to: CGPoint(x: dividerX.rounded() + 0.5, y: bannerRect.minY + 9))
+        ctx.addLine(to: CGPoint(x: dividerX.rounded() + 0.5, y: bannerRect.maxY - 9))
+        ctx.strokePath()
+
+        let closeAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.72),
+        ]
+        let closeText = "×" as NSString
+        let closeSize = closeText.size(withAttributes: closeAttrs)
+        closeText.draw(
+            at: CGPoint(
+                x: (closeRect.midX - closeSize.width / 2).rounded(),
+                y: (closeRect.midY - closeSize.height / 2).rounded()
+            ),
+            withAttributes: closeAttrs
+        )
+    }
+
+    /// 点击主文案：先退出截图遮罩，再打开「系统设置 → 隐私与安全性 → 辅助功能」
+    /// （用户主动点击才允许弹系统确认框，符合全局权限纪律）
+    private func activateAccessibilityHint() {
+        Log.event(.overlay, "overlay.axhint.openSettings", ["trusted": "\(axTrusted)"])
+        controller.perform(action: .cancel)
+        AccessibilityPermission.requestAndOpenSettings()
+    }
+
+    /// 点击 ×：本次及以后不再提示（不影响继续截图）
+    private func dismissAccessibilityHint() {
+        UserDefaults.standard.set(true, forKey: Self.axHintDismissedKey)
+        axHintDismissed = true
+        axHintBannerRect = nil
+        axHintCloseRect = nil
+        axHintHovered = false
+        NSCursor.crosshair.set()
+        needsDisplay = true
+        Log.event(.overlay, "overlay.axhint.dismissed")
     }
 
     /// 编辑阶段：选区外蒙层 + 选区内冻结底图 + 标注层
@@ -2260,7 +3233,15 @@ final class OverlayView: NSView {
         //   每帧裁剪 + nearest 亚像素重采样导致的「移动选框时背后文字轻微变形/热浪抖动」；
         // - 开启画框时底下已铺渐变与卡片背景，必须绘制位图底图；
         // - 独立外源图（frozenImage == nil）或静止态含马赛克：正常绘制 `baseForDraw`。
-        let annotations = session.store.annotations + (pendingAnnotation.map { [$0] } ?? [])
+        let annotations: [AnnotationModel] = {
+            var items = session.store.annotations
+            // 原地改字：先撤下那条已落盘文字，避免输入框底下重影（Esc 取消则原样恢复显示）
+            if let reedit = editingTextAnnotationIndex, items.indices.contains(reedit) {
+                items.remove(at: reedit)
+            }
+            if let pending = pendingAnnotation { items.append(pending) }
+            return items
+        }()
         let hasMosaic = annotations.contains { annotation in
             if case .mosaic = annotation.shape { return true }
             return false
@@ -2271,7 +3252,7 @@ final class OverlayView: NSView {
         case .move(let startRect, _), .resize(_, let startRect):
             isDraggingBox = true
             annotationOrigin = (frozenImage != nil) ? startRect.origin : editorRectLocal.origin
-        case .none:
+        case .none, .editAnnotation:
             isDraggingBox = false
             annotationOrigin = editorRectLocal.origin
         }
@@ -2368,6 +3349,9 @@ final class OverlayView: NSView {
             ctx.strokePath()
             ctx.restoreGState()
         }
+
+        // 3.6 已画标注二次编辑视觉反馈（悬停浅蓝细虚框 / 选中蓝虚框 + 操控柄；同样不入导出图）
+        drawAnnotationEditingDecorations(ctx: ctx)
         ctx.restoreGState()
 
         if let layout = backdropLayout, let cardRect = cardRectLocal {
@@ -2428,6 +3412,102 @@ final class OverlayView: NSView {
 
         // 5. 提示条已移除（病例：长条提示与工具栏重叠、压住按钮，原型 scene 03 也没有它；
         //    快捷键教学放设置面板与首次引导，不占编辑画布）
+    }
+
+    // MARK: - 已画标注二次编辑（绘制）
+
+    /// 标注轴对齐包框（文字用与 CGRenderer 同字体的实测尺寸，命中框 = 视觉像素）
+    private func annotationFrameRect(for annotation: AnnotationModel) -> CGRect {
+        AnnotationEditorGeometry.boundingRect(for: annotation, textMetrics: measuredTextMetrics(for: annotation))
+    }
+
+    /// 选中/悬停视觉：克制到「看得出能改、不抢内容」——细虚线 + Apple 风格白底蓝环小圆柄，全部不入导出图
+    private func drawAnnotationEditingDecorations(ctx: CGContext) {
+        guard let session = editorSession else { return }
+        let items = session.store.annotations
+        let isReediting = editingTextAnnotationIndex != nil
+
+        // 悬停（非选中）：极克制浅蓝细虚线轮廓，提示「这里可点」
+        if session.currentTool == .none, !isReediting,
+           let hovered = hoveredAnnotationIndex, hovered != selectedAnnotationIndex,
+           items.indices.contains(hovered) {
+            drawAnnotationHoverOutline(for: items[hovered], ctx: ctx)
+        }
+
+        // 选中（且不在原地改字）：蓝虚框 + 操控柄
+        guard !isReediting,
+              let sel = selectedAnnotationIndex,
+              items.indices.contains(sel) else { return }
+        let annot = items[sel]
+        drawAnnotationSelectionFrame(for: annot, ctx: ctx)
+        for handlePoint in AnnotationEditorGeometry.handles(for: annot, textSize: measuredTextSize(for: annot)) {
+            let isHot = hoveredAnnotationIndex == sel && hoveredAnnotationHandle == handlePoint.handle
+            drawAnnotationHandle(at: handlePoint.point, isHot: isHot, ctx: ctx)
+        }
+    }
+
+    private func drawAnnotationHoverOutline(for annotation: AnnotationModel, ctx: CGContext) {
+        ctx.saveGState()
+        ctx.beginPath()
+        ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.45).cgColor)
+        ctx.setLineWidth(1)
+        ctx.setLineDash(phase: 0, lengths: [3, 3])
+        switch annotation.shape {
+        case .arrow(let from, let to), .highlight(let from, let to):
+            // 线形标注沿走向描一条虚线，比斜向包围盒更读懂是「哪一条」
+            ctx.move(to: from)
+            ctx.addLine(to: to)
+            ctx.strokePath()
+        default:
+            let box = annotationFrameRect(for: annotation).insetBy(dx: -3, dy: -3)
+            if box.width > 0.5, box.height > 0.5 {
+                ctx.addPath(CGPath(roundedRect: box, cornerWidth: 3, cornerHeight: 3, transform: nil))
+                ctx.strokePath()
+            }
+        }
+        ctx.restoreGState()
+    }
+
+    private func drawAnnotationSelectionFrame(for annotation: AnnotationModel, ctx: CGContext) {
+        switch annotation.shape {
+        case .arrow, .highlight:
+            // 箭头/高亮不画多余方框，直接高亮两个端点操控柄
+            return
+        default:
+            break
+        }
+        let box = annotationFrameRect(for: annotation).insetBy(dx: -3, dy: -3)
+        guard box.width > 0.5, box.height > 0.5 else { return }
+        ctx.saveGState()
+        ctx.beginPath()
+        ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.85).cgColor)
+        ctx.setLineWidth(1)
+        ctx.setLineDash(phase: 0, lengths: [4, 3])
+        ctx.addPath(CGPath(roundedRect: box, cornerWidth: 2, cornerHeight: 2, transform: nil))
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    /// 操控柄：与选区手柄同源的 Apple 风格（白填充 + 蓝描边 7.5pt 圆柄；悬停 9.5pt + 轻投影）
+    private func drawAnnotationHandle(at point: CGPoint, isHot: Bool, ctx: CGContext) {
+        let diameter: CGFloat = isHot ? 9.5 : 7.5
+        let circle = CGRect(
+            x: point.x - diameter / 2,
+            y: point.y - diameter / 2,
+            width: diameter,
+            height: diameter
+        )
+        ctx.saveGState()
+        if isHot {
+            ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 4,
+                          color: NSColor.black.withAlphaComponent(0.30).cgColor)
+        }
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.fillEllipse(in: circle)
+        ctx.restoreGState()
+        ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(isHot ? 1.0 : 0.92).cgColor)
+        ctx.setLineWidth(isHot ? 1.5 : 1.0)
+        ctx.strokeEllipse(in: circle)
     }
 
     /// 窗口名角标（统一深色半透玻璃胶囊族 + 0.5pt 发丝边 + 轻影，告别突兀纯白条）
@@ -2565,7 +3645,8 @@ final class OverlayView: NSView {
             imageSize: CGSize(width: frozen.width, height: frozen.height),
             screenPoints: screen.frame.size,
             globalOrigin: CGPoint(x: frame.minX, y: screen.frame.maxY),
-            ctx: ctx
+            ctx: ctx,
+            format: colorCopyFormat
         )
     }
 
