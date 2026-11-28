@@ -33,6 +33,9 @@
 - 构建签名必须用**固定开发证书**（Makefile 里的 SIGN_ID），不能用 ad-hoc：
   ad-hoc 每次构建 cdhash 变 ⇒ TCC 记录失效 ⇒ 用户被反复弹授权窗。
 - 换 bundle 路径 / 换签名身份都会让屏幕录制授权重置，验证清单要注明当前签名方式。
+- 构建/发版口径已收进 `mcak`（`~/work/project/macos-app-kit/`，规范 `~/.pi/agent/skills/macos-app-kit/SKILL.md`）：
+  `.mcak.env` 是本工程的签名/发版配置；`mcak dev` 与 `make dev` 等价且多一道「requirement 无 cdhash」断言；
+  `mcak doctor` 用于怀疑授权/配置出问题时体检。**新增构建或发版脚本前先看 mcak 有没有现成的**，别再造一份。
 
 ## 图标管线纪律
 
