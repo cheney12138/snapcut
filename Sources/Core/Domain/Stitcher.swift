@@ -86,9 +86,10 @@ enum Stitcher {
 
     /// 流式增量拼接会话（非线程安全；由调用方在串行 actor / 队列内驱动）。
     final class Session {
-        private enum ReferenceMode {
-            case previousFrame
-            case canvasWindow
+        /// 原始关键帧档案条目：`offsetY` 为该帧首行在画布坐标系（Y-down，长图顶 = 0）中的绝对偏移。
+        private struct KeyframeAnchor {
+            var offsetY: Int
+            let frame: TileMotionEstimator.PreparedFrame
         }
 
         private let options: Options
@@ -105,10 +106,14 @@ enum Stitcher {
 
         private var canvasPixels = Data()
         private var referenceFrame: TileMotionEstimator.PreparedFrame?
-        /// 回滚进入已拼画布内部后切换为 CanvasWindow 对齐参考（对齐 SnowShot 零漂移策略）
-        private var referenceMode: ReferenceMode = .previousFrame
-        private var cachedCanvasWindowPos: Int?
-        private var cachedCanvasWindowFrame: TileMotionEstimator.PreparedFrame?
+        /// 原始关键帧档案（**始终是未剥离 sticky UI 的原始帧**）——回滚重定位与边界防重的唯一依据。
+        /// 绝对不能用 `canvasPixels` 切片当参考：那份像素已剥掉 sticky 顶栏、且重复盖印了 sticky 侧栏，
+        /// 固定 UI 屏蔽会失效，在高度重复的表格行上疯狂漂移（Raptor 网页实机病例根因）。
+        private var keyframes: [KeyframeAnchor] = []
+        /// 关键帧内存上限：超出后保留首尾锚点，中间按间距稀疏淘汰（4K 长滚动不占满内存）
+        private let maxKeyframes = 12
+        /// 是否发生过向下扩展（Append）：为 true 时向上越界必须由顶锚点高置信度确认才放行 Prepend
+        private var hasAppendedDownward = false
         /// 最近一次 `push` 的诊断信息（供实时日志排查）
         private(set) var lastEstimate: TileMotionEstimator.Estimate?
         private(set) var lastPrepMs: Int = 0
@@ -118,32 +123,6 @@ enum Stitcher {
 
         init(options: Options = Options()) {
             self.options = options
-        }
-
-        /// 从已拼画布提取当前 `viewportPosition` 处高度为 `height` 的参考切片（零漂移对齐用）
-        private func loadCanvasWindowReference(height: Int) -> TileMotionEstimator.PreparedFrame? {
-            guard canvasWidth > 8, height > options.minOverlap,
-                  viewportPosition >= 0, viewportPosition + height <= canvasHeight else {
-                return nil
-            }
-            if let cached = cachedCanvasWindowFrame,
-               cachedCanvasWindowPos == viewportPosition,
-               cached.height == height {
-                return cached
-            }
-            let rowBytes = canvasWidth * 4
-            let byteStart = viewportPosition * rowBytes
-            let byteEnd = (viewportPosition + height) * rowBytes
-            guard byteStart >= 0, byteEnd <= canvasPixels.count else { return nil }
-            let slice = canvasPixels.subdata(in: byteStart..<byteEnd)
-            guard let prepared = TileMotionEstimator.PreparedFrame(
-                rgbaSlice: slice, width: canvasWidth, height: height,
-                downsample: options.estimatorOptions.downsample) else {
-                return nil
-            }
-            cachedCanvasWindowPos = viewportPosition
-            cachedCanvasWindowFrame = prepared
-            return prepared
         }
 
         /// 推入一帧并立即完成运动估计与增量画布合成。
@@ -174,9 +153,8 @@ enum Stitcher {
                 canvasPixels = Data(capacity: initialRGBA.count * 3)
                 canvasPixels.append(initialRGBA)
                 referenceFrame = prepared
-                referenceMode = .previousFrame
-                cachedCanvasWindowPos = nil
-                cachedCanvasWindowFrame = nil
+                keyframes = [KeyframeAnchor(offsetY: 0, frame: prepared)]
+                hasAppendedDownward = false
                 seams = [SeamInfo(
                     frameIndex: 0, overlapRows: 0,
                     contributedRows: prepared.height, offsetY: 0)]
@@ -200,48 +178,59 @@ enum Stitcher {
                 return .staticFrame
             }
 
-            // 回滚进入已拼区域后，优先用 CanvasWindow 与当前帧直接对齐以消除来回滚动累计漂移；
-            // 若 CanvasWindow 未命中（如大幅越过边界或顶底栏占比较高），自动回退到 rawRef 兜底。
-            var estimate: TileMotionEstimator.Estimate?
-            var matchedRefHeight = rawRef.height
-            if referenceMode == .canvasWindow,
-               let canvasRef = loadCanvasWindowReference(height: cur.height),
-               let canvasEst = TileMotionEstimator.estimateShift(
-                   ref: canvasRef, cur: cur, options: options.estimatorOptions) {
-                if case .motion = canvasEst.outcome {
-                    estimate = canvasEst
-                    matchedRefHeight = canvasRef.height
+            // 已采关键帧快判（<0.1ms）：画面回到曾采集过的位置时直接锚回，
+            // 避免「反复来回滚动」在重复表格行上逐帧累计漂移。
+            if let hit = matchCapturedKeyframe(cur: cur) {
+                referenceFrame = cur
+                lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+                if abs(viewportPosition - hit.offsetY) <= 2 {
+                    return .staticFrame
                 }
-            }
-            if estimate == nil {
-                estimate = TileMotionEstimator.estimateShift(
-                    ref: rawRef, cur: cur, options: options.estimatorOptions)
-                matchedRefHeight = rawRef.height
+                viewportPosition = hit.offsetY
+                return .contained(positionY: hit.offsetY, totalHeight: canvasHeight)
             }
 
-            guard let estimate else {
+            // 主位移估计**始终**用原始帧 rawRef：canvasPixels 切片已剥掉 sticky 顶栏、且重复盖印侧栏，
+            // 拿它当主参考会让 fixed UI 屏蔽失效（Raptor 网页实机病例：重复表格行上 posY 疯狂漂移）。
+            guard let rawEstimate = TileMotionEstimator.estimateShift(
+                ref: rawRef, cur: cur, options: options.estimatorOptions) else {
                 lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
                 return .skipped
             }
-            lastEstimate = estimate
-            lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+            lastEstimate = rawEstimate
 
-            switch estimate.outcome {
+            switch rawEstimate.outcome {
             case .noMotion:
+                lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
                 return .staticFrame
             case .indeterminate:
+                // 兜底重定位：高速扇屏/跳帧后恰好落回已采关键帧附近时直接锚回已拼区域
+                let anchored = reanchorAfterIndeterminate(cur: cur)
+                lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+                if let anchored {
+                    referenceFrame = cur
+                    viewportPosition = anchored
+                    return .contained(positionY: anchored, totalHeight: canvasHeight)
+                }
                 return .skipped
             case .motion(let dy):
-                guard dy != 0 else { return .staticFrame }
-                let minH = min(matchedRefHeight, cur.height)
+                guard dy != 0 else {
+                    lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
+                    return .staticFrame
+                }
+                let minH = min(rawRef.height, cur.height)
                 let overlap = minH - abs(dy)
                 guard overlap >= options.minOverlap else {
+                    lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
                     return .skipped
                 }
 
                 let curH = cur.height
                 let rowBytes = canvasWidth * 4
-                let candidate = viewportPosition - dy
+                // 关键帧重定位 + 边界防重闸门（顶锚点核验 / 底锚点核验 / 内部零漂移锚定）
+                let candidate = reanchorWithKeyframes(
+                    cur: cur, candidate: viewportPosition - dy, curH: curH).pos
+                lastEstMs = Int((DispatchTime.now().uptimeNanoseconds - t1) / 1_000_000)
 
                 // 检测相邻原始帧的静态顶栏/底栏带（必须用 rawRef 与 cur 比较，才能检出固定顶底栏）
                 let (staticTop, staticBottom) = rawRef.height == cur.height
@@ -271,9 +260,8 @@ enum Stitcher {
                     viewportPosition = candidate
                     maxViewportPosition = max(maxViewportPosition, candidate)
                     referenceFrame = cur
-                    referenceMode = .previousFrame
-                    cachedCanvasWindowPos = nil
-                    cachedCanvasWindowFrame = nil
+                    recordKeyframe(offsetY: candidate, frame: cur)
+                    hasAppendedDownward = true
                     contributingFrameCount += 1
 
                     let seamOverlap = curH - growth
@@ -285,10 +273,9 @@ enum Stitcher {
                     ))
                     return .appended(growthRows: growth, totalHeight: canvasHeight)
                 } else if candidate >= 0 {
-                    // 在已合成画布范围内回弹/回滚（Contained）：不破坏画布，切到 CanvasWindow 参考模式防漂移
+                    // 在已合成画布范围内回弹/回滚（Contained）：不破坏画布，靠关键帧档案保持零漂移
                     viewportPosition = candidate
                     referenceFrame = cur
-                    referenceMode = .canvasWindow
                     return .contained(positionY: candidate, totalHeight: canvasHeight)
                 } else {
                     // 向上超出画布顶部（Prepend）
@@ -311,9 +298,8 @@ enum Stitcher {
                     viewportPosition = 0
                     maxViewportPosition += growth
                     referenceFrame = cur
-                    referenceMode = .previousFrame
-                    cachedCanvasWindowPos = nil
-                    cachedCanvasWindowFrame = nil
+                    shiftKeyframes(deltaY: growth)
+                    recordKeyframe(offsetY: 0, frame: cur)
                     contributingFrameCount += 1
 
                     seams = seams.map { seam in
@@ -333,6 +319,217 @@ enum Stitcher {
                     return .prepended(growthRows: growth, totalHeight: canvasHeight)
                 }
             }
+        }
+
+        // MARK: - 原始关键帧档案与关键帧重定位
+
+        /// 记录一个原始关键帧（按 `offsetY` 去重后插入）并做裁剪。
+        private func recordKeyframe(offsetY: Int, frame: TileMotionEstimator.PreparedFrame) {
+            keyframes.removeAll { $0.offsetY == offsetY }
+            keyframes.append(KeyframeAnchor(offsetY: offsetY, frame: frame))
+            trimKeyframes()
+        }
+
+        /// Prepend 后已有关键帧在画布坐标系整体下移 `deltaY`。
+        private func shiftKeyframes(deltaY: Int) {
+            for i in keyframes.indices {
+                keyframes[i].offsetY += deltaY
+            }
+        }
+
+        /// 关键帧数量裁剪：保留首帧（顶锚点）与末帧（底锚点），中间按间距稀疏淘汰。
+        private func trimKeyframes() {
+            keyframes.sort { $0.offsetY < $1.offsetY }
+            guard keyframes.count > maxKeyframes, let first = keyframes.first,
+                  let last = keyframes.last else { return }
+            let middle = Array(keyframes[1..<(keyframes.count - 1)])
+            guard !middle.isEmpty else { return }
+            let slots = max(1, maxKeyframes - 2)
+            var kept: [KeyframeAnchor] = []
+            var seen = Set<Int>()
+            for slot in 0..<slots {
+                let idx = min(middle.count - 1, (slot * middle.count) / slots)
+                let anchor = middle[idx]
+                if seen.insert(anchor.offsetY).inserted {
+                    kept.append(anchor)
+                }
+            }
+            keyframes = [first] + kept + [last]
+        }
+
+        /// 找离 `position` 最近的、且不是 `excludingImage` 的关键帧（不重复计算同一个 prepared frame）。
+        private func nearestKeyframe(
+            to position: Int,
+            excludingImage: CGImage? = nil
+        ) -> KeyframeAnchor? {
+            var best: KeyframeAnchor?
+            var bestDistance = Int.max
+            for anchor in keyframes {
+                if let excludingImage, anchor.frame.cgImage === excludingImage { continue }
+                let distance = abs(anchor.offsetY - position)
+                if distance < bestDistance {
+                    bestDistance = distance
+                    best = anchor
+                }
+            }
+            return best
+        }
+
+        /// 已访问边界快判：当前帧是否就是某个已知关键帧（顶锚点 / 底锚点 / 离视口最近的关键帧）。
+        /// 命中说明位置完全已知，直接锚回，不再依赖位移估计（全采样比对，< 0.1ms）。
+        private func matchCapturedKeyframe(
+            cur: TileMotionEstimator.PreparedFrame
+        ) -> KeyframeAnchor? {
+            var probes: [KeyframeAnchor] = []
+            if let top = keyframes.first(where: { $0.offsetY == 0 }) {
+                probes.append(top)
+            }
+            if maxViewportPosition > 0,
+               let bottom = keyframes.last(where: { $0.offsetY == maxViewportPosition }) {
+                probes.append(bottom)
+            }
+            if let nearest = nearestKeyframe(to: viewportPosition) {
+                probes.append(nearest)
+            }
+            var checked = Set<Int>()
+            for probe in probes {
+                guard checked.insert(probe.offsetY).inserted else { continue }
+                guard probe.frame.height == cur.height else { continue }
+                guard probe.frame.cgImage !== cur.cgImage else { continue }
+                if Self.fastFramesIdentical(ref: probe.frame, cur: cur) {
+                    return probe
+                }
+            }
+            return nil
+        }
+
+        /// `.indeterminate` 的兜底重定位：高速甩屏 / 跳帧后恰好落回已采关键帧附近时直接锚回。
+        /// 最多额外跑 2 次关键帧复核，保证单帧耗时可控。
+        private func reanchorAfterIndeterminate(
+            cur: TileMotionEstimator.PreparedFrame
+        ) -> Int? {
+            let rawImage = referenceFrame?.cgImage
+            var probes: [KeyframeAnchor] = []
+            if let nearest = nearestKeyframe(to: viewportPosition, excludingImage: rawImage) {
+                probes.append(nearest)
+            }
+            if let top = keyframes.first(where: { $0.offsetY == 0 }), top.frame.cgImage !== rawImage {
+                probes.append(top)
+            }
+            if maxViewportPosition > 0,
+               let bottom = keyframes.last(where: { $0.offsetY == maxViewportPosition }),
+               bottom.frame.cgImage !== rawImage {
+                probes.append(bottom)
+            }
+            var tried = Set<Int>()
+            for probe in probes.prefix(2) {
+                guard tried.insert(probe.offsetY).inserted else { continue }
+                guard let estimate = TileMotionEstimator.estimateShift(
+                    ref: probe.frame, cur: cur, options: options.estimatorOptions) else { continue }
+                guard estimate.confidence >= 0.65, estimate.preciseError <= 0.025,
+                      case .motion(let probeDy) = estimate.outcome else { continue }
+                let anchoredPos = probe.offsetY - probeDy
+                if anchoredPos >= 0, anchoredPos <= maxViewportPosition {
+                    return anchoredPos
+                }
+            }
+            return nil
+        }
+
+        /// 关键帧重定位 + 边界防重闸门（去重核心）：
+        /// - **顶边界核验**：准备向上越界时用顶锚点（`offsetY == 0`）反查真实位置，封堵漂移导致的假 Prepend；
+        /// - **底边界核验**：准备向下越界时用底锚点（`offsetY == maxViewportPosition`）反查，封堵重复 Append；
+        /// - **内部区间零漂移锚定**：落在已采区域内时用最近的原始关键帧锁住位置；
+        /// - **已向下滚过的严格 Prepend 守卫**：必须由顶锚点高置信度确认真的向上越界才放行。
+        private func reanchorWithKeyframes(
+            cur: TileMotionEstimator.PreparedFrame,
+            candidate: Int,
+            curH: Int
+        ) -> (pos: Int, matchedTop: Bool, matchedBottom: Bool, topEst: TileMotionEstimator.Estimate?) {
+            var pos = candidate
+            var matchedTop = false
+            var matchedBottom = false
+            var topEst: TileMotionEstimator.Estimate?
+            let rawImage = referenceFrame?.cgImage
+            let topKF = keyframes.first(where: { $0.offsetY == 0 })
+
+            // 1) 顶边界核验（同一 prepared frame 直接跳过，不做冗余计算）
+            if pos < curH / 2, let topKF, topKF.frame.cgImage !== rawImage,
+               let estimate = TileMotionEstimator.estimateShift(
+                   ref: topKF.frame, cur: cur, options: options.estimatorOptions) {
+                topEst = estimate
+                switch estimate.outcome {
+                case .noMotion:
+                    // 已在顶部：禁止 Prepend
+                    pos = topKF.offsetY
+                    matchedTop = true
+                case .motion(let topDy):
+                    let topOverlap = min(topKF.frame.height, curH) - abs(topDy)
+                    if topOverlap >= options.minOverlap,
+                       estimate.confidence >= 0.55, estimate.preciseError <= 0.035 {
+                        let topPos = topKF.offsetY - topDy
+                        pos = topPos
+                        if topPos >= 0 { matchedTop = true }
+                    }
+                case .indeterminate:
+                    break
+                }
+            }
+
+            // 2) 底边界核验（仅在真正有「已采底部」时才做）
+            if pos + curH > canvasHeight - curH / 2, maxViewportPosition > 0,
+               let botKF = keyframes.last(where: { $0.offsetY == maxViewportPosition }),
+               botKF.frame.cgImage !== rawImage,
+               let estimate = TileMotionEstimator.estimateShift(
+                   ref: botKF.frame, cur: cur, options: options.estimatorOptions) {
+                switch estimate.outcome {
+                case .noMotion:
+                    // 已在底部：禁止重复 Append
+                    pos = botKF.offsetY
+                    matchedBottom = true
+                case .motion(let botDy):
+                    let botOverlap = min(botKF.frame.height, curH) - abs(botDy)
+                    if botOverlap >= options.minOverlap,
+                       estimate.confidence >= 0.55, estimate.preciseError <= 0.035 {
+                        let botPos = botKF.offsetY - botDy
+                        pos = botPos
+                        if botPos <= maxViewportPosition { matchedBottom = true }
+                    }
+                case .indeterminate:
+                    break
+                }
+            }
+
+            // 3) 已采区间内部零漂移锚定（关键帧是原始画面，完整保留 sticky 顶栏/侧栏屏蔽能力）
+            if !matchedTop, pos > 0, pos + curH <= canvasHeight,
+               let anchor = nearestKeyframe(to: pos, excludingImage: rawImage),
+               abs(anchor.offsetY - pos) < (curH * 65) / 100,
+               let estimate = TileMotionEstimator.estimateShift(
+                   ref: anchor.frame, cur: cur, options: options.estimatorOptions),
+               case .motion(let anchorDy) = estimate.outcome,
+               estimate.confidence >= 0.65, estimate.preciseError <= 0.025 {
+                let anchoredPos = anchor.offsetY - anchorDy
+                if anchoredPos >= 0, anchoredPos <= maxViewportPosition {
+                    pos = anchoredPos
+                }
+            }
+
+            // 4) 已向下滚动后的严格 Prepend 守卫：必须由顶锚点高置信度确认真的向上越界
+            if hasAppendedDownward, pos < 0 {
+                var confirmedOverflow = false
+                if let topEst, case .motion(let topDy) = topEst.outcome, let topKF {
+                    confirmedOverflow = (topKF.offsetY - topDy) < 0
+                        && topEst.confidence >= 0.65
+                        && topEst.preciseError <= 0.025
+                }
+                if !confirmedOverflow {
+                    // 视为漂移/误判：钳制回顶部已拼区域，绝不把顶栏/侧栏重复贴到画布上方
+                    pos = 0
+                    matchedTop = true
+                }
+            }
+
+            return (pos: pos, matchedTop: matchedTop, matchedBottom: matchedBottom, topEst: topEst)
         }
 
         /// 将增量画布毫秒级导出为 CGImage。

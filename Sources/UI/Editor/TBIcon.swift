@@ -15,6 +15,7 @@ enum TBIcon {
         case arrow, rect, text, mosaic, sequence, highlight, ellipse
         case undo, redo, ocr, pin, backdrop, eye, more
         case save, cancel, copy, scroll
+        case record, recordGIF
     }
 
     private struct Spec {
@@ -62,6 +63,10 @@ enum TBIcon {
             return Spec(symbol: "square.and.arrow.down", pointSizeDelta: -0.5, weight: .medium, hierarchical: true)
         case .cancel:
             return Spec(symbol: "xmark", pointSizeDelta: -1.5, weight: .semibold, hierarchical: false)
+        case .record:
+            return Spec(symbol: "video", pointSizeDelta: -0.5, weight: .medium, hierarchical: true)
+        case .recordGIF:
+            return Spec(symbol: "play.square.stack", pointSizeDelta: -0.5, weight: .medium, hierarchical: true)
         }
     }
 

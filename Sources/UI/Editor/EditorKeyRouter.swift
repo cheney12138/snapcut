@@ -18,6 +18,8 @@ enum EditorKeyRouter {
         var done: () -> Void = {}
         var cancel: () -> Void = {}
         var scroll: () -> Void = {}
+        var record: () -> Void = {}
+        var recordGIF: () -> Void = {}
         var selectTool: (EditorSession.Tool) -> Void = { _ in }
 
         init(
@@ -30,6 +32,8 @@ enum EditorKeyRouter {
             done: @escaping () -> Void = {},
             cancel: @escaping () -> Void = {},
             scroll: @escaping () -> Void = {},
+            record: @escaping () -> Void = {},
+            recordGIF: @escaping () -> Void = {},
             selectTool: @escaping (EditorSession.Tool) -> Void = { _ in }
         ) {
             self.undo = undo
@@ -41,6 +45,8 @@ enum EditorKeyRouter {
             self.done = done
             self.cancel = cancel
             self.scroll = scroll
+            self.record = record
+            self.recordGIF = recordGIF
             self.selectTool = selectTool
         }
     }
@@ -55,9 +61,10 @@ enum EditorKeyRouter {
             fromkeyCode: UInt32(event.keyCode),
             modifiers: event.modifierFlags.hotkeyModifiers
         ) else { return nil }
-        for (actionKey, stored) in settings.editorHotkeys {
-            if ignoringScroll, actionKey == "scroll" { continue }
-            let effective = stored.isEmpty ? (AppSettings.defaultEditorHotkeys[actionKey] ?? "") : stored
+        let allKeys = Set(AppSettings.defaultEditorHotkeys.keys).union(settings.editorHotkeys.keys)
+        for actionKey in allKeys {
+            if ignoringScroll, actionKey == "scroll" || actionKey == "record" || actionKey == "recordGIF" { continue }
+            let effective = settings.editorHotkey(for: actionKey)
             guard !effective.isEmpty else { continue }
             // 撞内置键（快存 ⌘⌥S / 文字态 Esc/Return——调用方已挡）：
             // 组合一致时让内置语义先行（设置页有冲突提示）
@@ -84,6 +91,8 @@ enum EditorKeyRouter {
         case "done": actions.done()
         case "cancel": actions.cancel()
         case "scroll": actions.scroll()
+        case "record": actions.record()
+        case "recordGIF": actions.recordGIF()
         default: break
         }
     }

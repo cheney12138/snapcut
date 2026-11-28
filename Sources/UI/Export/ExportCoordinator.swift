@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import UniformTypeIdentifiers
 
 /// 导出协调器（docs/03 §4 Export 模块，v0.1 子集：复制 + 保存）
 @MainActor
@@ -56,6 +57,77 @@ final class ExportCoordinator {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         return formatter.string(from: Date())
+    }
+
+    /// 准备录制输出路径（遵循设置的保存目录与命名风格；`askEveryTime` 先落临时目录，停止后再弹保存面板）
+    func prepareRecordingOutputURL(format: RecordingFormat, settings: AppSettings) -> (url: URL, isTemporary: Bool) {
+        let name: String
+        switch settings.filenameStyle {
+        case .timestamp:
+            name = Self.timestampName()
+        case .appAndTime:
+            let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Snapcut"
+            name = "\(app)_\(Self.timestampName())"
+        case .askEveryTime:
+            let tempDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SnapcutRecordings", isDirectory: true)
+            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            let url = tempDir.appendingPathComponent("\(Self.timestampName()).\(format.fileExtension)")
+            return (url, true)
+        }
+
+        let dir = URL(fileURLWithPath: (settings.saveDirectoryPath as NSString).expandingTildeInPath)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("\(name).\(format.fileExtension)")
+        return (url, false)
+    }
+
+    /// 当命名风格为「每次询问」时，录制完成后弹出保存面板并将临时文件移动到目标路径
+    func finalizeAskEveryTimeRecording(
+        _ result: RecordingResult,
+        completion: @escaping (RecordingResult?) -> Void
+    ) {
+        guard result.isTemporaryFile else {
+            completion(result)
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = result.format == .mp4 ? [.mpeg4Movie] : [.gif]
+        panel.nameFieldStringValue = "Snapcut \(Self.timestampName()).\(result.format.fileExtension)"
+        panel.message = result.format == .mp4 ? "保存屏幕录制" : "保存 GIF 录制"
+        panel.begin { [weak self] response in
+            guard response == .OK, let destURL = panel.url else {
+                try? FileManager.default.removeItem(at: result.fileURL)
+                Log.event(.recording, "recording.save.cancelled")
+                self?.releaseFocus()
+                completion(nil)
+                return
+            }
+            do {
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try FileManager.default.removeItem(at: destURL)
+                }
+                try FileManager.default.moveItem(at: result.fileURL, to: destURL)
+                let moved = RecordingResult(
+                    format: result.format,
+                    fileURL: destURL,
+                    pixelWidth: result.pixelWidth,
+                    pixelHeight: result.pixelHeight,
+                    duration: result.duration,
+                    fileSizeBytes: result.fileSizeBytes,
+                    thumbnail: result.thumbnail,
+                    isTemporaryFile: false
+                )
+                Log.event(.recording, "recording.save.ok", ["format": result.format.rawValue])
+                self?.releaseFocus()
+                completion(moved)
+            } catch {
+                Log.error(.recording, "recording.save.moveFail", ["err": error.localizedDescription])
+                self?.releaseFocus()
+                completion(result)
+            }
+        }
     }
 
     // MARK: - 私有

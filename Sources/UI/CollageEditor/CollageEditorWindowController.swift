@@ -188,8 +188,8 @@ final class CollageEditorWindowController: NSWindowController, NSWindowDelegate 
                 "preset": session.backdropStyle.preset.rawValue,
                 "host": "collage",
             ])
-        case .scroll, .autoRedact:
-            // 滚动截图与自动脱敏快捷胶囊由截图主编辑器承载
+        case .scroll, .record, .recordGIF, .autoRedact:
+            // 滚动截图、录屏与自动脱敏快捷胶囊由截图主编辑器承载
             break
         }
     }

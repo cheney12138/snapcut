@@ -2,6 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 import QuartzCore
+import VisionKit
 
 /// 贴图内容视图：1:1 像素精确绘制（不重采样）+ 6pt 圆角 + 1px 白描边 + 交互转发。
 /// isFlipped 场景：CGContext.draw 假设 Y-up，本视图 Y-down ⇒ 局部镜像一次再 draw
@@ -28,6 +29,18 @@ final class PinContentView: NSView {
 
     /// 右上角悬停关闭按钮（20×20 深半透圆钮，悬停时柔显，一键关闭单张贴图）
     private let closeButton = PinHoverCloseButton()
+
+    /// 实况文本宿主（垫在最底层：右上角按钮 / HUD 永远压在它上面保持可点击可读）
+    private let liveTextHost = PinLiveTextHostView(frame: .zero)
+    /// 右上角实况文本圆钮（位于关闭钮左侧 6pt，20×20 同规范）
+    private let liveTextButton = PinHoverLiveTextButton()
+    /// 后台静默分析是否识别到文字（无文字则整条实况文本入口不出现）
+    private var hasLiveText = false
+    /// 鼠标是否停在贴图上（悬停按钮组的显隐依据）
+    private var isHovering = false
+    /// 悬停按钮组在当前尺寸下是否拥挤（宽 < 84 或高 < 44 时只留关闭钮）
+    private var controlsTooSmall: Bool { bounds.width < 84 || bounds.height < 44 }
+
     private var hoverTrackingArea: NSTrackingArea?
 
     /// 吸附预览（拖动中贴合：移动卡与目标卡都亮）；视觉由 CAShapeLayer 承担
@@ -39,6 +52,22 @@ final class PinContentView: NSView {
 
     override init(frame: NSRect) {
         super.init(frame: frame)
+        liveTextHost.frame = bounds
+        addSubview(liveTextHost)
+        liveTextHost.onScrollWheel = { [weak self] event in
+            // 划词态下的滚轮依然要能缩放（⌥ 调透明度）；锚点按内容视图（翻转）坐标换算
+            guard let self else { return }
+            self.controller?.handleScroll(event, anchor: self.convert(event.locationInWindow, from: nil))
+        }
+        liveTextHost.onMagnify = { [weak self] event in
+            guard let self else { return }
+            let factor = max(0.2, 1 + event.magnification)
+            self.controller?.applyZoom(
+                factor: factor,
+                anchor: self.convert(event.locationInWindow, from: nil)
+            )
+        }
+
         hud.isHidden = true
         hud.alphaValue = 0
         // 固定贴住右下角：翻转坐标下 min-Y 视觉上是顶部，顶部/左侧边距可伸缩
@@ -50,6 +79,12 @@ final class PinContentView: NSView {
         closeButton.target = self
         closeButton.action = #selector(menuClose)
         addSubview(closeButton)
+
+        liveTextButton.alphaValue = 0
+        liveTextButton.isHidden = true
+        liveTextButton.target = self
+        liveTextButton.action = #selector(menuToggleLiveText)
+        addSubview(liveTextButton)
     }
 
     @available(*, unavailable)
@@ -67,6 +102,7 @@ final class PinContentView: NSView {
 
     override func layout() {
         super.layout()
+        liveTextHost.frame = bounds
         let btnSide: CGFloat = 20
         let inset: CGFloat = 8
         closeButton.frame = NSRect(
@@ -75,6 +111,14 @@ final class PinContentView: NSView {
             width: btnSide,
             height: btnSide
         )
+        // 实况文本钮在关闭钮左侧 6pt（同高同宽，同一套发丝边/TactilePress 语言）
+        liveTextButton.frame = NSRect(
+            x: closeButton.frame.minX - btnSide - 6,
+            y: inset,
+            width: btnSide,
+            height: btnSide
+        )
+        refreshLiveTextButtonVisibility(animated: false)
     }
 
     override func updateTrackingAreas() {
@@ -91,16 +135,20 @@ final class PinContentView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        guard bounds.width >= 56, bounds.height >= 44 else { return }
-        closeButton.isHidden = false
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.14
-            ctx.timingFunction = DesignTokens.Motion.easeOutStrong
-            closeButton.animator().alphaValue = 1
+        isHovering = true
+        if bounds.width >= 56, bounds.height >= 44 {
+            closeButton.isHidden = false
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.14
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                closeButton.animator().alphaValue = 1
+            }
         }
+        refreshLiveTextButtonVisibility(animated: true)
     }
 
     override func mouseExited(with event: NSEvent) {
+        isHovering = false
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.12
             ctx.timingFunction = DesignTokens.Motion.easeOutStrong
@@ -111,6 +159,80 @@ final class PinContentView: NSView {
                 self.closeButton.isHidden = true
             }
         })
+        // 划词态下实况文本钮常驻（mouseExited 只淡出关闭钮）
+        refreshLiveTextButtonVisibility(animated: true)
+    }
+
+    // MARK: - 实况文本（划词）
+
+    /// 是否处于实况文本划词态（外框蓝边 + 按钮常驻高亮的依据）
+    var isLiveTextActive: Bool { liveTextHost.isActive }
+
+    /// 后台静默分析完成后回调：识别到文字才开放入口
+    func setLiveTextAvailable(_ available: Bool) {
+        guard hasLiveText != available else { return }
+        hasLiveText = available
+        refreshLiveTextButtonVisibility(animated: true)
+    }
+
+    /// 进入/退出划词态（analysis 仅在进入时传入）
+    func setLiveTextActive(_ active: Bool, analysis: ImageAnalysis?) {
+        if active, let analysis {
+            liveTextHost.activate(with: analysis)
+        } else {
+            liveTextHost.deactivate()
+        }
+        liveTextButton.isLiveTextOn = active
+        refreshLiveTextButtonVisibility(animated: true)
+        needsDisplay = true
+    }
+
+    /// 复制当前划选文字；返回 false = 当前没有选区（控制器据此降级为复制图像）
+    @discardableResult
+    func copySelectedLiveText() -> Bool {
+        liveTextHost.copySelectedText()
+    }
+
+    func selectAllLiveText() {
+        liveTextHost.selectAllText()
+    }
+
+    /// 悬停按钮组显隐：
+    /// - 划词态：实况文本钮常驻 + accent 蓝底（一眼看出当前状态、随时可点退出）；
+    /// - 平时：有文字 + 鼠标悬停 → 与关闭钮一起柔和淡入；
+    /// - 贴图过小（宽 < 84 / 高 < 44）→ 只留关闭钮，防拥挤。
+    private func refreshLiveTextButtonVisibility(animated: Bool) {
+        let shouldShow = !controlsTooSmall && (isLiveTextActive || (hasLiveText && isHovering))
+        if shouldShow {
+            liveTextButton.isHidden = false
+            guard animated, !DesignTokens.Motion.reduceMotion else {
+                liveTextButton.alphaValue = 1
+                return
+            }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.14
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                liveTextButton.animator().alphaValue = 1
+            }
+        } else {
+            guard !liveTextButton.isHidden else { return }
+            guard animated, !DesignTokens.Motion.reduceMotion else {
+                liveTextButton.alphaValue = 0
+                liveTextButton.isHidden = true
+                return
+            }
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.12
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                liveTextButton.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.liveTextButton.alphaValue < 0.05 else { return }
+                    guard !self.isLiveTextActive, !self.isHovering else { return }
+                    self.liveTextButton.isHidden = true
+                }
+            })
+        }
     }
 
     func setSnapGlow(_ on: Bool) {
@@ -233,12 +355,20 @@ final class PinContentView: NSView {
     override func keyDown(with event: NSEvent) {
         let keyCode = Int(event.keyCode)
         if keyCode == kVK_Escape { // Esc（仅窗口为 key 时事件才会到达这里）
+            // 划词态先退划词（不关窗），再按一次才关贴图
+            if isLiveTextActive {
+                controller?.setLiveTextActive(false)
+                return
+            }
             controller?.close()
             return
         }
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         if mods.isEmpty {
             switch keyCode {
+            case kVK_ANSI_T:
+                controller?.toggleLiveText()
+                return
             case kVK_ANSI_D, kVK_ANSI_5:
                 controller?.toggleCompareOpacity()
                 return
@@ -262,8 +392,17 @@ final class PinContentView: NSView {
             keyEquivalent: ""
         )
         compareItem.state = isComparing ? .on : .off
+        let liveTextItem = NSMenuItem(
+            title: isLiveTextActive ? "退出实况文本 (T)" : "实况文本划词 (T)",
+            action: #selector(menuToggleLiveText),
+            keyEquivalent: ""
+        )
+        liveTextItem.state = isLiveTextActive ? .on : .off
+        liveTextItem.isEnabled = hasLiveText || isLiveTextActive
         var items: [NSMenuItem] = [
             NSMenuItem(title: "复制图像", action: #selector(menuCopyImage), keyEquivalent: ""),
+            liveTextItem,
+            NSMenuItem(title: "结构化取字…", action: #selector(menuStructuredOCR), keyEquivalent: ""),
             NSMenuItem(title: "缩放 100%", action: #selector(menuResetZoom), keyEquivalent: ""),
             compareItem,
         ]
@@ -282,6 +421,8 @@ final class PinContentView: NSView {
     }
 
     @objc private func menuCopyImage() { controller?.copyImageToPasteboard() }
+    @objc private func menuToggleLiveText() { controller?.toggleLiveText() }
+    @objc private func menuStructuredOCR() { controller?.openStructuredOCRPanel() }
     @objc private func menuResetZoom() { controller?.resetZoom(anchor: CGPoint(x: bounds.midX, y: bounds.midY)) }
     @objc private func menuToggleCompareOpacity() { controller?.toggleCompareOpacity() }
     @objc private func menuUngroup() { controller?.ungroupCurrentGroup() }
@@ -323,10 +464,20 @@ final class PinContentView: NSView {
 
         let innerRect = rect.insetBy(dx: 0.75, dy: 0.75)
         let innerPath = CGPath(roundedRect: innerRect, cornerWidth: max(1, radius - 0.5), cornerHeight: max(1, radius - 0.5), transform: nil)
-        ctx.setStrokeColor(NSColor.white.withAlphaComponent(controller.inGroup ? 0.34 : 0.42).cgColor)
-        ctx.setLineWidth(0.5)
-        ctx.addPath(innerPath)
-        ctx.strokePath()
+        if isLiveTextActive {
+            // 划词态：一圈 1pt accent 柔和蓝边替代普通白边（表达「此刻可直接在图上划词复制」）
+            let liveRect = rect.insetBy(dx: 0.5, dy: 0.5)
+            let livePath = CGPath(roundedRect: liveRect, cornerWidth: max(1, radius - 1), cornerHeight: max(1, radius - 1), transform: nil)
+            ctx.setStrokeColor(DesignTokens.accent.withAlphaComponent(0.70).cgColor)
+            ctx.setLineWidth(1)
+            ctx.addPath(livePath)
+            ctx.strokePath()
+        } else {
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(controller.inGroup ? 0.34 : 0.42).cgColor)
+            ctx.setLineWidth(0.5)
+            ctx.addPath(innerPath)
+            ctx.strokePath()
+        }
     }
 
     // MARK: - HUD
@@ -444,5 +595,86 @@ private final class PinHoverCloseButton: NSButton {
         layer?.backgroundColor = (isHot
             ? DesignTokens.statusError.withAlphaComponent(0.88)
             : NSColor(srgbRed: 24/255.0, green: 24/255.0, blue: 28/255.0, alpha: 0.72)).cgColor
+    }
+}
+
+/// 贴图右上角悬停「实况文本划词」圆钮（与关闭钮同规范：20×20 圆底 + 0.5pt 白发丝边 + 轻按缩放）。
+///
+/// 两态：
+/// - 平时：深半透底 + 白图标，随鼠标悬停淡入；
+/// - 划词态（isLiveTextOn）：accent 强调蓝实心 + 白图标，常驻可见，随时可点退出。
+@MainActor
+private final class PinHoverLiveTextButton: NSButton {
+    private var isHot = false
+    private var trackingArea: NSTrackingArea?
+
+    /// 划词态（由 PinContentView 同步）：蓝底常驻 + tooltip 改为退出语义
+    var isLiveTextOn = false { didSet { applyStyle() } }
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+        isBordered = false
+        bezelStyle = .regularSquare
+        title = ""
+        imagePosition = .imageOnly
+        image = TBIcon.symbolImage(named: "text.viewfinder", pointSize: 10, weight: .semibold, hierarchical: false)
+        contentTintColor = NSColor.white.withAlphaComponent(0.92)
+        toolTip = "实况文本划词 (T)"
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 0.5
+        layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        applyStyle()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsetsZero }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHot = true
+        applyStyle()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHot = false
+        applyStyle()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        TactilePress.animate(view: self, pressed: true, scale: 0.90)
+        super.mouseDown(with: event)
+        TactilePress.animate(view: self, pressed: false)
+    }
+
+    private func applyStyle() {
+        if isLiveTextOn {
+            layer?.backgroundColor = DesignTokens.accent.cgColor
+            layer?.borderColor = NSColor.white.withAlphaComponent(0.30).cgColor
+            contentTintColor = DesignTokens.labelOnAccent
+            toolTip = "退出实况文本 (T / Esc)"
+        } else {
+            layer?.backgroundColor = (isHot
+                ? DesignTokens.accent.withAlphaComponent(0.88)
+                : NSColor(srgbRed: 24/255.0, green: 24/255.0, blue: 28/255.0, alpha: 0.72)).cgColor
+            layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+            contentTintColor = NSColor.white.withAlphaComponent(0.92)
+            toolTip = "实况文本划词 (T)"
+        }
     }
 }

@@ -35,9 +35,12 @@ public protocol ClipboardWriting {
     /// 写入图片，返回是否至少写入一种格式
     @discardableResult
     func writeImage(_ image: CGImage) -> Bool
-    /// 写入纯文本（OCR 取字用）
+    /// 写入纯文本（OCR 取字 / 复制文件路径用）
     @discardableResult
     func writeText(_ text: String) -> Bool
+    /// 写入文件引用（以及 GIF 动图数据），支持直接粘贴到访达或聊天工具
+    @discardableResult
+    func writeFileURL(_ url: URL) -> Bool
 }
 
 // MARK: - 历史
@@ -124,6 +127,66 @@ public protocol PinningPresenting {
     func pin(_ image: CGImage, atGlobalRect rect: CGRect)
 }
 
+// MARK: - 屏幕录制（MP4 / GIF）
+
+/// 录制启动请求（领域与 UI 只传坐标、屏幕参数与偏好，不感知 SCStream / AVAssetWriter）
+public struct ScreenRecordingRequest: Sendable {
+    public let regionGlobal: CGRect
+    public let displayID: CGDirectDisplayID
+    public let screenFrame: CGRect
+    public let backingScale: CGFloat
+    public let preferDisplayP3: Bool
+    public let options: RecordingOptions
+    public let outputURL: URL
+    public let isTemporaryFile: Bool
+
+    public init(
+        regionGlobal: CGRect,
+        displayID: CGDirectDisplayID,
+        screenFrame: CGRect,
+        backingScale: CGFloat,
+        preferDisplayP3: Bool,
+        options: RecordingOptions,
+        outputURL: URL,
+        isTemporaryFile: Bool = false
+    ) {
+        self.regionGlobal = regionGlobal
+        self.displayID = displayID
+        self.screenFrame = screenFrame
+        self.backingScale = backingScale
+        self.preferDisplayP3 = preferDisplayP3
+        self.options = options
+        self.outputURL = outputURL
+        self.isTemporaryFile = isTemporaryFile
+    }
+}
+
+/// 录制运行期事件（回传给控制条更新计时、音频电平动效与状态）
+public enum ScreenRecordingEvent: Sendable {
+    case started
+    case progress(elapsed: TimeInterval)
+    /// 实时音频收录归一化电平（0.0...1.0；静音或未启用轨为 0）
+    case audioLevels(system: Float, microphone: Float)
+    case paused(elapsed: TimeInterval)
+    case resumed
+    case failed(String)
+}
+
+/// 屏幕录制端口。适配器：`SCKScreenRecorder`（SCStream + AVAssetWriter / CGImageDestination）
+@MainActor
+public protocol ScreenRecording: AnyObject {
+    var isRecording: Bool { get }
+    var isPaused: Bool { get }
+    func start(
+        request: ScreenRecordingRequest,
+        onEvent: @escaping @MainActor (ScreenRecordingEvent) -> Void
+    ) async throws
+    func pause() async
+    func resume() async
+    func stop() async throws -> RecordingResult
+    func cancel() async
+}
+
 // MARK: - 自动更新
 
 /// 应用更新端口。适配器：`SparkleUpdater`（Sparkle 2 + EdDSA 签名的 appcast）
@@ -155,6 +218,7 @@ public struct Dependencies {
     public let permission: ScreenPermissionChecking
     public let pinning: PinningPresenting
     public let updating: AppUpdating
+    public let recording: ScreenRecording
 
     public init(
         screen: ScreenCapturing,
@@ -164,7 +228,8 @@ public struct Dependencies {
         hotkeys: HotkeyRegistering,
         permission: ScreenPermissionChecking,
         pinning: PinningPresenting,
-        updating: AppUpdating
+        updating: AppUpdating,
+        recording: ScreenRecording
     ) {
         self.screen = screen
         self.clipboard = clipboard
@@ -174,5 +239,6 @@ public struct Dependencies {
         self.permission = permission
         self.pinning = pinning
         self.updating = updating
+        self.recording = recording
     }
 }

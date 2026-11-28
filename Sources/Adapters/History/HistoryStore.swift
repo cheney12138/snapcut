@@ -160,6 +160,9 @@ final class HistoryStore {
     /// 启动后低优先级补齐存量缺失 OCR 的后台任务
     private var backfillTask: Task<Void, Never>?
 
+    /// 首屏缩略图后台静默预热任务（冷启动延迟触发，可被新一轮预热取消）
+    private var prewarmTask: Task<Void, Never>?
+
     private init() {
         thumbnailCache.countLimit = max(1, maxItems * 2)
         if let entries = Self.readIndexEntries() {
@@ -330,6 +333,8 @@ final class HistoryStore {
             written.append("tiff")
         }
         let ok = !written.isEmpty
+        // 自写标记：剪贴板图片感知据此跳过 Snapcut 自己写的内容（否则自己触发自己）
+        if ok { ClipboardWriter.markOwnWrite() }
         Log.event(.history, "history.copy", [
             "id": item.id, "fmts": written.joined(separator: "+"), "ok": "\(ok)",
         ])
@@ -356,6 +361,8 @@ final class HistoryStore {
         let removed = itemsCache.count
         itemsCache = []
         thumbnailCache.removeAllObjects()
+        prewarmTask?.cancel()
+        prewarmTask = nil
         backfillTask?.cancel()
         backfillTask = nil
         ocrQueueTask?.cancel()
@@ -380,40 +387,104 @@ final class HistoryStore {
         thumbnail(forRecordID: item.id, pixelSize: item.pixelSize, maxSize: maxSize)
     }
 
-    /// 按记录 ID 取缓存缩略图（供 Spotlight 面板直接按 `HistoryRecord` 取缩略图）
+    /// 纯内存查询缩略图（0 磁盘 I/O）：只查 thumbnailCache，未命中直接返回 `nil`
+    ///
+    /// Spotlight 面板同步布局阶段只能调它 —— 绝不在主线程解码磁盘 PNG（冷启动首开卡顿 1.46s 的根因）。
+    func cachedThumbnail(forRecordID id: String, maxSize: CGFloat) -> NSImage? {
+        thumbnailCache.object(forKey: Self.thumbnailCacheKey(id: id, maxSize: maxSize))
+    }
+
+    /// 按记录 ID 取缩略图（同步版本：命中缓存直接返回，否则当前线程解码）
+    ///
+    /// 仍保留给托盘菜单等既有调用点（零回归）；有 UI 交互的调用点应改用 `loadThumbnailAsync`。
     func thumbnail(forRecordID id: String, pixelSize: CGSize, maxSize: CGFloat) -> NSImage? {
-        let key = "\(id)#\(Int(maxSize))" as NSString
+        let key = Self.thumbnailCacheKey(id: id, maxSize: maxSize)
         if let cached = thumbnailCache.object(forKey: key) { return cached }
 
-        let url = HistoryPaths.imageURL(for: id)
-        let maxPixelSize = max(1, maxSize * 2) // Retina 2x 像素密度
-        let options = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
-        ] as [CFString: Any] as CFDictionary
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
+        guard let decoded = Self.decodeThumbnailCGImage(
+            url: HistoryPaths.imageURL(for: id),
+            pixelSize: pixelSize,
+            maxSize: maxSize
+        ) else {
             Log.error(.history, "history.thumb.fail", ["id": id])
             return nil
         }
-        let referenceSize: CGSize
-        if pixelSize.width > 0 && pixelSize.height > 0 {
-            referenceSize = pixelSize
-        } else {
-            referenceSize = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
-        }
-        let aspect = min(
-            maxSize / max(1, referenceSize.width),
-            maxSize / max(1, referenceSize.height)
-        )
-        let targetSize = NSSize(
-            width: max(1, referenceSize.width * aspect),
-            height: max(1, referenceSize.height * aspect)
-        )
-        let image = NSImage(cgImage: cgImage, size: targetSize)
+        let image = NSImage(cgImage: decoded.cgImage, size: decoded.targetSize)
         thumbnailCache.setObject(image, forKey: key)
         return image
+    }
+
+    /// 异步缩略图：先查纯内存缓存，未命中在后台 `.userInitiated` 解码，回主线程建 NSImage 并写缓存
+    ///
+    /// 跨 actor 只传 Sendable 的 CGImage + NSSize，NSImage 始终在 MainActor 上创建。
+    func loadThumbnailAsync(
+        forRecordID id: String,
+        pixelSize: CGSize,
+        maxSize: CGFloat
+    ) async -> NSImage? {
+        if let cached = cachedThumbnail(forRecordID: id, maxSize: maxSize) { return cached }
+
+        guard let decoded = await Self.decodeThumbnailOffMain(
+            url: HistoryPaths.imageURL(for: id),
+            pixelSize: pixelSize,
+            maxSize: maxSize
+        ) else {
+            Log.error(.history, "history.thumb.fail", ["id": id, "async": "1"])
+            return nil
+        }
+        guard !Task.isCancelled else { return nil }
+        // 解码期间可能有别的调用先写入了缓存，以先到者为准，避免重复替换造成重绘
+        if let existing = cachedThumbnail(forRecordID: id, maxSize: maxSize) { return existing }
+
+        let image = NSImage(cgImage: decoded.cgImage, size: decoded.targetSize)
+        thumbnailCache.setObject(image, forKey: Self.thumbnailCacheKey(id: id, maxSize: maxSize))
+        return image
+    }
+
+    /// 后台静默预热首屏缩略图（冷启动后由 AppCoordinator 延迟 1.2s 调用）
+    ///
+    /// 逐张低优先级解码，张与张之间 30ms 间隔，绝不与前台交互抢 CPU；新一轮预热会取消上一轮。
+    func prewarmThumbnails(limit: Int = 9, maxSize: CGFloat = 440) {
+        prewarmTask?.cancel()
+        prewarmTask = nil
+
+        var candidates: [(id: String, pixelSize: CGSize)] = []
+        for item in itemsCache.prefix(max(0, limit)) {
+            guard cachedThumbnail(forRecordID: item.id, maxSize: maxSize) == nil else { continue }
+            candidates.append((item.id, item.pixelSize))
+        }
+        guard !candidates.isEmpty else { return }
+
+        prewarmTask = Task(priority: .background) { [weak self] in
+            guard let self else { return }
+            await self.runPrewarm(candidates, maxSize: maxSize)
+        }
+    }
+
+    /// 预热实际执行体（MainActor 隔离，解码在后台，写缓存在主线程）
+    private func runPrewarm(_ candidates: [(id: String, pixelSize: CGSize)], maxSize: CGFloat) async {
+        for (offset, candidate) in candidates.enumerated() {
+            if Task.isCancelled { break }
+            if offset > 0 {
+                try? await Task.sleep(nanoseconds: 30_000_000)
+                if Task.isCancelled { break }
+            }
+            guard let decoded = await Self.decodeThumbnailOffMain(
+                url: HistoryPaths.imageURL(for: candidate.id),
+                pixelSize: candidate.pixelSize,
+                maxSize: maxSize
+            ) else { continue }
+            guard !Task.isCancelled else { break }
+
+            let image = NSImage(cgImage: decoded.cgImage, size: decoded.targetSize)
+            thumbnailCache.setObject(
+                image,
+                forKey: Self.thumbnailCacheKey(id: candidate.id, maxSize: maxSize)
+            )
+            await Task.yield()
+        }
+        // 被新一轮预热/clearAll 取消说明引用已被替换，不要清空别人刚注册的任务
+        if !Task.isCancelled { prewarmTask = nil }
     }
 
     /// 启动后低优先级懒补齐尚未有 OCR 文本的存量记录（逐条串行、间隔 150ms、可中途取消）
@@ -716,6 +787,55 @@ final class HistoryStore {
     private nonisolated static func decodeCGImage(at url: URL) -> CGImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         return CGImageSourceCreateImageAtIndex(source, 0, nil)
+    }
+
+    private nonisolated static func thumbnailCacheKey(id: String, maxSize: CGFloat) -> NSString {
+        "\(id)#\(Int(maxSize))" as NSString
+    }
+
+    /// 在后台线程解码缩略图（线程安全：不碰 NSImage，只返回 Sendable 的 CGImage + 目标尺寸）
+    private nonisolated static func decodeThumbnailCGImage(
+        url: URL,
+        pixelSize: CGSize,
+        maxSize: CGFloat
+    ) -> (cgImage: CGImage, targetSize: NSSize)? {
+        let options = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, maxSize * 2), // Retina 2x 像素密度
+            kCGImageSourceShouldCacheImmediately: true,
+        ] as [CFString: Any] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else {
+            return nil
+        }
+
+        let referenceSize: CGSize
+        if pixelSize.width > 0 && pixelSize.height > 0 {
+            referenceSize = pixelSize
+        } else {
+            referenceSize = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+        }
+        let aspect = min(
+            maxSize / max(1, referenceSize.width),
+            maxSize / max(1, referenceSize.height)
+        )
+        let targetSize = NSSize(
+            width: max(1, referenceSize.width * aspect),
+            height: max(1, referenceSize.height * aspect)
+        )
+        return (cgImage, targetSize)
+    }
+
+    /// 把上面的同步解码丢到 detached 任务里执行（调用方保持在 MainActor）
+    private nonisolated static func decodeThumbnailOffMain(
+        url: URL,
+        pixelSize: CGSize,
+        maxSize: CGFloat
+    ) async -> (cgImage: CGImage, targetSize: NSSize)? {
+        await Task.detached(priority: .userInitiated) {
+            decodeThumbnailCGImage(url: url, pixelSize: pixelSize, maxSize: maxSize)
+        }.value
     }
 
     /// 读 index.json；缺失或损坏返回 nil（触发重建）

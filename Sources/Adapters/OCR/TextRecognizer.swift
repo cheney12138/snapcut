@@ -46,19 +46,40 @@ enum TextRecognizer {
             let plainText = OCRTextAssembler.assemble(items)
             let qrCodes = qrPayloads.map(StructuredOCRFormatter.makeQRCode(payload:))
             let table = StructuredOCRFormatter.detectMarkdownTable(from: blocks)
+            let document = StructuredOCRFormatter.parseDocument(from: blocks)
+
+            // 向后兼容：整图表格检测 nil、但文档里含局部混排表格时，回填首个表格的 Markdown 与行列数
+            var markdownTable = table?.markdown
+            var tableRowCount = table?.rows ?? 0
+            var tableColumnCount = table?.columns ?? 0
+            if markdownTable == nil,
+               document.hasTable,
+               let firstTable = document.blocks.first(where: { block -> Bool in
+                   if case .table = block { return true }
+                   return false
+               }),
+               let dimensions = document.primaryTableDimensions {
+                markdownTable = OCRDocument(blocks: [firstTable]).renderMarkdown()
+                tableRowCount = dimensions.rows
+                tableColumnCount = dimensions.columns
+            }
+
             let ms = elapsedMs(since: start)
             Log.event(.ocr, "ocr.structured.done", [
                 "ms": ms,
                 "chars": "\(plainText.count)",
                 "qrs": "\(qrCodes.count)",
-                "table": table != nil ? "\(table!.rows)x\(table!.columns)" : "none",
+                "table": markdownTable != nil ? "\(tableRowCount)x\(tableColumnCount)" : "none",
+                "blocks": "\(document.blocks.count)",
+                "rich": document.hasRichStructure ? "yes" : "no",
             ])
             return StructuredOCRResult(
                 plainText: plainText,
                 qrCodes: qrCodes,
-                markdownTable: table?.markdown,
-                tableRowCount: table?.rows ?? 0,
-                tableColumnCount: table?.columns ?? 0
+                markdownTable: markdownTable,
+                tableRowCount: tableRowCount,
+                tableColumnCount: tableColumnCount,
+                document: document
             )
         } catch {
             Log.error(.ocr, "ocr.structured.fail", ["err": "\(error.localizedDescription)"])

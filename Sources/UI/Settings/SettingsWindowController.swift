@@ -47,6 +47,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var filenamePopup: GlassPopUpButton!
     private var historyStepper: GlassStepperControl!
     private var autoIndexOCRSwitch: GlassSwitch!
+    private var smartClipboardSwitch: GlassSwitch!
     private var notifySwitch: GlassSwitch!
     private var soundSwitch: GlassSwitch!
 
@@ -58,6 +59,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     // 快捷键 tab 控件
     private var regionRecorder: GlassHotkeyRecorderView!
     private var fullScreenRecorder: GlassHotkeyRecorderView!
+    private var recordVideoRecorder: GlassHotkeyRecorderView!
+    private var recordGIFRecorder: GlassHotkeyRecorderView!
     private var historySpotlightRecorder: GlassHotkeyRecorderView!
     private var editorRecorders: [String: GlassHotkeyRecorderView] = [:]
     private var spotlightRecorders: [String: GlassHotkeyRecorderView] = [:]
@@ -429,6 +432,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         autoIndexOCRSwitch.target = self
         autoIndexOCRSwitch.action = #selector(autoIndexOCRToggled(_:))
 
+        smartClipboardSwitch = GlassSwitch()
+        smartClipboardSwitch.target = self
+        smartClipboardSwitch.action = #selector(smartClipboardToggled(_:))
+
         let historySection = makeSection(
             title: "视觉记忆历史",
             symbol: "clock.arrow.circlepath",
@@ -436,6 +443,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             rows: [
                 settingRow("历史保留数量", trailing: [historyStepper]),
                 settingRow("后台自动识别文字", subtitle: "为截图建立本地 OCR 索引以便快速搜索", trailing: [autoIndexOCRSwitch]),
+                settingRow(
+                    "外部复制含文字图片时轻提示",
+                    subtitle: "在微信、飞书等软件复制图片后，仅检测到文字或二维码时浮现贴图划词与提取入口",
+                    subtitleLines: 2,
+                    trailing: [smartClipboardSwitch]
+                ),
             ]
         )
 
@@ -701,6 +714,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         ("pin", "贴图"),
         ("toggleVisibility", "隐藏贴图"),
         ("scroll", "滚动截图"),
+        ("record", "录制视频"),
+        ("recordGIF", "录制 GIF"),
     ]
 
     private static let spotlightHotkeyRows: [(key: String, label: String)] = [
@@ -760,9 +775,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // 全局热键
         regionRecorder = GlassHotkeyRecorderView(width: 136)
         fullScreenRecorder = GlassHotkeyRecorderView(width: 136)
+        recordVideoRecorder = GlassHotkeyRecorderView(width: 136)
+        recordGIFRecorder = GlassHotkeyRecorderView(width: 136)
         historySpotlightRecorder = GlassHotkeyRecorderView(width: 136)
         wireGlobalRecorder(regionRecorder)
         wireGlobalRecorder(fullScreenRecorder)
+        wireGlobalRecorder(recordVideoRecorder)
+        wireGlobalRecorder(recordGIFRecorder)
         wireGlobalRecorder(historySpotlightRecorder)
 
         let globalSection = makeSection(
@@ -772,6 +791,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             rows: [
                 settingRow("区域截图", trailing: [regionRecorder]),
                 settingRow("全屏截图", trailing: [fullScreenRecorder]),
+                settingRow("录制视频", trailing: [recordVideoRecorder]),
+                settingRow("录制 GIF", trailing: [recordGIFRecorder]),
                 settingRow("视觉记忆搜索", trailing: [historySpotlightRecorder]),
             ]
         )
@@ -879,6 +900,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let def = AppSettings.defaultSettings
         settings.hotkeyRegion = def.hotkeyRegion
         settings.hotkeyFullScreen = def.hotkeyFullScreen
+        settings.hotkeyRecordVideo = def.hotkeyRecordVideo
+        settings.hotkeyRecordGIF = def.hotkeyRecordGIF
         settings.hotkeyHistorySpotlight = def.hotkeyHistorySpotlight
         settings.editorHotkeys = AppSettings.defaultEditorHotkeys
         settings.spotlightHotkeys = AppSettings.defaultSpotlightHotkeys
@@ -1152,6 +1175,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         persist()
     }
 
+    @objc private func smartClipboardToggled(_ sender: GlassSwitch) {
+        settings.smartClipboardImagePrompt = sender.isOn
+        Log.event(.app, "settings.smartClipboardPrompt", ["enabled": "\(settings.smartClipboardImagePrompt)"])
+        persist()
+    }
+
     @objc private func notifyToggled(_ sender: GlassSwitch) {
         settings.showCopyNotification = sender.isOn
         persist()
@@ -1219,7 +1248,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - 快捷键录制与冲突校验
 
     private func stopOtherRecorders(except current: GlassHotkeyRecorderView?) {
-        for other in [regionRecorder, fullScreenRecorder, historySpotlightRecorder] {
+        for other in [regionRecorder, fullScreenRecorder, recordVideoRecorder, recordGIFRecorder, historySpotlightRecorder] {
             if let other, other !== current {
                 other.endRecordingIfNeeded()
             }
@@ -1267,6 +1296,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let globalSlots: [(combo: String, label: String)] = [
             (settings.hotkeyRegion, "区域截图（全局）"),
             (settings.hotkeyFullScreen, "全屏截图（全局）"),
+            (settings.hotkeyRecordVideo, "录制视频（全局）"),
+            (settings.hotkeyRecordGIF, "录制 GIF（全局）"),
             (settings.hotkeyHistorySpotlight, "视觉记忆搜索（全局）"),
         ]
         for slot in globalSlots where combosConflict(combo, slot.combo) {
@@ -1308,6 +1339,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let globalSlots: [(combo: String, label: String)] = [
             (settings.hotkeyRegion, "区域截图（全局）"),
             (settings.hotkeyFullScreen, "全屏截图（全局）"),
+            (settings.hotkeyRecordVideo, "录制视频（全局）"),
+            (settings.hotkeyRecordGIF, "录制 GIF（全局）"),
             (settings.hotkeyHistorySpotlight, "视觉记忆搜索（全局）"),
         ]
         for slot in globalSlots where combosConflict(combo, slot.combo) {
@@ -1345,28 +1378,15 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             showHotkeyHint("组合无效：必须包含至少一个修饰键（⌘ / ⇧ / ⌥ / ⌃）")
             return
         }
-        let slot: String
-        let otherGlobals: [(combo: String, label: String)]
-        if recorder === regionRecorder {
-            slot = "region"
-            otherGlobals = [
-                (settings.hotkeyFullScreen, "全屏截图"),
-                (settings.hotkeyHistorySpotlight, "视觉记忆搜索"),
-            ]
-        } else if recorder === fullScreenRecorder {
-            slot = "fullScreen"
-            otherGlobals = [
-                (settings.hotkeyRegion, "区域截图"),
-                (settings.hotkeyHistorySpotlight, "视觉记忆搜索"),
-            ]
-        } else {
-            slot = "historySpotlight"
-            otherGlobals = [
-                (settings.hotkeyRegion, "区域截图"),
-                (settings.hotkeyFullScreen, "全屏截图"),
-            ]
-        }
-        for other in otherGlobals where combosConflict(combo, other.combo) {
+        let allSlots: [(recorder: GlassHotkeyRecorderView?, slot: String, combo: String, label: String)] = [
+            (regionRecorder, "region", settings.hotkeyRegion, "区域截图"),
+            (fullScreenRecorder, "fullScreen", settings.hotkeyFullScreen, "全屏截图"),
+            (recordVideoRecorder, "recordVideo", settings.hotkeyRecordVideo, "录制视频"),
+            (recordGIFRecorder, "recordGIF", settings.hotkeyRecordGIF, "录制 GIF"),
+            (historySpotlightRecorder, "historySpotlight", settings.hotkeyHistorySpotlight, "视觉记忆搜索"),
+        ]
+        let slot = allSlots.first(where: { $0.recorder === recorder })?.slot ?? "historySpotlight"
+        for other in allSlots where other.recorder !== recorder && combosConflict(combo, other.combo) {
             showHotkeyHint("「\(HotkeySpec.display(combo))」已被「\(other.label)」占用")
             return
         }
@@ -1381,6 +1401,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         } else if recorder === fullScreenRecorder {
             settings.hotkeyFullScreen = combo
             fullScreenRecorder.setCombo(combo)
+        } else if recorder === recordVideoRecorder {
+            settings.hotkeyRecordVideo = combo
+            recordVideoRecorder.setCombo(combo)
+        } else if recorder === recordGIFRecorder {
+            settings.hotkeyRecordGIF = combo
+            recordGIFRecorder.setCombo(combo)
         } else {
             settings.hotkeyHistorySpotlight = combo
             historySpotlightRecorder.setCombo(combo)
@@ -1414,10 +1440,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         pathSubtitleLabel?.stringValue = settings.saveDirectoryPath
         historyStepper?.setValue(settings.historyLimit)
         autoIndexOCRSwitch?.setOn(settings.autoIndexHistoryOCR, animated: false)
+        smartClipboardSwitch?.setOn(settings.smartClipboardImagePrompt, animated: false)
         notifySwitch?.setOn(settings.showCopyNotification, animated: false)
         soundSwitch?.setOn(settings.playCaptureSound, animated: false)
         regionRecorder?.setCombo(settings.hotkeyRegion)
         fullScreenRecorder?.setCombo(settings.hotkeyFullScreen)
+        recordVideoRecorder?.setCombo(settings.hotkeyRecordVideo)
+        recordGIFRecorder?.setCombo(settings.hotkeyRecordGIF)
         historySpotlightRecorder?.setCombo(settings.hotkeyHistorySpotlight)
         for (actionKey, recorder) in editorRecorders {
             recorder.setCombo(settings.editorHotkey(for: actionKey))
@@ -1536,7 +1565,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         return hair
     }
 
-    private func settingRow(_ labelText: String, subtitle: String? = nil, trailing: [NSView]) -> NSStackView {
+    private func settingRow(
+        _ labelText: String,
+        subtitle: String? = nil,
+        subtitleLines: Int = 1,
+        trailing: [NSView]
+    ) -> NSStackView {
         let label = NSTextField(labelWithString: labelText)
         label.font = DesignTokens.Font.body
         label.textColor = DesignTokens.label1
@@ -1548,12 +1582,18 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             let sub = NSTextField(labelWithString: subtitle)
             sub.font = DesignTokens.Font.note
             sub.textColor = DesignTokens.label2
+            // 长副文案（超过一行）允许换行，避免末尾被截成「…」读不懂语义
+            if subtitleLines > 1 {
+                sub.maximumNumberOfLines = subtitleLines
+                sub.lineBreakMode = .byWordWrapping
+                sub.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            }
             let col = NSStackView(views: [label, sub])
             col.orientation = .vertical
             col.alignment = .leading
             col.spacing = 2
             leadingView = col
-            height = 50
+            height = subtitleLines > 1 ? 58 : 50
         } else {
             leadingView = label
             height = 38

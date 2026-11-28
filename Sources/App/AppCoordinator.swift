@@ -57,6 +57,13 @@ final class AppCoordinator {
             }
         }
         Log.event(.app, "app.warmup.ready", ["granted": "\(deps.permission.isGranted())"])
+        // 视觉记忆首屏静默预热：延迟 1.2s 才开（冷启动不抢开机 CPU），
+        // 首次 ⌘⌃V 时前 9 张缩略图已就位，面板打开无需现场解码
+        Task(priority: .background) { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard !Task.isCancelled else { return }
+            HistoryStore.shared.prewarmThumbnails(limit: 9, maxSize: 440)
+        }
         if settings.autoIndexHistoryOCR {
             Task(priority: .background) { @MainActor [weak self] in
                 guard let self, self.settings.autoIndexHistoryOCR else { return }
@@ -68,6 +75,7 @@ final class AppCoordinator {
     func start() {
         AppCoordinatorShared.coordinator = self
         AppCoordinatorShared.deps = deps
+        UserDefaults.standard.set(false, forKey: "app.recording.active")
         TCCPermission.preflight()
         // 菜单门禁初值（@AppStorage 桥；翻转时写 → 菜单重建）
         syncPermissionMirror()
@@ -86,6 +94,8 @@ final class AppCoordinator {
             "hotkeyFullScreen": settings.hotkeyFullScreen,
             "hotkeyHistorySpotlight": settings.hotkeyHistorySpotlight,
         ])
+        // 外部剪贴板智能感知：微信/飞书里复制的含文字图片 → 轻提示「贴图划词 / 提取文字」
+        startClipboardImageWatcher()
         scheduleSelfTestIfRequested()
         tray.setup(coordinator: self)
         registerCaptureHotkeys()
@@ -202,6 +212,8 @@ final class AppCoordinator {
     private var everRegisteredFallbacks = false
     private var fullHotKeyID: UInt32?
     private var historySpotlightHotKeyID: UInt32?
+    private var recordGIFHotKeyID: UInt32?
+    private var recordVideoHotKeyID: UInt32?
 
     /// 设置保存后立即重建工具栏（工具栏大小档位 / 按钮排序即时生效，无需重启）
     func invalidateToolbar() {
@@ -213,9 +225,13 @@ final class AppCoordinator {
         hotkeyCenter.unregister(regionHotKeyID)
         hotkeyCenter.unregister(fullHotKeyID)
         hotkeyCenter.unregister(historySpotlightHotKeyID)
+        hotkeyCenter.unregister(recordGIFHotKeyID)
+        hotkeyCenter.unregister(recordVideoHotKeyID)
         regionHotKeyID = nil
         fullHotKeyID = nil
         historySpotlightHotKeyID = nil
+        recordGIFHotKeyID = nil
+        recordVideoHotKeyID = nil
         registerCaptureHotkeys()
 
         HistoryStore.shared.maxItems = max(1, settings.historyLimit)
@@ -223,11 +239,15 @@ final class AppCoordinator {
         if settings.autoIndexHistoryOCR {
             HistoryStore.shared.backfillMissingOCRIfNeeded()
         }
+        // 设置面板切换「外部复制含文字图片时轻提示」后即时生效（无需重启）
+        ClipboardImageWatcher.shared.isEnabled = settings.smartClipboardImagePrompt
 
         Log.event(.hotkey, "hotkey.rebind", [
             "region": settings.hotkeyRegion,
             "full": settings.hotkeyFullScreen,
             "spotlight": settings.hotkeyHistorySpotlight,
+            "recVideo": settings.hotkeyRecordVideo,
+            "recGIF": settings.hotkeyRecordGIF,
         ])
     }
 
@@ -235,6 +255,8 @@ final class AppCoordinator {
         let region = HotkeySpec.parse(settings.hotkeyRegion) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_A), modifiers: [.command, .shift])
         let full = HotkeySpec.parse(settings.hotkeyFullScreen) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_S), modifiers: [.command, .shift])
         let spotlight = HotkeySpec.parse(settings.hotkeyHistorySpotlight) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_V), modifiers: [.option, .command])
+        let recVideo = HotkeySpec.parse(settings.hotkeyRecordVideo) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_R), modifiers: [.option, .command])
+        let recGIF = HotkeySpec.parse(settings.hotkeyRecordGIF) ?? HotkeySpec(keyCode: UInt32(kVK_ANSI_G), modifiers: [.option, .command])
         regionHotKeyID = hotkeyCenter.register(keyCode: region.keyCode, modifiers: region.modifiers) { [weak self] in
             self?.beginRegionCapture()
         }
@@ -243,6 +265,12 @@ final class AppCoordinator {
         }
         historySpotlightHotKeyID = hotkeyCenter.register(keyCode: spotlight.keyCode, modifiers: spotlight.modifiers) { [weak self] in
             self?.toggleHistorySpotlight()
+        }
+        recordVideoHotKeyID = hotkeyCenter.register(keyCode: recVideo.keyCode, modifiers: recVideo.modifiers) { [weak self] in
+            self?.beginRegionRecording(format: .mp4)
+        }
+        recordGIFHotKeyID = hotkeyCenter.register(keyCode: recGIF.keyCode, modifiers: recGIF.modifiers) { [weak self] in
+            self?.beginRegionRecording(format: .gif)
         }
         // ⚠️ 兜底热键（⌥⌘H / ⌃⌥D / ⌥⌘, / ⌥⌘P）只注册一次——rebind 不会走这里
         guard !everRegisteredFallbacks else { return }
@@ -380,6 +408,103 @@ final class AppCoordinator {
         }
     }
 
+    // MARK: - 屏幕录制与 GIF 录制
+
+    private(set) var isRecordingActive = false
+
+    /// 托盘/全局热键直接进入框选录制（再次触发热键可停止正在进行的录制）
+    func beginRegionRecording(format: RecordingFormat) {
+        if isRecordingActive {
+            stopActiveRecording()
+            return
+        }
+        guard state == .idle else {
+            Log.event(.recording, "recording.ignored", ["state": state.rawValue])
+            return
+        }
+        guard ensureCaptureReadiness() else { return }
+        state = .overlay
+        if overlayController == nil {
+            overlayController = OverlayController()
+        }
+        overlayController?.beginForRecording(format: format) { [weak self] _ in
+            self?.state = .idle
+        }
+    }
+
+    func stopActiveRecording() {
+        overlayController?.stopRecordingFromBar()
+    }
+
+    func cancelActiveRecording() {
+        overlayController?.cancelRecordingSession()
+    }
+
+    func setRecordingActiveState(_ active: Bool) {
+        isRecordingActive = active
+        if UserDefaults.standard.bool(forKey: "app.recording.active") != active {
+            UserDefaults.standard.set(active, forKey: "app.recording.active")
+        }
+    }
+
+    func updateRecordingOptions(_ options: RecordingOptions) {
+        settings.recordingOptions = options
+        UserDefaultsSettingsStore().save(settings)
+    }
+
+    func handleRecordingCompleted(_ result: RecordingResult) {
+        exporter.finalizeAskEveryTimeRecording(result) { [weak self] finalResult in
+            guard let self, let finalResult else { return }
+            CaptureSoundPlayer.play()
+
+            let copyFile: @MainActor (URL) -> Void = { [weak self] url in
+                _ = self?.deps.clipboard.writeFileURL(url)
+                CaptureToast.show(message: "已复制文件到剪贴板", status: .ok)
+            }
+            let revealInFinder: @MainActor (URL) -> Void = { url in
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            }
+            let discardFile: @MainActor (URL) -> Void = { url in
+                do {
+                    try FileManager.default.removeItem(at: url)
+                    Log.event(.recording, "recording.discard.ok")
+                    CaptureToast.show(message: "已删除本次录制", status: .ok)
+                } catch {
+                    Log.error(.recording, "recording.discard.fail", ["err": error.localizedDescription])
+                    CaptureToast.show(message: "删除失败：\(error.localizedDescription)", status: .warn)
+                }
+            }
+
+            CaptureToast.showRecording(
+                finalResult,
+                onCopyFile: copyFile,
+                onRevealInFinder: revealInFinder,
+                onOpen: { _ in
+                    if finalResult.format == .gif {
+                        GIFPreviewPanel.shared.show(
+                            result: finalResult,
+                            callbacks: GIFPreviewPanel.Callbacks(
+                                onCopyFile: copyFile,
+                                onRevealInFinder: revealInFinder,
+                                onDiscard: discardFile
+                            )
+                        )
+                    } else {
+                        VideoPreviewPanel.shared.show(
+                            result: finalResult,
+                            callbacks: VideoPreviewPanel.Callbacks(
+                                onCopyFile: copyFile,
+                                onRevealInFinder: revealInFinder,
+                                onDiscard: discardFile
+                            )
+                        )
+                    }
+                },
+                onDiscard: discardFile
+            )
+        }
+    }
+
     /// 呼出或收起视觉记忆库 Spotlight 搜索面板（⌥⌘V / 托盘入口共用）
     func toggleHistorySpotlight() {
         if HistorySpotlightPanel.shared.isVisible {
@@ -394,8 +519,11 @@ final class AppCoordinator {
             loadRecords: {
                 HistoryStore.shared.records()
             },
-            loadThumbnail: { record, maxSize in
-                HistoryStore.shared.thumbnail(
+            cachedThumbnail: { record, maxSize in
+                HistoryStore.shared.cachedThumbnail(forRecordID: record.id, maxSize: maxSize)
+            },
+            loadThumbnailAsync: { record, maxSize in
+                await HistoryStore.shared.loadThumbnailAsync(
                     forRecordID: record.id,
                     pixelSize: CGSize(width: record.width, height: record.height),
                     maxSize: maxSize
@@ -486,6 +614,154 @@ final class AppCoordinator {
         }
         let hidden = PinWindowController.toggleAllVisibility()
         CaptureToast.show(message: hidden ? "已隐藏全部贴图（再按 ⌥⌘P 唤回）" : "已恢复全部贴图")
+    }
+
+    // MARK: - 外部剪贴板图片智能感知（微信/飞书复制图片的轻提示入口）
+
+    /// 启动外部剪贴板监听：只监听粘贴板计数变化，命中「图片 + 文字/二维码」才提示，
+    /// 截图/编辑进行中（state != idle）直接跳过，绝不打断手上的活
+    private func startClipboardImageWatcher() {
+        let watcher = ClipboardImageWatcher.shared
+        watcher.isEnabled = settings.smartClipboardImagePrompt
+        watcher.isBusyProvider = { [weak self] in (self?.state ?? .idle) != .idle }
+        watcher.onDetected = { [weak self] detected in
+            self?.handleClipboardImageDetected(detected)
+        }
+        watcher.start()
+        Log.event(.clipboard, "clipboard.watch.start", [
+            "enabled": "\(settings.smartClipboardImagePrompt)",
+        ])
+    }
+
+    /// 检测到外部剪贴板图片：右下角轻提示（贴图划词 / 提取文字两个入口）
+    private func handleClipboardImageDetected(_ detected: ClipboardDetectedImage) {
+        guard state == .idle else {
+            Log.event(.clipboard, "clipboard.detected.ignored", ["state": state.rawValue])
+            return
+        }
+        Log.event(.clipboard, "clipboard.detected", [
+            "hasText": "\(detected.hasText)",
+            "hasQR": "\(detected.hasQR)",
+            "chars": "\(detected.charCount)",
+            "pxW": "\(detected.image.width)",
+            "pxH": "\(detected.image.height)",
+        ])
+        CaptureToast.showClipboardImageDetected(
+            thumbnail: detected.image,
+            pixelSize: CGSize(width: detected.image.width, height: detected.image.height),
+            hasText: detected.hasText,
+            hasQR: detected.hasQR,
+            charCount: detected.charCount,
+            onPinLiveText: { [weak self] in
+                self?.pinDetectedClipboardImage(detected)
+            },
+            onExtractOCR: { [weak self] in
+                self?.openStructuredOCR(for: detected.image)
+            }
+        )
+    }
+
+    /// 托盘 / 兜底菜单入口：把剪贴板图片贴到屏幕上并立刻进入实况文本划词态
+    func pinClipboardImageWithLiveText() {
+        guard let image = ClipboardImageReader.readImage() else {
+            CaptureToast.show(message: "剪贴板中无可用图片", status: .warn)
+            return
+        }
+        guard let screen = clipboardTargetScreen() else { return }
+        let rect = centeredPinRect(for: image, on: screen)
+        PinWindowController.pin(
+            image,
+            atGlobalRect: rect,
+            on: screen,
+            initialLiveTextAnalysis: nil,
+            activateLiveTextImmediately: true
+        )
+        Log.event(.clipboard, "clipboard.pin", [
+            "src": "clipboard",
+            "pxW": "\(image.width)",
+            "pxH": "\(image.height)",
+        ])
+    }
+
+    /// 轻提示「贴图划词」：直接透传已经分析好的实况文本结果，避免二次跑 Vision
+    private func pinDetectedClipboardImage(_ detected: ClipboardDetectedImage) {
+        guard let screen = clipboardTargetScreen() else { return }
+        let rect = centeredPinRect(for: detected.image, on: screen)
+        PinWindowController.pin(
+            detected.image,
+            atGlobalRect: rect,
+            on: screen,
+            initialLiveTextAnalysis: detected.analysis,
+            activateLiveTextImmediately: true
+        )
+        Log.event(.clipboard, "clipboard.pin.detected", [
+            "hasText": "\(detected.hasText)",
+            "chars": "\(detected.charCount)",
+        ])
+    }
+
+    /// 托盘 / 兜底菜单入口：直接对剪贴板图片做结构化 OCR（识别结果浮层）
+    func ocrClipboardImage() {
+        guard let image = ClipboardImageReader.readImage() else {
+            CaptureToast.show(message: "剪贴板中无可用图片", status: .warn)
+            return
+        }
+        openStructuredOCR(for: image)
+    }
+
+    /// 结构化 OCR 统一出口（克隆贴图取字面板同款浮层语义）
+    private func openStructuredOCR(for image: CGImage) {
+        guard let screen = clipboardTargetScreen() else { return }
+        let visible = screen.visibleFrame
+        let anchorRect = CGRect(
+            x: (visible.midX - 160).rounded(),
+            y: (visible.midY - 120).rounded(),
+            width: 320,
+            height: 240
+        )
+        Log.event(.ocr, "ocr.start", [
+            "pxW": "\(image.width)",
+            "pxH": "\(image.height)",
+            "src": "clipboard",
+        ])
+        Task { @MainActor in
+            do {
+                let result = try await deps.textRecognizer.recognizeStructured(image)
+                NSApp.activate()
+                OCRResultPanel.present(
+                    result: result,
+                    nearGlobalRect: anchorRect,
+                    on: screen,
+                    avoidRect: nil
+                )
+            } catch {
+                Log.error(.ocr, "ocr.fail", ["src": "clipboard", "err": error.localizedDescription])
+                CaptureToast.show(message: "文字识别失败：\(error.localizedDescription)", status: .warn)
+            }
+        }
+    }
+
+    /// 光标所在屏（兜底主屏 / 首屏）——与视觉记忆面板贴图同一判据
+    private func clipboardTargetScreen() -> NSScreen? {
+        NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }
+            ?? NSScreen.main ?? NSScreen.screens.first
+    }
+
+    /// 屏幕可见区居中、按 75% 上限缩放后的初始贴图矩形（像素 → 逻辑点）
+    private func centeredPinRect(for image: CGImage, on screen: NSScreen) -> CGRect {
+        let visible = screen.visibleFrame
+        let backing = max(1, screen.backingScaleFactor)
+        let logicalW = max(1, CGFloat(image.width) / backing)
+        let logicalH = max(1, CGFloat(image.height) / backing)
+        let fit = min(1.0, min((visible.width * 0.75) / logicalW, (visible.height * 0.75) / logicalH))
+        let w = max(1, (logicalW * fit).rounded())
+        let h = max(1, (logicalH * fit).rounded())
+        return CGRect(
+            x: (visible.midX - w / 2).rounded(),
+            y: (visible.midY - h / 2).rounded(),
+            width: w,
+            height: h
+        )
     }
 
     private func showCopyToast(image: CGImage, snapshot: EditableExportSnapshot?) {

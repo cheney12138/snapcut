@@ -13,7 +13,10 @@ final class HistorySpotlightPanel: NSObject {
 
     struct Callbacks {
         var loadRecords: @MainActor () -> [HistoryRecord]
-        var loadThumbnail: @MainActor (HistoryRecord, CGFloat) -> NSImage?
+        /// 纯内存查询（0 磁盘 I/O）：同步布局阶段只允许调它，命中不了就先用占位
+        var cachedThumbnail: @MainActor (HistoryRecord, CGFloat) -> NSImage?
+        /// 异步加载：未命中缓存的缩略图在后台解码，回主线程交给面板
+        var loadThumbnailAsync: @MainActor (HistoryRecord, CGFloat) async -> NSImage?
         var onCopyImage: @MainActor (HistoryRecord) -> Void
         var onReopenEdit: @MainActor (HistoryRecord) -> Void
         var onPin: @MainActor (HistoryRecord) -> Void
@@ -22,7 +25,8 @@ final class HistorySpotlightPanel: NSObject {
 
         init(
             loadRecords: @escaping @MainActor () -> [HistoryRecord],
-            loadThumbnail: @escaping @MainActor (HistoryRecord, CGFloat) -> NSImage?,
+            cachedThumbnail: @escaping @MainActor (HistoryRecord, CGFloat) -> NSImage?,
+            loadThumbnailAsync: @escaping @MainActor (HistoryRecord, CGFloat) async -> NSImage?,
             onCopyImage: @escaping @MainActor (HistoryRecord) -> Void,
             onReopenEdit: @escaping @MainActor (HistoryRecord) -> Void,
             onPin: @escaping @MainActor (HistoryRecord) -> Void,
@@ -30,7 +34,8 @@ final class HistorySpotlightPanel: NSObject {
             onDismiss: (@MainActor () -> Void)? = nil
         ) {
             self.loadRecords = loadRecords
-            self.loadThumbnail = loadThumbnail
+            self.cachedThumbnail = cachedThumbnail
+            self.loadThumbnailAsync = loadThumbnailAsync
             self.onCopyImage = onCopyImage
             self.onReopenEdit = onReopenEdit
             self.onPin = onPin
@@ -85,6 +90,9 @@ final class HistorySpotlightPanel: NSObject {
     private var selectedIndex: Int?
     private var cardPool: [HistoryCardView] = []
     private var thumbnailCache: [String: NSImage] = [:]
+
+    /// 本轮异步补图任务（每次重新 applySearch / dismiss 都要取消上一轮）
+    private var thumbnailLoadTask: Task<Void, Never>?
 
     private var isPresented = false
     private var isContextMenuOpen = false
@@ -154,7 +162,9 @@ final class HistorySpotlightPanel: NSObject {
         rebuildHintsStack()
         searchField.stringValue = ""
         allRecords = callbacks.loadRecords()
-        thumbnailCache.removeAll(keepingCapacity: true)
+        // 只剔除已不存在记录的失效缩略图，其余保留（上一轮的图直接复用，免二次解码）
+        let validIDs = Set(allRecords.map(\.id))
+        thumbnailCache = thumbnailCache.filter { validIDs.contains($0.key) }
         applySearch(query: "", preferredRecordID: nil, preserveScroll: false)
 
         installEventMonitors()
@@ -602,6 +612,8 @@ final class HistorySpotlightPanel: NSObject {
 
         layoutGrid(preserveScroll: preserveScroll)
         updateFooterActionButtons()
+        // 同步布局完成后才异步补图：面板已瞬间弹出，图片逐张补位
+        startThumbnailLoad(for: matches.map(\.record), epoch: presentationEpoch)
     }
 
     private func layoutGrid(preserveScroll: Bool) {
@@ -650,7 +662,7 @@ final class HistorySpotlightPanel: NSObject {
                 card.isHidden = false
 
                 let match = matches[index]
-                let thumb = loadCachedThumbnail(for: match.record)
+                let thumb = cachedThumbnailImage(for: match.record)
                 let metaText = Self.formatMetaLine(for: match.record)
                 card.configure(
                     index: index,
@@ -685,15 +697,81 @@ final class HistorySpotlightPanel: NSObject {
         }
     }
 
-    private func loadCachedThumbnail(for record: HistoryRecord) -> NSImage? {
+    /// 同步阶段取缩略图：本地缓存 → 注入的纯内存查询；绝不在主线程解码磁盘 PNG
+    private func cachedThumbnailImage(for record: HistoryRecord) -> NSImage? {
         if let cached = thumbnailCache[record.id] {
             return cached
         }
-        guard let loaded = callbacks?.loadThumbnail(record, Spec.thumbMaxSide) else {
+        guard let loaded = callbacks?.cachedThumbnail(record, Spec.thumbMaxSide) else {
             return nil
         }
         thumbnailCache[record.id] = loaded
         return loaded
+    }
+
+    /// 异步补图：首屏前 9 条优先，其余后排；最多 4 个并发解码，拿一张刷一张
+    private func startThumbnailLoad(for records: [HistoryRecord], epoch: Int) {
+        thumbnailLoadTask?.cancel()
+        thumbnailLoadTask = nil
+        guard callbacks != nil else { return }
+
+        var ordered: [HistoryRecord] = []
+        ordered.reserveCapacity(records.count)
+        var seen = Set<String>()
+        for record in records where !seen.contains(record.id) {
+            seen.insert(record.id)
+            guard thumbnailCache[record.id] == nil else { continue }
+            ordered.append(record)
+        }
+        guard !ordered.isEmpty else { return }
+
+        let headCount = min(9, ordered.count)
+        let planned = Array(ordered[0..<headCount]) + Array(ordered[headCount...])
+
+        thumbnailLoadTask = Task { [weak self] in
+            await withTaskGroup(of: Void.self) { group in
+                let maxConcurrent = 4
+                var nextIndex = 0
+                while nextIndex < planned.count, nextIndex < maxConcurrent {
+                    let record = planned[nextIndex]
+                    nextIndex += 1
+                    group.addTask { [weak self] in
+                        await self?.loadAndApplyThumbnail(record, epoch: epoch)
+                    }
+                }
+                while nextIndex < planned.count {
+                    guard !Task.isCancelled else {
+                        group.cancelAll()
+                        return
+                    }
+                    _ = await group.next()
+                    let record = planned[nextIndex]
+                    nextIndex += 1
+                    group.addTask { [weak self] in
+                        await self?.loadAndApplyThumbnail(record, epoch: epoch)
+                    }
+                }
+                await group.waitForAll()
+            }
+        }
+    }
+
+    /// 单个缩略图加载单元：取图与落图都在 MainActor，NSImage 不跨 actor
+    private func loadAndApplyThumbnail(_ record: HistoryRecord, epoch: Int) async {
+        guard let callbacks, !Task.isCancelled else { return }
+        guard let image = await callbacks.loadThumbnailAsync(record, Spec.thumbMaxSide) else { return }
+        guard !Task.isCancelled else { return }
+        applyLoadedThumbnail(image, recordID: record.id, epoch: epoch)
+    }
+
+    /// 补图落地：epoch / 可见性双重校验后写本地缓存并只刷仍展示同一记录的卡片
+    private func applyLoadedThumbnail(_ image: NSImage, recordID: String, epoch: Int) {
+        guard isVisible, presentationEpoch == epoch else { return }
+        thumbnailCache[recordID] = image
+        guard let index = matches.firstIndex(where: { $0.record.id == recordID }),
+              cardPool.indices.contains(index),
+              !cardPool[index].isHidden else { return }
+        cardPool[index].updateThumbnail(image, forRecordID: recordID)
     }
 
     private func selectCard(at newIndex: Int, ensureVisible: Bool) {
@@ -1057,6 +1135,9 @@ final class HistorySpotlightPanel: NSObject {
         isContextMenuOpen = false
         presentationEpoch += 1
         let epoch = presentationEpoch
+
+        thumbnailLoadTask?.cancel()
+        thumbnailLoadTask = nil
 
         removeEventMonitors()
 
@@ -1692,8 +1773,12 @@ private final class HistoryCardView: NSView {
         self.isSelectedCard = isSelected
         let record = match.record
 
-        if currentRecordID != record.id || thumbImageView.image == nil {
+        if currentRecordID != record.id {
+            // 卡片复用：换了记录必须先清掉上一张图，否则异步补图会串图
             currentRecordID = record.id
+            thumbImageView.image = thumbnail
+        } else if thumbImageView.image == nil, let thumbnail {
+            // 同一条记录：已有异步补上的图就保留，避免回退成占位
             thumbImageView.image = thumbnail
         }
 
@@ -1734,6 +1819,13 @@ private final class HistoryCardView: NSView {
         guard isSelectedCard != selected else { return }
         isSelectedCard = selected
         applyVisualState()
+    }
+
+    /// 异步补图落到卡片：只有仍展示同一条记录时才换图（防止复用卡片串图）
+    func updateThumbnail(_ image: NSImage, forRecordID id: String) {
+        guard currentRecordID == id else { return }
+        guard thumbImageView.image !== image else { return }
+        thumbImageView.image = image
     }
 
     override func updateTrackingAreas() {

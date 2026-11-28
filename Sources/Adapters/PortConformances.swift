@@ -34,7 +34,14 @@ final class PasteboardClipboard: ClipboardWriting {
         Log.event(.clipboard, "clipboard.write", [
             "fmts": "text", "bytes": "\(text.utf8.count)", "ok": "\(ok)",
         ])
+        // 自写标记：剪贴板图片感知据此跳过「自己写进去的内容」
+        if ok { ClipboardWriter.markOwnWrite() }
         return ok
+    }
+
+    @discardableResult
+    func writeFileURL(_ url: URL) -> Bool {
+        ClipboardWriter.writeFileURL(url)
     }
 }
 
@@ -123,7 +130,8 @@ extension Dependencies {
             hotkeys: CarbonHotKeyCenter.shared,
             permission: ScreenPermissionAdapter(),
             pinning: PinPresenterAdapter(),
-            updating: SparkleUpdater.shared
+            updating: SparkleUpdater.shared,
+            recording: SCKScreenRecorder()
         )
     }
 }

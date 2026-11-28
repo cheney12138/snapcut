@@ -10,6 +10,10 @@ struct TrayMenuContent: View {
     /// 成菜单卡死在未授权态」第二轮）。@AppStorage 的 UserDefaults 写入会让
     /// SwiftUI 重建 menu content。写入方：AppCoordinator 的 preflight 翻转。
     @AppStorage("app.perm.granted") private var permissionGranted: Bool = false
+    @AppStorage("app.recording.active") private var isRecordingActive: Bool = false
+    /// 剪贴板里有图片时（监控侧写的 UserDefaults 桥）才多出「贴图划词 / 识别文字」
+    /// 两个入口，避免菜单常驻两个点了会提示「没图」的死项
+    @AppStorage("app.clipboard.hasImage") private var hasClipboardImage: Bool = false
 
     /// 实际注册的快捷键（用户可改；菜单显示跟实际一致）
     private var hotkeys: AppSettings {
@@ -38,6 +42,32 @@ struct TrayMenuContent: View {
     }
 
     @ViewBuilder private var fullMenu: some View {
+        if isRecordingActive {
+            Button("■ 停止录制") {
+                Log.event(.tray, "tray.action", ["item": "stopRecording"])
+                AppCoordinatorShared.coordinator?.stopActiveRecording()
+            }
+            Button("✕ 放弃录制") {
+                Log.event(.tray, "tray.action", ["item": "cancelRecording"])
+                AppCoordinatorShared.coordinator?.cancelActiveRecording()
+            }
+            Divider()
+        }
+
+        if hasClipboardImage {
+            Button("贴图剪贴板图片（实况划词）") {
+                Log.event(.tray, "tray.action", ["item": "pinClipboard"])
+                AppCoordinatorShared.coordinator?.pinClipboardImageWithLiveText()
+            }
+
+            Button("识别剪贴板图片文字…") {
+                Log.event(.tray, "tray.action", ["item": "ocrClipboard"])
+                AppCoordinatorShared.coordinator?.ocrClipboardImage()
+            }
+
+            Divider()
+        }
+
         Button("截取区域  \(HotkeySpec.display(hotkeys.hotkeyRegion))") {
             Log.event(.tray, "tray.action", ["item": "captureRegion"])
             AppCoordinatorShared.coordinator?.beginRegionCapture()
@@ -46,6 +76,16 @@ struct TrayMenuContent: View {
         Button("截取全屏  \(HotkeySpec.display(hotkeys.hotkeyFullScreen))") {
             Log.event(.tray, "tray.action", ["item": "captureFullScreen"])
             AppCoordinatorShared.coordinator?.beginFullScreenCapture()
+        }
+
+        Button("录制视频  \(HotkeySpec.display(hotkeys.hotkeyRecordVideo))") {
+            Log.event(.tray, "tray.action", ["item": "recordVideo"])
+            AppCoordinatorShared.coordinator?.beginRegionRecording(format: .mp4)
+        }
+
+        Button("录制 GIF  \(HotkeySpec.display(hotkeys.hotkeyRecordGIF))") {
+            Log.event(.tray, "tray.action", ["item": "recordGIF"])
+            AppCoordinatorShared.coordinator?.beginRegionRecording(format: .gif)
         }
 
         Button("延时 3 秒截图") {
