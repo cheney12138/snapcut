@@ -14,8 +14,8 @@ settings:
     # 版本号真源：scripts/release.sh 改写这里 → xcodegen generate → Resources/Info.plist
     # （ChatGPT 教训见 glance 病例：写局部 Info.plist 的 PlistBuddy 失败被 || true 吞掉，
     #  包永远叫旧版本名。版本只认工程设置这一处。）
-    MARKETING_VERSION: "0.3.0"
-    CURRENT_PROJECT_VERSION: "202611281002"
+    MARKETING_VERSION: "0.4.0"
+    CURRENT_PROJECT_VERSION: "202611281238"
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "Apple Development: 18600607249@163.com (7KDMYNHX76)"
     DEVELOPMENT_TEAM: ""
@@ -46,7 +46,7 @@ targets:
         CFBundleDisplayName: Snapcut
         CFBundleName: Snapcut
         CFBundleIconFile: AppIcon
-        CFBundleShortVersionString: "0.3.0"
+        CFBundleShortVersionString: "0.4.0"
         # Sparkle 比大小看的是 CFBundleVersion，不是短版本号。
         # 不显式绑定就会落到 xcodegen 的默认值 "1" ⇒ 每个包在 Sparkle 眼里都是
         # 「比已装的更新」⇒ 装完再检查又提示有更新（无限升级循环）。
