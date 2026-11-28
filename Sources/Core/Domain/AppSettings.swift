@@ -54,10 +54,22 @@ public struct AppSettings: Equatable, Sendable, Codable {
     public var toolbarSize: ToolbarSize
     /// 视觉记忆库 Spotlight 面板全局热键（默认 "opt+cmd+v"，即 ⌥⌘V）
     public var hotkeyHistorySpotlight: String
+    /// 区域屏幕录制（MP4）全局热键（默认 "opt+cmd+r"，即 ⌥⌘R）
+    public var hotkeyRecordVideo: String
+    /// 区域 GIF 录制全局热键（默认 "opt+cmd+g"，即 ⌥⌘G）
+    public var hotkeyRecordGIF: String
     /// 截图导出后是否自动后台执行本地 OCR 文本索引（默认 true）
     public var autoIndexHistoryOCR: Bool
     /// 视觉记忆库浮窗内快捷操作键位（copyImage / reopenEdit / pin / copyOCR）
     public var spotlightHotkeys: [String: String]
+    /// 录屏与 GIF 录制偏好参数（记住上次选择）
+    public var recordingOptions: RecordingOptions
+    /// 外部剪贴板图片智能感知（默认 true）
+    ///
+    /// 开着时：任何 App 里复制一张「带文字/带二维码」的图片 → Snapcut 主动提示
+    /// 「要不要贴图 / 取字」；纯表情包与照片静默跳过（0 打扰）。
+    /// 纯数据开关，采样与解码都在适配器层（ClipboardImageWatcher）。
+    public var smartClipboardImagePrompt: Bool
 
     /// 工具组出厂默认序（纯标注工具 1-7；滚动截图已独立置于后段「取字」前）
     public static let defaultToolbarOrder: [Int] = EditorSession.Tool.allCases
@@ -84,6 +96,8 @@ public struct AppSettings: Equatable, Sendable, Codable {
         "ocr": "o",
         "pin": "p",
         "scroll": "s",
+        "record": "r",
+        "recordGIF": "g",
     ]
 
     /// 编辑器热键查找（缺失/非法回落默认；解析失败也回落——永不误吞按键）
@@ -120,8 +134,12 @@ public struct AppSettings: Equatable, Sendable, Codable {
         toolbarOrder: [Int] = AppSettings.defaultToolbarOrder,
         toolbarSize: ToolbarSize = .regular,
         hotkeyHistorySpotlight: String = "opt+cmd+v",
+        hotkeyRecordVideo: String = "opt+cmd+r",
+        hotkeyRecordGIF: String = "opt+cmd+g",
         autoIndexHistoryOCR: Bool = true,
-        spotlightHotkeys: [String: String] = AppSettings.defaultSpotlightHotkeys
+        spotlightHotkeys: [String: String] = AppSettings.defaultSpotlightHotkeys,
+        recordingOptions: RecordingOptions = RecordingOptions(),
+        smartClipboardImagePrompt: Bool = true
     ) {
         self.afterCapture = afterCapture
         self.saveDirectoryPath = saveDirectoryPath
@@ -135,12 +153,37 @@ public struct AppSettings: Equatable, Sendable, Codable {
         self.toolbarOrder = toolbarOrder
         self.toolbarSize = toolbarSize
         self.hotkeyHistorySpotlight = hotkeyHistorySpotlight
+        self.hotkeyRecordVideo = hotkeyRecordVideo
+        self.hotkeyRecordGIF = hotkeyRecordGIF
         self.autoIndexHistoryOCR = autoIndexHistoryOCR
         self.spotlightHotkeys = spotlightHotkeys
+        self.recordingOptions = recordingOptions
+        self.smartClipboardImagePrompt = smartClipboardImagePrompt
     }
 
     /// 出厂默认值
     public static let defaultSettings = AppSettings()
+
+    private enum CodingKeys: String, CodingKey {
+        case afterCapture
+        case saveDirectoryPath
+        case filenameStyle
+        case historyLimit
+        case showCopyNotification
+        case playCaptureSound
+        case hotkeyRegion
+        case hotkeyFullScreen
+        case editorHotkeys
+        case toolbarOrder
+        case toolbarSize
+        case hotkeyHistorySpotlight
+        case hotkeyRecordVideo
+        case hotkeyRecordGIF
+        case autoIndexHistoryOCR
+        case spotlightHotkeys
+        case recordingOptions
+        case smartClipboardImagePrompt
+    }
 
     /// 兼容旧存档：editorHotkeys 是 2026-11-15 加的字段，旧 JSON 没有 →
     /// 合成 Codable 在缺 key 时抛错整体回落默认，会把用户改过的其他设置
@@ -155,11 +198,47 @@ public struct AppSettings: Equatable, Sendable, Codable {
         playCaptureSound = (try? container.decodeIfPresent(Bool.self, forKey: .playCaptureSound)) ?? false
         hotkeyRegion = (try? container.decodeIfPresent(String.self, forKey: .hotkeyRegion)) ?? "cmd+shift+a"
         hotkeyFullScreen = (try? container.decodeIfPresent(String.self, forKey: .hotkeyFullScreen)) ?? "cmd+shift+s"
-        editorHotkeys = (try? container.decodeIfPresent([String: String].self, forKey: .editorHotkeys)) ?? Self.defaultEditorHotkeys
+        var mergedEditor = (try? container.decodeIfPresent([String: String].self, forKey: .editorHotkeys)) ?? Self.defaultEditorHotkeys
+        for (k, v) in Self.defaultEditorHotkeys where mergedEditor[k] == nil {
+            mergedEditor[k] = v
+        }
+        editorHotkeys = mergedEditor
         toolbarOrder = (try? container.decodeIfPresent([Int].self, forKey: .toolbarOrder)) ?? Self.defaultToolbarOrder
         toolbarSize = (try? container.decodeIfPresent(ToolbarSize.self, forKey: .toolbarSize)) ?? .regular
         hotkeyHistorySpotlight = (try? container.decodeIfPresent(String.self, forKey: .hotkeyHistorySpotlight)) ?? "opt+cmd+v"
+        hotkeyRecordVideo = (try? container.decodeIfPresent(String.self, forKey: .hotkeyRecordVideo)) ?? "opt+cmd+r"
+        hotkeyRecordGIF = (try? container.decodeIfPresent(String.self, forKey: .hotkeyRecordGIF)) ?? "opt+cmd+g"
         autoIndexHistoryOCR = (try? container.decodeIfPresent(Bool.self, forKey: .autoIndexHistoryOCR)) ?? true
-        spotlightHotkeys = (try? container.decodeIfPresent([String: String].self, forKey: .spotlightHotkeys)) ?? Self.defaultSpotlightHotkeys
+        var mergedSpotlight = (try? container.decodeIfPresent([String: String].self, forKey: .spotlightHotkeys)) ?? Self.defaultSpotlightHotkeys
+        for (k, v) in Self.defaultSpotlightHotkeys where mergedSpotlight[k] == nil {
+            mergedSpotlight[k] = v
+        }
+        spotlightHotkeys = mergedSpotlight
+        recordingOptions = (try? container.decodeIfPresent(RecordingOptions.self, forKey: .recordingOptions)) ?? RecordingOptions()
+        // 2026-11-28 新增：剪贴板图片智能感知。老存档没有这个 key → 回落 true（新功能默认开）
+        smartClipboardImagePrompt = (try? container.decodeIfPresent(Bool.self, forKey: .smartClipboardImagePrompt)) ?? true
+    }
+
+    /// 显式 encode：与上面的 CodingKeys 一一对应（新增字段必须同步两处，避免静默丢配置）
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(afterCapture, forKey: .afterCapture)
+        try container.encode(saveDirectoryPath, forKey: .saveDirectoryPath)
+        try container.encode(filenameStyle, forKey: .filenameStyle)
+        try container.encode(historyLimit, forKey: .historyLimit)
+        try container.encode(showCopyNotification, forKey: .showCopyNotification)
+        try container.encode(playCaptureSound, forKey: .playCaptureSound)
+        try container.encode(hotkeyRegion, forKey: .hotkeyRegion)
+        try container.encode(hotkeyFullScreen, forKey: .hotkeyFullScreen)
+        try container.encode(editorHotkeys, forKey: .editorHotkeys)
+        try container.encode(toolbarOrder, forKey: .toolbarOrder)
+        try container.encode(toolbarSize, forKey: .toolbarSize)
+        try container.encode(hotkeyHistorySpotlight, forKey: .hotkeyHistorySpotlight)
+        try container.encode(hotkeyRecordVideo, forKey: .hotkeyRecordVideo)
+        try container.encode(hotkeyRecordGIF, forKey: .hotkeyRecordGIF)
+        try container.encode(autoIndexHistoryOCR, forKey: .autoIndexHistoryOCR)
+        try container.encode(spotlightHotkeys, forKey: .spotlightHotkeys)
+        try container.encode(recordingOptions, forKey: .recordingOptions)
+        try container.encode(smartClipboardImagePrompt, forKey: .smartClipboardImagePrompt)
     }
 }

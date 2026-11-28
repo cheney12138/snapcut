@@ -1,5 +1,7 @@
 import AppKit
+import Carbon.HIToolbox
 import CoreGraphics
+import VisionKit
 
 /// 贴图（Pin）控制器：每张贴图一个实例，静态数组持有防提前释放，关闭时移除。
 /// 入口：PinWindowController.pin(_:atGlobalRect:on:)，多张贴图互不影响（各自 scale/alpha/窗口）。
@@ -48,6 +50,19 @@ final class PinWindowController {
     /// 是否处于某个拼贴组内（视觉归属由底层统一磨砂玻璃托盘承担，本窗尺寸零跳变）
     private(set) var inGroup = false
 
+    // MARK: - 实况文本（Live Text）状态
+
+    /// 后台静默分析任务（关闭时取消）
+    private var liveTextTask: Task<Void, Never>?
+    /// 分析结果（nil = 未完成 / 不支持 / 失败）
+    private var liveTextAnalysis: ImageAnalysis?
+    /// 是否处于划词态
+    private(set) var isLiveTextActive = false
+    /// 分析是否已跑完（无论成否）：避免「分析完了但没结果」时按 T 无休止重跑
+    private var liveTextAnalysisFinished = false
+    /// 用户在分析完成前就点了「实况文本划词」：分析结束自动立即开启
+    private var pendingLiveTextActivation = false
+
     var windowFrame: CGRect { window.frame }
 
     // MARK: - 手动拖动状态
@@ -73,14 +88,32 @@ final class PinWindowController {
 
     // MARK: - 入口
 
-    static func pin(_ image: CGImage, atGlobalRect rect: CGRect, on screen: NSScreen) {
+    /// 把一张图贴到屏幕上。
+    ///
+    /// - Parameters:
+    ///   - initialLiveTextAnalysis: 已经算好的实况文本结果（如外部剪贴板图片感知已经分析过）——
+    ///     传入就直接用，不再重复跑一次几分钟内的后台 OCR。
+    ///   - activateLiveTextImmediately: 贴出来就进划词态（用户复制的本来就是文字图，意图明确）。
+    @discardableResult
+    static func pin(
+        _ image: CGImage,
+        atGlobalRect rect: CGRect,
+        on screen: NSScreen,
+        initialLiveTextAnalysis: ImageAnalysis? = nil,
+        activateLiveTextImmediately: Bool = false
+    ) -> PinWindowController {
         if areAllPinsHidden {
             _ = toggleAllVisibility()
         }
         let controller = PinWindowController(image: image, atGlobalRect: rect, on: screen)
         live.append(controller)
+        // 分析结果先装：showWindow 内部据此跳过重复的后台分析
+        controller.applyInitialLiveTextAnalysis(initialLiveTextAnalysis)
         controller.showWindow()
         PinMagnetRegistry.shared.register(controller)
+        if activateLiveTextImmediately {
+            controller.setLiveTextActive(true)
+        }
         let screenScale = screen.backingScaleFactor
         Log.event(logCategory, "pin.create", [
             "w": "\(Int(rect.width))",
@@ -88,7 +121,10 @@ final class PinWindowController {
             "pxW": "\(Int(rect.width * screenScale))",
             "pxH": "\(Int(rect.height * screenScale))",
             "count": "\(live.count)",
+            "liveTextReady": "\(controller.liveTextAnalysisFinished)",
+            "liveTextActive": "\(controller.isLiveTextActive)",
         ])
+        return controller
     }
 
     /// 全局一键隐藏/唤回所有贴图及拼贴组托盘/顶栏（Boss Key），完整保留位置、缩放、透明度与分组状态。
@@ -186,7 +222,198 @@ final class PinWindowController {
     }
 
     private func showWindow() {
+        window.onKeyEquivalent = { [weak self] event in
+            self?.handleKeyEquivalent(event) ?? false
+        }
         window.makeKeyAndOrderFront(nil)
+        // 后台静默分析：用户还没想划词时就把结果备好，按 T 秒开（不抢焦点、不弹 HUD）。
+        // 已从剪贴板感知里拿到分析结果的贴图不需要再跑一遍。
+        if !liveTextAnalysisFinished {
+            startLiveTextAnalysis()
+        }
+    }
+
+    /// 直接装载外部算好的实况文本结果（外部剪贴板感知复用同一次 Vision 分析）
+    private func applyInitialLiveTextAnalysis(_ analysis: ImageAnalysis?) {
+        guard let analysis else { return }
+        liveTextTask?.cancel()
+        liveTextTask = nil
+        liveTextAnalysis = analysis
+        liveTextAnalysisFinished = true
+        let hasInteractive = analysis.hasResults(for: .text) || analysis.hasResults(for: .machineReadableCode)
+        contentView.setLiveTextAvailable(hasInteractive)
+        Log.event(Self.logCategory, "pin.livetext.preloaded", [
+            "chars": "\(analysis.transcript.count)",
+            "qr": "\(analysis.hasResults(for: .machineReadableCode))",
+        ])
+    }
+
+    // MARK: - 实况文本（划词）
+
+    /// 后台静默分析：贴图一出现就开始跑，完成前用户可拖动/缩放/复制，零干扰。
+    private func startLiveTextAnalysis() {
+        guard PinLiveTextAnalyzer.isSupported else {
+            Log.event(Self.logCategory, "pin.livetext.unsupported")
+            return
+        }
+        liveTextTask?.cancel()
+        liveTextAnalysisFinished = false
+        let image = self.image
+        liveTextTask = Task { [weak self] in
+            let start = ContinuousClock.now
+            let analysis = await PinLiveTextAnalyzer.analyze(image)
+            guard !Task.isCancelled else { return }
+            let (seconds, attoseconds) = (ContinuousClock.now - start).components
+            let ms = String(format: "%.0f", Double(seconds) * 1000 + Double(attoseconds) / 1e15)
+            guard let self else { return }
+            self.finishLiveTextAnalysis(analysis, elapsedMs: ms)
+        }
+    }
+
+    private func finishLiveTextAnalysis(_ analysis: ImageAnalysis?, elapsedMs: String) {
+        liveTextTask = nil
+        liveTextAnalysisFinished = true
+        liveTextAnalysis = analysis
+        let hasText = analysis?.hasResults(for: .text) ?? false
+        contentView.setLiveTextAvailable(hasText)
+        if hasText, let analysis {
+            Log.event(Self.logCategory, "pin.livetext.ready", [
+                "chars": "\(analysis.transcript.count)",
+                "ms": elapsedMs,
+            ])
+        } else {
+            Log.event(Self.logCategory, "pin.livetext.empty", ["ms": elapsedMs])
+        }
+        // 用户抢跑：分析结束自动补上激活
+        if pendingLiveTextActivation {
+            pendingLiveTextActivation = false
+            setLiveTextActive(true)
+        }
+    }
+
+    func toggleLiveText() {
+        setLiveTextActive(!isLiveTextActive)
+    }
+
+    func setLiveTextActive(_ active: Bool) {
+        guard active != isLiveTextActive else { return }
+        guard active else {
+            isLiveTextActive = false
+            pendingLiveTextActivation = false
+            contentView.setLiveTextActive(false, analysis: nil)
+            window.makeFirstResponder(contentView)
+            showHUD("已退出实况文本")
+            Log.event(Self.logCategory, "pin.livetext.toggle", ["active": "false"])
+            return
+        }
+
+        guard PinLiveTextAnalyzer.isSupported else {
+            showHUD("当前系统不支持实况文本")
+            return
+        }
+        guard let analysis = liveTextAnalysis else {
+            if liveTextAnalysisFinished {
+                // 分析跑完了却拿不到结果（系统拒绝 / VisionKit 报错）：一次性说清楚，绝不重试
+                pendingLiveTextActivation = false
+                showHUD("实况文本不可用")
+                Log.event(Self.logCategory, "pin.livetext.unavailable")
+                return
+            }
+            // 分析还在跑：HUD 提示 + 排队等结果（不丢用户的意图）
+            pendingLiveTextActivation = true
+            showHUD("识别中…")
+            if liveTextTask == nil { startLiveTextAnalysis() }
+            Log.event(Self.logCategory, "pin.livetext.pending")
+            return
+        }
+        guard analysis.hasResults(for: .text) || analysis.hasResults(for: .machineReadableCode) else {
+            showHUD("未检测到文字")
+            Log.event(Self.logCategory, "pin.livetext.noText")
+            return
+        }
+
+        isLiveTextActive = true
+        pendingLiveTextActivation = false
+        contentView.setLiveTextActive(true, analysis: analysis)
+        // 划词需要键盘焦点（⌘A / ⌘C / Esc 都走窗口 performKeyEquivalent 兑底）
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(contentView)
+        showHUD("实况文本 · ⌘拖移动 · Esc退出")
+        Log.event(Self.logCategory, "pin.livetext.toggle", ["active": "true"])
+    }
+
+    /// 窗口级快捷键兜底（LSUIElement 无主菜单栏，overlay 拿焦点后 ⌘C/⌘A 找不到菜单项）
+    private func handleKeyEquivalent(_ event: NSEvent) -> Bool {
+        let keyCode = Int(event.keyCode)
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+
+        if keyCode == kVK_Escape {
+            guard isLiveTextActive else { return false }
+            setLiveTextActive(false)
+            return true
+        }
+        if mods.isEmpty, keyCode == kVK_ANSI_T {
+            // 贴图窗内没有文本框，T 不会被文字输入占用
+            toggleLiveText()
+            return true
+        }
+        guard mods == .command else { return false }
+        switch keyCode {
+        case kVK_ANSI_C:
+            if isLiveTextActive, contentView.copySelectedLiveText() {
+                showHUD("已复制文字")
+                Log.event(Self.logCategory, "pin.livetext.copy", [:])
+                return true
+            }
+            // 未划词态、或划词态但没选中：都复制图像（不让 ⌘C 没反应）
+            copyImageToPasteboard()
+            showHUD("已复制图像")
+            return true
+        case kVK_ANSI_A:
+            guard isLiveTextActive else { return false }
+            contentView.selectAllLiveText()
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 右键「结构化取字…」：复用合成根注入的识别端口（没有则回退适配器），
+    /// 识别后弹 OCRResultPanel（Markdown / 表格可复制可编辑）
+    func openStructuredOCRPanel() {
+        let rect = window.frame
+        guard let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        if isLiveTextActive { setLiveTextActive(false) }
+        let image = self.image
+        let recognizer = AppCoordinatorShared.deps?.textRecognizer
+        Log.event(.ocr, "ocr.start", [
+            "pxW": "\(image.width)", "pxH": "\(image.height)", "src": "pin",
+        ])
+        Task { @MainActor in
+            let result: StructuredOCRResult
+            if let recognizer {
+                result = (try? await recognizer.recognizeStructured(image)) ?? Self.emptyOCRResult()
+            } else {
+                result = (try? await TextRecognizer.recognizeStructured(image)) ?? Self.emptyOCRResult()
+            }
+            OCRResultPanel.present(result: result, nearGlobalRect: rect, on: screen, avoidRect: nil)
+            Log.event(.ocr, "ocr.present", [
+                "chars": "\(result.plainText.count)",
+                "qrs": "\(result.qrCodes.count)",
+                "table": result.markdownTable != nil ? "\(result.tableRowCount)x\(result.tableColumnCount)" : "none",
+            ])
+        }
+    }
+
+    private static func emptyOCRResult() -> StructuredOCRResult {
+        StructuredOCRResult(
+            plainText: "",
+            qrCodes: [],
+            markdownTable: nil,
+            tableRowCount: 0,
+            tableColumnCount: 0
+        )
     }
 
     // MARK: - 成组标志（窗体尺寸零跳变；统一磨砂玻璃托盘由 PinMagnetRegistry 维护）
@@ -588,6 +815,14 @@ final class PinWindowController {
         }
         hudHideTask?.cancel()
         hudHideTask = nil
+        // 实况文本收尾：取消后台分析 + 卸下 overlay（避免 overlay 持着已释放图像的引用）
+        liveTextTask?.cancel()
+        liveTextTask = nil
+        liveTextAnalysis = nil
+        liveTextAnalysisFinished = false
+        pendingLiveTextActivation = false
+        isLiveTextActive = false
+        contentView.setLiveTextActive(false, analysis: nil)
         window.orderOut(nil)
         PinMagnetRegistry.shared.remove(self)
         Self.remove(self)

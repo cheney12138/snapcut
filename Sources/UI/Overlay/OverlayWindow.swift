@@ -61,6 +61,7 @@ final class OverlayWindow: NSWindow {
         if frame != screen.frame {
             setFrame(screen.frame, display: false)
         }
+        ignoresMouseEvents = false
         frozenBackdropView.layer?.contents = nil
         frozenBackdropView.isHidden = true
         overlayView.resetForReuse()
@@ -109,9 +110,32 @@ final class OverlayWindow: NSWindow {
         overlayView.exitEditorIfNeeded()
     }
 
-    func exitScrollMode() {
-        frozenBackdropView.isHidden = (frozenBackdropView.layer?.contents == nil)
+    func exitScrollMode(restoreFrozenBackdrop: Bool = true) {
+        frozenBackdropView.isHidden = !restoreFrozenBackdrop || (frozenBackdropView.layer?.contents == nil)
         overlayView.exitScrollMode()
+    }
+
+    /// 录屏准备态：隐藏冻结底图露出实时桌面，保留可调选区框
+    func enterRecordingPreparingMode(globalRect: CGRect) {
+        frozenBackdropView.isHidden = true
+        ignoresMouseEvents = false
+        overlayView.enterRecordingPreparingMode(globalRect: globalRect)
+    }
+
+    /// 录屏进行中：事件完全穿透下层 App，仅保留外围录制边框
+    func enterRecordingActiveMode(globalRect: CGRect, paused: Bool) {
+        frozenBackdropView.isHidden = true
+        ignoresMouseEvents = true
+        overlayView.enterRecordingActiveMode(globalRect: globalRect, paused: paused)
+    }
+
+    func setRecordingPaused(_ paused: Bool) {
+        overlayView.setRecordingPaused(paused)
+    }
+
+    func exitRecordingMode() {
+        ignoresMouseEvents = false
+        overlayView.exitRecordingMode()
     }
 
     /// 滚动采集：区域随内容生长（全局矩形）
@@ -193,6 +217,15 @@ final class OverlayView: NSView {
     /// 采集区域边缘光晕 + 底缘绿条（motion.pulse；替代旧 draw 内画框）
     private var scrollGlowView: ScrollRegionGlowView?
 
+    private enum RecordingOverlayMode: Equatable {
+        case none
+        case preparing
+        case active(paused: Bool)
+    }
+    private var recordingMode: RecordingOverlayMode = .none
+    private var recordingRectLocal: CGRect = .zero
+    private var recordingBorderView: RecordingRegionBorderView?
+
     /// 文字输入框（text 工具）
     private var textField: NSTextField?
 
@@ -236,6 +269,8 @@ final class OverlayView: NSView {
     private let minSelectionSize: CGFloat = 4
     /// 窗口悬停高亮淡入起点（审查：悬停反馈应「亮起」不是「出现」，0.12s）
     private var hoverFadeStart: CFTimeInterval = 0
+    /// 拖拽期直接按 Enter/快捷键提前提交后，吞掉系统随后补发的那一笔延迟 leftMouseUp（三指拖移场景）
+    private var ignoreNextMouseUpAfterEarlyCommit = false
 
     init(frame frameRect: NSRect, controller: OverlayController) {
         self.controller = controller
@@ -272,6 +307,10 @@ final class OverlayView: NSView {
         scrollGlowView = nil
         scrollMode = false
         scrollRectLocal = nil
+        recordingBorderView?.removeFromSuperview()
+        recordingBorderView = nil
+        recordingMode = .none
+        recordingRectLocal = .zero
         phase = .waitingForDrag
         selectionLocal = .zero
         editorSession = nil
@@ -290,6 +329,7 @@ final class OverlayView: NSView {
         hoverMorphFromRect = nil
         hoverMorphStart = 0
         hoverFadeStart = 0
+        ignoreNextMouseUpAfterEarlyCommit = false
         needsDisplay = true
     }
 
@@ -339,6 +379,67 @@ final class OverlayView: NSView {
         scrollRectLocal = nil
         scrollGlowView?.removeFromSuperview()
         scrollGlowView = nil
+        needsDisplay = true
+    }
+
+    func enterRecordingPreparingMode(globalRect: CGRect) {
+        textField?.removeFromSuperview()
+        textField = nil
+        pendingAnnotation = nil
+        editorSession = nil
+        editGesture = .none
+        hoverEdge = nil
+        recordingBorderView?.removeFromSuperview()
+        recordingBorderView = nil
+
+        let frame = window?.frame ?? .zero
+        recordingRectLocal = CGRect(
+            x: globalRect.minX - frame.minX,
+            y: frame.maxY - globalRect.maxY,
+            width: globalRect.width,
+            height: globalRect.height
+        )
+        recordingMode = .preparing
+        phase = .confirmed
+        needsDisplay = true
+    }
+
+    func enterRecordingActiveMode(globalRect: CGRect, paused: Bool) {
+        editGesture = .none
+        hoverEdge = nil
+        let frame = window?.frame ?? .zero
+        let local = CGRect(
+            x: globalRect.minX - frame.minX,
+            y: frame.maxY - globalRect.maxY,
+            width: globalRect.width,
+            height: globalRect.height
+        )
+        recordingRectLocal = local
+        recordingMode = .active(paused: paused)
+        if recordingBorderView == nil {
+            let border = RecordingRegionBorderView(frame: bounds)
+            border.autoresizingMask = [.width, .height]
+            addSubview(border)
+            recordingBorderView = border
+        }
+        recordingBorderView?.update(rect: local)
+        recordingBorderView?.setRecordingActive(paused)
+        needsDisplay = true
+    }
+
+    func setRecordingPaused(_ paused: Bool) {
+        guard case .active = recordingMode else { return }
+        recordingMode = .active(paused: paused)
+        recordingBorderView?.setRecordingActive(paused)
+    }
+
+    func exitRecordingMode() {
+        recordingMode = .none
+        recordingRectLocal = .zero
+        editGesture = .none
+        hoverEdge = nil
+        recordingBorderView?.removeFromSuperview()
+        recordingBorderView = nil
         needsDisplay = true
     }
 
@@ -441,6 +542,11 @@ final class OverlayView: NSView {
         let local = convert(event.locationInWindow, from: nil)
         cursorLocal = local
         if scrollMode { return }
+        if case .preparing = recordingMode {
+            updateHoverEdge(at: local)
+            return
+        }
+        if case .active = recordingMode { return }
         switch phase {
         case .waitingForDrag:
             updateHover(at: local)
@@ -502,11 +608,28 @@ final class OverlayView: NSView {
 
     /// 编辑态：光标是否压在手柄上（决定光标形状 + 手柄高亮）
     private func updateHoverEdge(at local: CGPoint) {
-        let rect = editorRectLocal
+        let isRecPrep = (recordingMode == .preparing)
+        let rect = isRecPrep ? recordingRectLocal : editorRectLocal
         let edge: SelectionEdge? = (rect.width >= SelectionGeometry.handleVisibilityThreshold
             || rect.height >= SelectionGeometry.handleVisibilityThreshold)
             ? SelectionGeometry.edge(atLocal: local, in: rect)
             : nil
+        if isRecPrep {
+            hoverEdge = edge
+            if let edge {
+                switch edge {
+                case .left, .right: NSCursor.resizeLeftRight.set()
+                case .top, .bottom: NSCursor.resizeUpDown.set()
+                case .topLeft, .bottomRight, .topRight, .bottomLeft: NSCursor.crosshair.set()
+                }
+            } else if rect.contains(local) {
+                NSCursor.openHand.set()
+            } else {
+                NSCursor.arrow.set()
+            }
+            needsDisplay = true
+            return
+        }
         guard edge != hoverEdge else { return }
         hoverEdge = edge
         if let edge {
@@ -741,6 +864,11 @@ final class OverlayView: NSView {
     // MARK: - 光标
 
     override func resetCursorRects() {
+        if case .preparing = recordingMode {
+            addCursorRect(recordingRectLocal, cursor: .openHand)
+            addCursorRect(bounds.minus(recordingRectLocal), cursor: .arrow)
+            return
+        }
         switch phase {
         case .editing:
             addCursorRect(editorRectLocal, cursor: .crosshair)
@@ -759,6 +887,7 @@ final class OverlayView: NSView {
     /// mouseDown 正常路径不受影响（phase guard 幂等）。
     func beginDragIfNeeded(from point: CGPoint) {
         guard phase == .waitingForDrag else { return }
+        ignoreNextMouseUpAfterEarlyCommit = false
         phase = .dragging(start: point)
         selectionLocal = CGRect(origin: point, size: .zero)
         Log.event(.overlay, "overlay.drag.recover", ["pt": "\(Int(point.x)),\(Int(point.y))"])
@@ -767,10 +896,19 @@ final class OverlayView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         super.mouseDown(with: event)
+        ignoreNextMouseUpAfterEarlyCommit = false
         let point = convert(event.locationInWindow, from: nil)
         Log.event(.overlay, "overlay.mousedown", [
             "phase": phaseLabel, "pt": "\(Int(point.x)),\(Int(point.y))",
         ])
+        if case .preparing = recordingMode {
+            if let edge = SelectionGeometry.edge(atLocal: point, in: recordingRectLocal) {
+                editGesture = .resize(edge: edge, startRect: recordingRectLocal)
+            } else if recordingRectLocal.contains(point) {
+                editGesture = .move(startRect: recordingRectLocal, startPoint: point)
+            }
+            return
+        }
         switch phase {
         case .waitingForDrag:
             // 双击 = 当前显示器全屏截图（与单击整窗共用鼠标时靠宽限区分）
@@ -805,6 +943,23 @@ final class OverlayView: NSView {
             "viewId": "\(Unmanaged.passUnretained(self).toOpaque())",
             "sel": "\(Int(selectionLocal.width))x\(Int(selectionLocal.height))",
         ])
+        if case .preparing = recordingMode {
+            let point = convert(event.locationInWindow, from: nil)
+            switch editGesture {
+            case .resize(let edge, let startRect):
+                recordingRectLocal = SelectionGeometry.resized(startRect, edge: edge, to: point, limit: bounds)
+            case .move(let startRect, let startPoint):
+                let delta = CGSize(width: point.x - startPoint.x, height: point.y - startPoint.y)
+                recordingRectLocal = SelectionGeometry.moved(startRect, by: delta, limit: bounds)
+            case .none:
+                return
+            }
+            if let screen = window?.screen {
+                controller.updateRecordingRegionGlobal(convertToGlobalRect(recordingRectLocal), on: screen)
+            }
+            needsDisplay = true
+            return
+        }
         switch phase {
         case .dragging(let start):
             let point = convert(event.locationInWindow, from: nil)
@@ -839,6 +994,15 @@ final class OverlayView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
+        if ignoreNextMouseUpAfterEarlyCommit {
+            ignoreNextMouseUpAfterEarlyCommit = false
+            Log.event(.overlay, "overlay.mouseup.ignoredAfterEarlyCommit", ["phase": phaseLabel])
+            return
+        }
+        if case .preparing = recordingMode {
+            commitRecordingEditGestureIfNeeded()
+            return
+        }
         switch phase {
         case .dragging:
             Log.event(.overlay, "overlay.mouseup", [
@@ -858,22 +1022,48 @@ final class OverlayView: NSView {
                 }
                 return
             }
-            selectionLocal = snapToPixelGrid(selectionLocal)
-            phase = .confirmed
-            needsDisplay = true
-            // 松手即激活：capture 冻结 ~100-200ms 期间用户可能已按键，
-            // 未激活 App 的键盘事件全给前台 App（用户实报：Enter/Esc 无响应）
-            NSApp.activate(ignoringOtherApps: true)
-            window?.makeKeyAndOrderFront(nil)
-            window?.makeFirstResponder(self)
-            let globalRect = convertToGlobalRect(selectionLocal)
-            let screen = window?.screen ?? NSScreen.main!
-            controller.didSelect(rect: globalRect, on: screen)
+            _ = commitDraggingSelection(via: "mouseUp")
         case .editing:
             handleEditorMouseUp(convert(event.locationInWindow, from: nil))
         default:
             break
         }
+    }
+
+    /// 统一提交当前拖选框（mouseUp / 拖拽期直接按 Enter 或快捷键共用）
+    @discardableResult
+    private func commitDraggingSelection(via: String) -> Bool {
+        guard case .dragging = phase,
+              selectionLocal.width >= minSelectionSize,
+              selectionLocal.height >= minSelectionSize else {
+            return false
+        }
+        Log.event(.overlay, "overlay.drag.commit", [
+            "via": via,
+            "sel": "\(Int(selectionLocal.minX)),\(Int(selectionLocal.minY)),\(Int(selectionLocal.width)),\(Int(selectionLocal.height))",
+        ])
+        selectionLocal = snapToPixelGrid(selectionLocal)
+        phase = .confirmed
+        needsDisplay = true
+        // 松手即激活：capture 冻结 ~100-200ms 期间用户可能已按键，
+        // 未激活 App 的键盘事件全给前台 App（用户实报：Enter/Esc 无响应）
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(self)
+        let globalRect = convertToGlobalRect(selectionLocal)
+        let screen = window?.screen ?? NSScreen.main!
+        controller.didSelect(rect: globalRect, on: screen)
+        return true
+    }
+
+    private func commitRecordingEditGestureIfNeeded() {
+        if case .none = editGesture { return }
+        recordingRectLocal = snapToPixelGrid(recordingRectLocal)
+        editGesture = .none
+        if let screen = window?.screen {
+            controller.updateRecordingRegionGlobal(convertToGlobalRect(recordingRectLocal), on: screen)
+        }
+        needsDisplay = true
     }
 
     // MARK: - 整窗 / 全屏采集
@@ -1178,6 +1368,11 @@ final class OverlayView: NSView {
 
     private var phaseLabel: String {
         if scrollMode { return "scroll" }
+        switch recordingMode {
+        case .preparing: return "rec-prep"
+        case .active: return "rec-active"
+        case .none: break
+        }
         switch phase {
         case .waitingForDrag: return "wait"
         case .dragging: return "drag"
@@ -1567,10 +1762,19 @@ final class OverlayView: NSView {
             return super.performKeyEquivalent(with: event)
         }
         if Int(event.keyCode) == kVK_ANSI_S,
-           event.modifierFlags.contains(.option),
-           phase == .editing || phase == .confirmed {
-            controller.perform(action: .quickSave)
-            return true
+           event.modifierFlags.contains(.option) {
+            if case .dragging = phase, commitDraggingSelection(via: "keyQuickSave") {
+                ignoreNextMouseUpAfterEarlyCommit = true
+            }
+            if recordingMode == .none, phase == .editing || phase == .confirmed {
+                controller.perform(action: .quickSave)
+                return true
+            }
+        }
+        if case .dragging = phase,
+           EditorKeyRouter.matchHotkey(event) != nil,
+           commitDraggingSelection(via: "keyEquivalent") {
+            ignoreNextMouseUpAfterEarlyCommit = true
         }
         if phase == .editing, let action = matchEditorHotkey(event) {
             performEditorHotkeyAction(action)
@@ -1585,6 +1789,30 @@ final class OverlayView: NSView {
         // 此时 editorSession 还挂着旧单帧底图，Enter→done / Esc→cancel 会把会话
         // 销毁 ⇒ 合成结果无处回填（scroll.compose.noSession 病例）。
         if controller.isScrollComposing { return }
+        if case .active = recordingMode { return }
+        if case .preparing = recordingMode {
+            switch Int(event.keyCode) {
+            case kVK_Escape:
+                controller.cancelRecordingSession()
+            case kVK_Return, kVK_ANSI_KeypadEnter:
+                controller.startRecordingFromBar()
+            case kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow:
+                let step: CGFloat = event.modifierFlags.contains(.shift) ? 10 : 1
+                let dx: CGFloat = Int(event.keyCode) == kVK_LeftArrow ? -step : (Int(event.keyCode) == kVK_RightArrow ? step : 0)
+                let dy: CGFloat = Int(event.keyCode) == kVK_UpArrow ? -step : (Int(event.keyCode) == kVK_DownArrow ? step : 0)
+                let moved = SelectionGeometry.nudged(recordingRectLocal, dx: dx, dy: dy, limit: bounds)
+                if moved != recordingRectLocal {
+                    recordingRectLocal = moved
+                    if let screen = window?.screen {
+                        controller.updateRecordingRegionGlobal(convertToGlobalRect(moved), on: screen)
+                    }
+                    needsDisplay = true
+                }
+            default:
+                break
+            }
+            return
+        }
         // 文字输入态：普通键给输入框（first responder 已是 field，事件不会到这）
         // C：选区阶段复制光标处像素颜色（取色器语义），随后结束会话
         let inSelectionPhase: Bool = {
@@ -1614,6 +1842,25 @@ final class OverlayView: NSView {
             default: break
             }
             return
+        }
+        // 兜底：若系统三指拖移未下发离手触控事件，用户已拖出有效选区并在 0.5s 合成 mouseUp 间隙内
+        // 直接按回车/快捷键（如 Return / ⌘S / P / O / S / R / G），立刻落定选区并同步执行该按键动作，绝不吞键！
+        if case .dragging = phase,
+           selectionLocal.width >= minSelectionSize,
+           selectionLocal.height >= minSelectionSize {
+            let code = Int(event.keyCode)
+            let isReturn = (code == kVK_Return || code == kVK_ANSI_KeypadEnter)
+            let isQuickSave = (code == kVK_ANSI_S && event.modifierFlags.contains(.command) && event.modifierFlags.contains(.option))
+            let isEditorKey = EditorKeyRouter.matchHotkey(event) != nil
+            if isReturn || isQuickSave || isEditorKey {
+                if commitDraggingSelection(via: "keyDown") {
+                    ignoreNextMouseUpAfterEarlyCommit = true
+                    // 若本次是从录屏/GIF 入口框选，已切进准备态，停留在准备态不触发截图保存
+                    if recordingMode != .none {
+                        return
+                    }
+                }
+            }
         }
         // 编辑器自定义热键（工具栏后半段 8 动作，settings.editorHotkeys）：
         // 匹配优先于下述系统语义（Return/Esc 先走文字输入态，S 滚动/⌘⌥S 快存
@@ -1709,6 +1956,12 @@ final class OverlayView: NSView {
             Log.event(.scroll, "scroll.keyReceived")
             self.controller.beginScrollCapture()
         },
+        record: { [weak self] in
+            self?.controller.toolbarAction(.record)
+        },
+        recordGIF: { [weak self] in
+            self?.controller.toolbarAction(.recordGIF)
+        },
         selectTool: { [weak self] tool in
             guard let self else { return }
             self.editorSession?.currentTool = tool
@@ -1720,7 +1973,7 @@ final class OverlayView: NSView {
     /// event → 组合串 → settings.editorHotkeys 反查 action key。
     /// 仅编辑/确认阶段且无文字输入时生效（文字输入态的键必须给输入框）。
     private func matchEditorHotkey(_ event: NSEvent) -> String? {
-        guard textField == nil, phase == .editing || phase == .confirmed, !scrollMode else { return nil }
+        guard textField == nil, phase == .editing || phase == .confirmed, !scrollMode, recordingMode == .none else { return nil }
         return EditorKeyRouter.matchHotkey(event)
     }
 
@@ -1783,6 +2036,15 @@ final class OverlayView: NSView {
             drawScrollHUD(ctx: ctx)
             return
         }
+        switch recordingMode {
+        case .active:
+            return
+        case .preparing:
+            drawRecordingPreparing(ctx: ctx)
+            return
+        case .none:
+            break
+        }
         switch phase {
         case .editing:
             drawEditor(ctx: ctx)
@@ -1790,6 +2052,30 @@ final class OverlayView: NSView {
             drawSelection(ctx: ctx)
             drawSelectionOverlays(ctx: ctx)
         }
+    }
+
+    private func drawRecordingPreparing(ctx: CGContext) {
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.28).cgColor)
+        ctx.fill(bounds)
+        let rect = recordingRectLocal
+        guard rect.width > 0, rect.height > 0 else { return }
+
+        ctx.saveGState()
+        ctx.setBlendMode(.clear)
+        ctx.fill(rect)
+        ctx.restoreGState()
+
+        let outer = rect.insetBy(dx: -1.0, dy: -1.0)
+        ctx.setStrokeColor(DesignTokens.statusError.withAlphaComponent(0.92).cgColor)
+        ctx.setLineWidth(2.0)
+        ctx.stroke(outer)
+
+        drawSelectionHandles(ctx: ctx, rect: rect)
+
+        let scale = window?.screen?.backingScaleFactor ?? 1
+        let w = Int((rect.width * scale).rounded())
+        let h = Int((rect.height * scale).rounded())
+        drawBadge(text: "\(w) × \(h)", below: rect)
     }
 
     /// 滚动采集态：蒙层 + 挖空采集区（outline/光晕/底缘绿条由 ScrollRegionGlowView 承担，
@@ -2235,8 +2521,8 @@ final class OverlayView: NSView {
     }
 
     /// 8 向圆形手柄（Apple Preview / Keynote 风格：圆形白点 + 悬停放大带蓝环 + 柔和投影）
-    private func drawSelectionHandles(ctx: CGContext) {
-        let rect = editorRectLocal
+    private func drawSelectionHandles(ctx: CGContext, rect customRect: CGRect? = nil) {
+        let rect = customRect ?? editorRectLocal
         guard rect.width >= SelectionGeometry.handleVisibilityThreshold
                 || rect.height >= SelectionGeometry.handleVisibilityThreshold else { return }
         let baseSize: CGFloat = 7.5

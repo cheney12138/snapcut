@@ -55,6 +55,7 @@ targets:
         NSHighResolutionCapable: true
         LSMinimumSystemVersion: "15.0"
         NSHumanReadableCopyright: ""
+        NSMicrophoneUsageDescription: "Snapcut 需要麦克风权限以在屏幕录制时收录您的旁白声音。"
         # ── 自动更新（Sparkle 2）─────────────────────────────────────────
         # appcast 走 GitHub Releases 的 latest 指针：发版只需把那两个资产挂到
         # 最新 release 上，URL 永远不用改。

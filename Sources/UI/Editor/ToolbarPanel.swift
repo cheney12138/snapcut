@@ -86,13 +86,15 @@ final class ToolbarPanel: NSPanel {
 
     enum Action {
         case undo, redo, toggleVisibility, done, save, cancel, ocr, pin, scroll, autoRedact, toggleBackdrop
+        case record, recordGIF
     }
 
     struct Capabilities {
         var supportsScroll: Bool
+        var supportsRecording: Bool
 
-        static let screenshot = Capabilities(supportsScroll: true)
-        static let collage = Capabilities(supportsScroll: false)
+        static let screenshot = Capabilities(supportsScroll: true, supportsRecording: true)
+        static let collage = Capabilities(supportsScroll: false, supportsRecording: false)
     }
 
     // 视图
@@ -104,6 +106,7 @@ final class ToolbarPanel: NSPanel {
     private var undoButton: TBIconButton!
     private var redoButton: TBIconButton!
     private var scrollButton: TBIconButton!
+    private var recordButton: TBIconButton!
     private var moreButton: TBIconButton!
     private var tooltip: ToolbarTooltipWindow?
     /// 工具上下文属性胶囊（选中任意标注工具时在主栏上方/下方自动展开对应属性）
@@ -161,6 +164,7 @@ final class ToolbarPanel: NSPanel {
         lastSelectedTool = session.currentTool
         backdropStyle = BackdropStyle()
         scrollButton?.isHidden = !capabilities.supportsScroll
+        recordButton?.isHidden = !capabilities.supportsRecording
         moreButton?.setSelected(false)
         smartAttributePill?.hide(immediate: true)
         smartBackdropPill?.hide(immediate: true)
@@ -303,7 +307,7 @@ final class ToolbarPanel: NSPanel {
 
         stack.addArrangedSubview(makeSeparator())
 
-        // 3) 滚动截图 / 取字 / 贴图 / 更多（画框美化 · 隐藏工具栏收敛进更多菜单）
+        // 3) 滚动截图 / 录屏 / 贴图 / 更多（取字 · 画框美化 · 隐藏工具栏 · 录制 GIF 收敛进更多菜单）
         let scrollBtn = TBIconButton(icon: .scroll, fallback: "滚")
         scrollBtn.tag = 206
         scrollBtn.target = self
@@ -312,13 +316,15 @@ final class ToolbarPanel: NSPanel {
         scrollButton = scrollBtn
         stack.addArrangedSubview(scrollBtn)
 
-        let ocr = TBIconButton(icon: .ocr, fallback: "字")
-        ocr.tag = 204
-        ocr.target = self
-        ocr.action = #selector(actionTapped(_:))
-        ocr.onHover = { [weak self] inside in self?.handleHover(inside, button: ocr, text: "取字 \(Self.hotkeyTip("ocr"))") }
-        stack.addArrangedSubview(ocr)
+        let recordBtn = TBIconButton(icon: .record, fallback: "录")
+        recordBtn.tag = 209
+        recordBtn.target = self
+        recordBtn.action = #selector(actionTapped(_:))
+        recordBtn.onHover = { [weak self] inside in self?.handleHover(inside, button: recordBtn, text: "录制视频 \(Self.hotkeyTip("record"))") }
+        recordButton = recordBtn
+        stack.addArrangedSubview(recordBtn)
 
+        // 取字（tag 204）已从主栏瘦身收进 `•••` 更多菜单，快捷键 O 与 actionTapped 分支保留
         let pin = TBIconButton(icon: .pin, fallback: "钉")
         pin.tag = 205
         pin.target = self
@@ -928,6 +934,7 @@ final class ToolbarPanel: NSPanel {
         case 206: onAction(.scroll)
         case 207: onAction(.toggleBackdrop)
         case 208: toggleMoreMenu()
+        case 209: onAction(.record)
         default: break
         }
     }
@@ -944,8 +951,14 @@ final class ToolbarPanel: NSPanel {
                 onToggleBackdrop: { [weak self] in
                     self?.onAction(.toggleBackdrop)
                 },
+                onOCR: { [weak self] in
+                    self?.onAction(.ocr)
+                },
                 onToggleVisibility: { [weak self] in
                     self?.onAction(.toggleVisibility)
+                },
+                onRecordGIF: { [weak self] in
+                    self?.onAction(.recordGIF)
                 }
             )
             self.smartMorePanel = p
@@ -954,7 +967,17 @@ final class ToolbarPanel: NSPanel {
         panel.appearance = appearance
         let toggleCombo = AppCoordinatorShared.coordinator?.settings.editorHotkey(for: "toggleVisibility") ?? "h"
         let toggleTip = HotkeySpec.compactDisplay(toggleCombo)
-        panel.updateState(backdropEnabled: backdropStyle.enabled, hideShortcut: toggleTip)
+        let gifCombo = AppCoordinatorShared.coordinator?.settings.editorHotkey(for: "recordGIF") ?? "g"
+        let gifTip = HotkeySpec.compactDisplay(gifCombo)
+        let ocrCombo = AppCoordinatorShared.coordinator?.settings.editorHotkey(for: "ocr") ?? "o"
+        let ocrTip = HotkeySpec.compactDisplay(ocrCombo)
+        panel.updateState(
+            backdropEnabled: backdropStyle.enabled,
+            ocrShortcut: ocrTip,
+            hideShortcut: toggleTip,
+            gifShortcut: gifTip,
+            supportsRecording: capabilities.supportsRecording
+        )
 
         let inWindow = moreButton.convert(moreButton.bounds, to: nil)
         let btnGlobal = convertToScreen(inWindow)
@@ -3514,7 +3537,9 @@ private final class SmartMoreMenuPanel: NSPanel {
     private static let cornerRadius: CGFloat = 12
 
     private let onToggleBackdrop: () -> Void
+    private let onOCR: () -> Void
     private let onToggleVisibility: () -> Void
+    private let onRecordGIF: () -> Void
 
     private let glassSurface: DesignTokens.Mat.LiquidGlassSurface
     private let motionHost = NSView()
@@ -3524,6 +3549,8 @@ private final class SmartMoreMenuPanel: NSPanel {
     private let outerShadowView: OuterShadowView
 
     private let backdropRow: MoreMenuItemRowButton
+    private let ocrRow: MoreMenuItemRowButton
+    private let recordGIFRow: MoreMenuItemRowButton
     private let hideRow: MoreMenuItemRowButton
 
     private weak var triggerButton: NSView?
@@ -3537,19 +3564,25 @@ private final class SmartMoreMenuPanel: NSPanel {
 
     init(
         onToggleBackdrop: @escaping () -> Void,
-        onToggleVisibility: @escaping () -> Void
+        onOCR: @escaping () -> Void,
+        onToggleVisibility: @escaping () -> Void,
+        onRecordGIF: @escaping () -> Void
     ) {
         self.onToggleBackdrop = onToggleBackdrop
+        self.onOCR = onOCR
         self.onToggleVisibility = onToggleVisibility
+        self.onRecordGIF = onRecordGIF
         self.glassSurface = DesignTokens.Mat.fixedLightCrystalBlur(
             cornerRadius: Self.cornerRadius,
             tintAlpha: 0.08
         )
         self.outerShadowView = OuterShadowView(spec: .pill, margin: Self.shadowMargin, cornerRadius: Self.cornerRadius)
         self.backdropRow = MoreMenuItemRowButton(icon: .backdrop, title: "画框美化", shortcut: "B")
+        self.ocrRow = MoreMenuItemRowButton(icon: .ocr, title: "取字", shortcut: "O")
+        self.recordGIFRow = MoreMenuItemRowButton(icon: .recordGIF, title: "录制 GIF", shortcut: "G")
         self.hideRow = MoreMenuItemRowButton(icon: .eye, title: "隐藏工具栏", shortcut: "H")
 
-        let initH: CGFloat = 74
+        let initH: CGFloat = 104
         let m = Self.shadowMargin
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: Self.panelWidth + m * 2, height: initH + m * 2),
@@ -3638,20 +3671,38 @@ private final class SmartMoreMenuPanel: NSPanel {
 
         backdropRow.target = self
         backdropRow.action = #selector(backdropTapped)
+        ocrRow.target = self
+        ocrRow.action = #selector(ocrTapped)
+        recordGIFRow.target = self
+        recordGIFRow.action = #selector(recordGIFTapped)
         hideRow.target = self
         hideRow.action = #selector(hideTapped)
 
         contentStack.addArrangedSubview(backdropRow)
+        contentStack.addArrangedSubview(ocrRow)
+        contentStack.addArrangedSubview(recordGIFRow)
         contentStack.addArrangedSubview(hideRow)
         backdropRow.widthAnchor.constraint(equalToConstant: Self.panelWidth - 12).isActive = true
+        ocrRow.widthAnchor.constraint(equalToConstant: Self.panelWidth - 12).isActive = true
+        recordGIFRow.widthAnchor.constraint(equalToConstant: Self.panelWidth - 12).isActive = true
         hideRow.widthAnchor.constraint(equalToConstant: Self.panelWidth - 12).isActive = true
 
         contentView = outer
     }
 
-    func updateState(backdropEnabled: Bool, hideShortcut: String) {
+    func updateState(
+        backdropEnabled: Bool,
+        ocrShortcut: String,
+        hideShortcut: String,
+        gifShortcut: String,
+        supportsRecording: Bool
+    ) {
         backdropRow.setChecked(backdropEnabled)
+        ocrRow.setShortcut(ocrShortcut.isEmpty ? "O" : ocrShortcut)
         hideRow.setShortcut(hideShortcut.isEmpty ? "H" : hideShortcut)
+        recordGIFRow.setShortcut(gifShortcut.isEmpty ? "G" : gifShortcut)
+        // 拼贴编辑器等不支持录制的场景隐藏「录制 GIF」行
+        recordGIFRow.isHidden = !supportsRecording
     }
 
     func show(
@@ -3768,6 +3819,16 @@ private final class SmartMoreMenuPanel: NSPanel {
     @objc private func backdropTapped() {
         hide(immediate: false)
         onToggleBackdrop()
+    }
+
+    @objc private func recordGIFTapped() {
+        hide(immediate: true)
+        onRecordGIF()
+    }
+
+    @objc private func ocrTapped() {
+        hide(immediate: true)
+        onOCR()
     }
 
     @objc private func hideTapped() {

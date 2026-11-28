@@ -59,21 +59,47 @@ private final class OCRResultPanelWindow: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// 语义结构成立时才存在的两种视图（无结构走纯文本老路，不出现切换胶囊）
+private enum OCRViewMode: String {
+    case formatted
+    case markdown
+}
+
 @MainActor
-private final class OCRPanelController {
+private final class OCRPanelController: NSObject, NSTextViewDelegate {
     private static let screenMargin: CGFloat = 12
     private static let headerHeight: CGFloat = 38
     private static let qrBarHeight: CGFloat = 40
     private static let footerHeight: CGFloat = 46
     private static let bodyFont = NSFont.systemFont(ofSize: 13.5, weight: .regular)
     private static let bodyLineSpacing: CGFloat = 4.5
+    /// 富文本（尤其带表格）需要更宽版面：上限 640pt
+    private static let richMaxWidth: CGFloat = 640
+    /// 带表格时的最小宽度，保证一列数字不至于挤成两行
+    private static let richTableMinWidth: CGFloat = 480
 
     private let panel: OCRResultPanelWindow
     private let textView: NSTextView
+    private let scrollView: NSScrollView
     private let result: StructuredOCRResult
     private let primaryQR: DetectedQRCode?
     private let isTextEmpty: Bool
     private let hasOnlyQR: Bool
+    private let shortcutHint: NSTextField
+    private let copyButton: OCRPrimaryButton
+    private let modeButton: OCRSecondaryButton?
+    private let segment: OCRViewModeSegment?
+    /// 语义文档（OCR-A 解析产物）：非 nil 且块非空才提供「排版 / Markdown」双视图
+    private let document: OCRDocument?
+    private let hasRichDocument: Bool
+    private var mode: OCRViewMode
+    /// 用户改过的内容（未改过时始终按 document 重新渲染，保证导出最纯净）
+    private var formattedCache: NSAttributedString?
+    private var markdownCache: NSAttributedString?
+    private var hasEditedFormatted = false
+    private var hasEditedMarkdown = false
+    /// 程序写入正文时抑制脏状态误判
+    private var isApplyingContent = false
     private var keyMonitor: Any?
 
     init(result: StructuredOCRResult, nearGlobalRect rect: CGRect, on screen: NSScreen, avoidRect: CGRect?) {
@@ -81,6 +107,14 @@ private final class OCRPanelController {
         self.primaryQR = result.qrCodes.first(where: { $0.isOpenableURL }) ?? result.qrCodes.first
         self.isTextEmpty = result.plainText.isEmpty
         self.hasOnlyQR = result.plainText.isEmpty && !result.qrCodes.isEmpty
+
+        let document = result.document
+        // 契约闸门：hasRichStructure 为真且确有可渲染的块才启用双视图；
+        // 旧链路（仅 markdownTable、document 为 nil）保持原纯文本面板零回归
+        let hasRichDocument = result.hasRichStructure && !(document?.blocks.isEmpty ?? true)
+        self.document = document
+        self.hasRichDocument = hasRichDocument
+        self.mode = .formatted
 
         let placement = Self.computeFrame(for: result, selection: rect, on: screen, avoidRect: avoidRect)
         let frame = placement
@@ -142,6 +176,13 @@ private final class OCRPanelController {
         let closeBtn = OCRCloseButton()
         closeBtn.translatesAutoresizingMaskIntoConstraints = false
 
+        // 视图切换胶囊：紧贴关闭按钮左侧 10pt（标题栏右侧），仅在语义结构成立时出现
+        let segment: OCRViewModeSegment? = hasRichDocument ? OCRViewModeSegment() : nil
+        if let segment {
+            segment.translatesAutoresizingMaskIntoConstraints = false
+            headerBar.addSubview(segment)
+        }
+
         headerBar.addSubview(iconView)
         headerBar.addSubview(titleLabel)
         headerBar.addSubview(countLabel)
@@ -166,7 +207,8 @@ private final class OCRPanelController {
         let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: max(100, size.width - 28), height: 60))
         textView.autoresizingMask = [.width]
         textView.drawsBackground = false
-        textView.isRichText = false
+        // 富文本模式才能承接 NSTextList / NSTextTable 的段落样式（纯文本会直接被抹平）
+        textView.isRichText = hasRichDocument
         textView.font = Self.bodyFont
         textView.defaultParagraphStyle = paragraph
         textView.typingAttributes = [
@@ -184,6 +226,9 @@ private final class OCRPanelController {
             textView.string = "未识别到可提取的文字内容"
             textView.textColor = DesignTokens.label3
             textView.isEditable = false
+        } else if hasRichDocument, let document {
+            textView.textStorage?.setAttributedString(OCRDocumentRenderer.render(document))
+            textView.isEditable = true
         } else {
             textView.textStorage?.setAttributedString(NSAttributedString(string: result.plainText, attributes: [
                 .font: Self.bodyFont,
@@ -198,27 +243,58 @@ private final class OCRPanelController {
         let bottomDivider = OCRHairlineView()
         bottomDivider.translatesAutoresizingMaskIntoConstraints = false
 
-        // 3) 底部操作栏：左侧克制快捷键提示 + 可选 Markdown 表格按钮 + 右侧 Apple 强调主按钮
-        let shortcutHint = NSTextField(labelWithString: isTextEmpty ? "Esc 关闭" : "↩ 复制并关闭  ·  Esc 关闭")
+        // 3) 底部操作栏：左侧克制快捷键提示 + 富文本双按钮（次要格式 + 当前格式主按钮）
+        let hintText: String
+        if hasRichDocument {
+            hintText = "↩ 复制并关闭  ·  ⌘M 切视图  ·  Esc 关闭"
+        } else {
+            hintText = isTextEmpty ? "Esc 关闭" : "↩ 复制并关闭  ·  Esc 关闭"
+        }
+        let shortcutHint = NSTextField(labelWithString: hintText)
         shortcutHint.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         shortcutHint.textColor = DesignTokens.label3
         shortcutHint.lineBreakMode = .byTruncatingTail
         shortcutHint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         shortcutHint.translatesAutoresizingMaskIntoConstraints = false
 
-        let copyButton = OCRPrimaryButton(
-            title: isTextEmpty ? "关闭" : "复制文字",
-            symbol: isTextEmpty ? nil : "doc.on.doc"
-        )
+        let copyButton: OCRPrimaryButton
+        let modeButton: OCRSecondaryButton?
+        if hasRichDocument {
+            // 默认「排版」态：主按钮复制排版，次按钮复制 Markdown（切到 Markdown 后互换）
+            copyButton = OCRPrimaryButton(title: "复制排版", symbol: "doc.on.doc")
+            modeButton = OCRSecondaryButton(title: "复制 Markdown", symbol: "doc.plaintext", height: 28)
+        } else {
+            copyButton = OCRPrimaryButton(
+                title: isTextEmpty ? "关闭" : "复制文字",
+                symbol: isTextEmpty ? nil : "doc.on.doc"
+            )
+            modeButton = nil
+        }
         copyButton.translatesAutoresizingMaskIntoConstraints = false
+        modeButton?.translatesAutoresizingMaskIntoConstraints = false
 
         self.panel = panel
         self.textView = textView
+        self.scrollView = scrollView
+        self.shortcutHint = shortcutHint
+        self.copyButton = copyButton
+        self.modeButton = modeButton
+        self.segment = segment
+        super.init()
+
+        textView.delegate = self
+        segment?.onSelect = { [weak self] newMode in
+            self?.setMode(newMode, animated: true)
+        }
 
         closeBtn.target = self
         closeBtn.action = #selector(closeTapped)
         copyButton.target = self
         copyButton.action = #selector(copyAndClose)
+        if let modeButton {
+            modeButton.target = self
+            modeButton.action = #selector(copyOtherModeAndClose)
+        }
 
         effect.addSubview(headerBar)
         effect.addSubview(topDivider)
@@ -268,6 +344,19 @@ private final class OCRPanelController {
             copyButton.topAnchor.constraint(equalTo: bottomDivider.bottomAnchor, constant: 9),
             copyButton.heightAnchor.constraint(equalToConstant: 28),
         ]
+
+        // 分段胶囊贴住 closeBtn 左侧，字数角标不得越过它
+        if let segment {
+            constraints.append(contentsOf: [
+                segment.trailingAnchor.constraint(equalTo: closeBtn.leadingAnchor, constant: -10),
+                segment.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+                countLabel.trailingAnchor.constraint(lessThanOrEqualTo: segment.leadingAnchor, constant: -8),
+            ])
+        } else {
+            constraints.append(
+                countLabel.trailingAnchor.constraint(lessThanOrEqualTo: closeBtn.leadingAnchor, constant: -8)
+            )
+        }
 
         // 二维码直达动作条（在标题栏下方）
         var bodyTopAnchor = topDivider.bottomAnchor
@@ -378,7 +467,15 @@ private final class OCRPanelController {
             ])
         }
 
-        if result.markdownTable != nil {
+        if let modeButton {
+            // 富文本双按钮：次按钮（另一格式）+ 主按钮（当前格式），文案随模式即时刷新
+            effect.addSubview(modeButton)
+            constraints.append(contentsOf: [
+                modeButton.trailingAnchor.constraint(equalTo: copyButton.leadingAnchor, constant: -8),
+                modeButton.centerYAnchor.constraint(equalTo: copyButton.centerYAnchor),
+                shortcutHint.trailingAnchor.constraint(lessThanOrEqualTo: modeButton.leadingAnchor, constant: -10),
+            ])
+        } else if result.markdownTable != nil {
             let markdownButton = OCRSecondaryButton(title: "复制 Markdown 表格", symbol: "tablecells", height: 28)
             markdownButton.toolTip = "\(result.tableRowCount) 行 × \(result.tableColumnCount) 列 Markdown 表格"
             markdownButton.target = self
@@ -428,9 +525,14 @@ private final class OCRPanelController {
             "h": "\(Int(panel.frame.height))",
             "chars": "\(result.plainText.count)",
             "qrs": "\(result.qrCodes.count)",
-            "table": result.markdownTable != nil ? "\(result.tableRowCount)x\(result.tableColumnCount)" : "none",
+            "table": result.markdownTable != nil ? "\(result.tableRowCount)x\(result.tableColumnCount)" : (document?.hasTable == true ? "native" : "none"),
+            "mode": modeLabel,
+            "rich": hasRichDocument ? "1" : "0",
+            "blocks": "\(document?.blocks.count ?? 0)",
         ])
     }
+
+    private var modeLabel: String { hasRichDocument ? mode.rawValue : "plain" }
 
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -442,6 +544,13 @@ private final class OCRPanelController {
             if event.modifierFlags.contains(.command),
                event.charactersIgnoringModifiers?.lowercased() == "c" {
                 self.copyCurrentSelectionOrAll(closeAfter: false)
+                return nil
+            }
+            // ⌘M：仅在存在语义结构时于「排版 ↔ Markdown」间切换
+            if event.modifierFlags.contains(.command),
+               event.charactersIgnoringModifiers?.lowercased() == "m",
+               self.hasRichDocument {
+                self.toggleMode()
                 return nil
             }
             // Return（无 Shift 时复制全文并关闭；Shift+Return 允许编辑换行）
@@ -459,10 +568,27 @@ private final class OCRPanelController {
     }
 
     @objc private func copyAndClose() {
-        if isTextEmpty {
+        guard !isTextEmpty else {
             close()
+            return
+        }
+        if hasRichDocument {
+            copyCurrentFormat(closeAfter: true)
+            return
+        }
+        copyText(textView.string, closeAfter: true, scope: "full")
+    }
+
+    /// 底部次按钮：复制「另一种」表示（排版 ↔ Markdown），复制完同样关闭
+    @objc private func copyOtherModeAndClose() {
+        guard hasRichDocument else {
+            copyAndClose()
+            return
+        }
+        if mode == .markdown {
+            copyFormatted(closeAfter: true)
         } else {
-            copyText(textView.string, closeAfter: true)
+            copyMarkdown(closeAfter: true)
         }
     }
 
@@ -500,31 +626,102 @@ private final class OCRPanelController {
     private func copyCurrentSelectionOrAll(closeAfter: Bool) {
         guard !isTextEmpty else {
             if let qrPayload = primaryQR?.payload, !qrPayload.isEmpty {
-                copyText(qrPayload, closeAfter: closeAfter)
+                copyText(qrPayload, closeAfter: closeAfter, scope: "qr")
             } else if closeAfter {
                 close()
             }
             return
         }
         let selectedRange = textView.selectedRange()
-        let full = textView.string as NSString
-        let payload: String
-        if selectedRange.length > 0, selectedRange.location + selectedRange.length <= full.length {
-            payload = full.substring(with: selectedRange)
-        } else {
-            payload = textView.string
+        let fullLength = (textView.string as NSString).length
+        let hasSelection = selectedRange.length > 0
+            && selectedRange.location + selectedRange.length <= fullLength
+
+        // 「排版」模式下拖选：选多少复制多少，且带完整列表 / 表格结构（粘进飞书 / 文档不丢表格）
+        if hasRichDocument, mode == .formatted {
+            if hasSelection,
+               let sub = textView.attributedSubstring(forProposedRange: selectedRange, actualRange: nil) {
+                OCRDocumentRenderer.writeRichToPasteboard(attributed: sub, semanticHTML: nil, plainText: sub.string)
+                logCopied(format: OCRViewMode.formatted.rawValue, scope: "selection", rich: true, chars: sub.string.count)
+                if closeAfter { close() }
+                return
+            }
+            if !hasSelection {
+                copyFormatted(closeAfter: closeAfter)
+                return
+            }
         }
-        copyText(payload, closeAfter: closeAfter)
+
+        let payload = hasSelection
+            ? (textView.string as NSString).substring(with: selectedRange)
+            : textView.string
+        let scope = hasSelection ? "selection" : "full"
+        if hasRichDocument, mode == .markdown {
+            writeToClipboard(payload)
+            logCopied(format: OCRViewMode.markdown.rawValue, scope: scope, rich: false, chars: payload.count)
+            if closeAfter { close() }
+            return
+        }
+        copyText(payload, closeAfter: closeAfter, scope: scope)
     }
 
-    private func copyText(_ payload: String, closeAfter: Bool) {
+    private func copyCurrentFormat(closeAfter: Bool) {
+        if mode == .markdown {
+            copyMarkdown(closeAfter: closeAfter)
+        } else {
+            copyFormatted(closeAfter: closeAfter)
+        }
+    }
+
+    /// 复制「排版」：未编辑 → 语义 HTML + 原生 RTF + 干净纯文本（最纯净）；
+    /// 已编辑 → 从当前 textView 导出，绝不丢用户修订
+    private func copyFormatted(closeAfter: Bool) {
+        guard let document else {
+            copyText(textView.string, closeAfter: closeAfter, scope: "full")
+            return
+        }
+        let edited = formattedSnapshot
+        let attributed = edited ?? OCRDocumentRenderer.render(document)
+        let html = edited == nil ? document.renderHTML() : nil
+        let plain = edited?.string ?? document.renderCleanPlainText()
+        OCRDocumentRenderer.writeRichToPasteboard(
+            attributed: attributed,
+            semanticHTML: html,
+            plainText: plain.isEmpty ? attributed.string : plain
+        )
+        logCopied(format: OCRViewMode.formatted.rawValue, scope: "full", rich: true, chars: plain.count)
+        if closeAfter { close() }
+    }
+
+    /// 复制「Markdown」：源码就该是纯文本（粘到编辑器 / 终端 / 飞书都是源码）
+    private func copyMarkdown(closeAfter: Bool) {
+        let payload = markdownSnapshot
         guard !payload.isEmpty else {
             if closeAfter { close() }
             return
         }
         writeToClipboard(payload)
-        Log.event(.ocr, "ocr.panel.copied", ["chars": "\(payload.count)"])
+        logCopied(format: OCRViewMode.markdown.rawValue, scope: "full", rich: false, chars: payload.count)
         if closeAfter { close() }
+    }
+
+    private func copyText(_ payload: String, closeAfter: Bool, scope: String) {
+        guard !payload.isEmpty else {
+            if closeAfter { close() }
+            return
+        }
+        writeToClipboard(payload)
+        logCopied(format: modeLabel, scope: scope, rich: false, chars: payload.count)
+        if closeAfter { close() }
+    }
+
+    private func logCopied(format: String, scope: String, rich: Bool, chars: Int) {
+        Log.event(.ocr, "ocr.panel.copied", [
+            "mode": format,
+            "scope": scope,
+            "rich": rich ? "1" : "0",
+            "chars": "\(chars)",
+        ])
     }
 
     private func writeToClipboard(_ payload: String) {
@@ -534,6 +731,143 @@ private final class OCRPanelController {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(payload, forType: .string)
+        }
+    }
+
+    // MARK: - 视图模式（排版 / Markdown）与脏状态
+
+    private func toggleMode() {
+        setMode(mode == .formatted ? .markdown : .formatted, animated: true)
+    }
+
+    private func setMode(_ newMode: OCRViewMode, animated: Bool) {
+        guard hasRichDocument, newMode != mode else { return }
+        cacheCurrentEdits()
+        mode = newMode
+        applyContent()
+        segment?.setMode(newMode, animated: animated)
+        refreshFooter()
+        if animated, !DesignTokens.Motion.reduceMotion {
+            // 不闪：先压到 0.72 再回升，不做空帧白闪
+            textView.alphaValue = 0.72
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = DesignTokens.Motion.crossfadeDuration
+                ctx.timingFunction = DesignTokens.Motion.easeOutStrong
+                textView.animator().alphaValue = 1
+            }
+        }
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        Log.event(.ocr, "ocr.panel.mode", ["mode": newMode.rawValue])
+    }
+
+    /// 写回正文（只在切模式时调用，程序写入不算「用户编辑」）
+    private func applyContent() {
+        guard !isTextEmpty else { return }
+        isApplyingContent = true
+        defer { isApplyingContent = false }
+
+        let bodyParagraph = NSMutableParagraphStyle()
+        bodyParagraph.lineSpacing = Self.bodyLineSpacing
+        bodyParagraph.lineBreakMode = .byWordWrapping
+
+        switch mode {
+        case .markdown where hasRichDocument:
+            let mono = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+            let monoParagraph = NSMutableParagraphStyle()
+            monoParagraph.lineSpacing = Self.bodyLineSpacing
+            monoParagraph.lineBreakMode = .byWordWrapping
+            textView.isRichText = true
+            textView.textStorage?.setAttributedString(markdownAttributed)
+            textView.font = mono
+            textView.typingAttributes = [
+                .font: mono,
+                .foregroundColor: DesignTokens.label1,
+                .paragraphStyle: monoParagraph,
+            ]
+        case .formatted where hasRichDocument:
+            textView.isRichText = true
+            textView.textStorage?.setAttributedString(formattedAttributed)
+            textView.font = Self.bodyFont
+            textView.typingAttributes = [
+                .font: Self.bodyFont,
+                .foregroundColor: DesignTokens.label1,
+                .paragraphStyle: bodyParagraph,
+            ]
+        default:
+            break
+        }
+        let length = (textView.string as NSString).length
+        textView.setSelectedRange(NSRange(location: length, length: 0))
+    }
+
+    /// 切走前把当前模式的修订存起来（未改则什么都不存，下次仍按 document 重新渲染）
+    private func cacheCurrentEdits() {
+        guard hasRichDocument else { return }
+        switch mode {
+        case .formatted:
+            if hasEditedFormatted { formattedCache = textView.attributedString() }
+        case .markdown:
+            if hasEditedMarkdown { markdownCache = textView.attributedString() }
+        }
+    }
+
+    /// 底部双按钮文案随模式即时互换，并重算固有宽度避免截断
+    private func refreshFooter() {
+        guard hasRichDocument else { return }
+        switch mode {
+        case .formatted:
+            modeButton?.update(title: "复制 Markdown", symbol: "doc.plaintext")
+            copyButton.update(title: "复制排版", symbol: "doc.on.doc")
+        case .markdown:
+            modeButton?.update(title: "复制排版", symbol: "text.alignleft")
+            copyButton.update(title: "复制 Markdown", symbol: "doc.on.doc")
+        }
+    }
+
+    // MARK: - 内容快照（未编辑走 document 语义导出，已编辑走 textView）
+
+    private var formattedAttributed: NSAttributedString {
+        if let formattedCache { return formattedCache }
+        guard let document else { return NSAttributedString(string: result.plainText) }
+        return OCRDocumentRenderer.render(document)
+    }
+
+    private var formattedSnapshot: NSAttributedString? {
+        guard hasEditedFormatted else { return nil }
+        return mode == .formatted ? textView.attributedString() : formattedCache
+    }
+
+    private var markdownSourceText: String {
+        guard let document else { return result.plainText }
+        let markdown = document.renderMarkdown()
+        return markdown.isEmpty ? document.renderCleanPlainText() : markdown
+    }
+
+    private var markdownAttributed: NSAttributedString {
+        if let markdownCache { return markdownCache }
+        return OCRDocumentRenderer.renderMarkdownSource(markdownSourceText)
+    }
+
+    private var markdownSnapshot: String {
+        if mode == .markdown, hasEditedMarkdown { return textView.string }
+        if let markdownCache { return markdownCache.string }
+        return markdownSourceText
+    }
+
+    // NSTextViewDelegate：记录用户是否真的动过手（决定整篇复制走语义 HTML 还是 textView 导出）
+    func textDidChange(_ notification: Notification) {
+        guard !isApplyingContent,
+              let changed = notification.object as? NSTextView,
+              changed === textView,
+              hasRichDocument else { return }
+        switch mode {
+        case .formatted:
+            hasEditedFormatted = true
+            formattedCache = textView.attributedString()
+        case .markdown:
+            hasEditedMarkdown = true
+            markdownCache = textView.attributedString()
         }
     }
 
@@ -560,11 +894,24 @@ private final class OCRPanelController {
         let gap: CGFloat = 10
 
         let hasQR = !result.qrCodes.isEmpty
-        let hasTable = result.markdownTable != nil
+        let hasLegacyTable = result.markdownTable != nil
+        let document = result.document
+        let hasRich = result.hasRichStructure && !(document?.blocks.isEmpty ?? true)
+        let hasRichTable = document?.hasTable == true
+        let hasTable = hasLegacyTable || hasRichTable
         let hasOnlyQR = result.plainText.isEmpty && hasQR
 
-        let minDesiredW: CGFloat = hasTable ? 436 : (hasQR ? 400 : 360)
-        let capW: CGFloat = (hasTable || hasQR) ? 540 : 500
+        // 富文本（尤其带表格）需要更宽的版面：上限 640pt，表格场景最小 480pt
+        let minDesiredW: CGFloat
+        let capW: CGFloat
+        if hasRich {
+            // 底栏「↩ 复制并关闭 · ⌘M 切视图 · Esc 关闭」+ 双按钮实测需 456pt，留出余量
+            minDesiredW = hasTable ? richTableMinWidth : 480
+            capW = richMaxWidth
+        } else {
+            minDesiredW = hasTable ? 436 : (hasQR ? 400 : 360)
+            capW = (hasTable || hasQR) ? 540 : 500
+        }
         let maxW = min(capW, max(320, visible.width - m * 2))
         let width = max(320, min(max(rect.width * 0.92, minDesiredW), maxW)).rounded()
 
@@ -576,6 +923,14 @@ private final class OCRPanelController {
             // 仅二维码无文字：贴合标题栏 + 二维码栏 + 底部操作栏，不留大片空文本区
             minH = headerHeight + qrTotalH + footerHeight + 2
             desiredH = minH
+        } else if hasRich, let document {
+            // 富文本：按真实排版实测高度（表格 / 列表都不用估算公式）
+            let rendered = OCRDocumentRenderer.render(document)
+            // 内容宽 = 面板宽 - 左右 12*2 - 文本容器内衬 2*2 - 行片段 padding 5*2
+            let measured = OCRDocumentRenderer.measuredHeight(of: rendered, width: max(120, width - 38))
+            let chromeH = headerHeight + qrTotalH + footerHeight + 28
+            minH = 168 + qrTotalH
+            desiredH = max(minH, ceil(measured) + chromeH)
         } else {
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineSpacing = bodyLineSpacing
@@ -614,8 +969,10 @@ private final class OCRPanelController {
 
         let height: CGFloat
         var originY: CGFloat
-        let maxShortH: CGFloat = hasQR ? 420 : 380
-        let maxTallH: CGFloat = hasQR ? 440 : 400
+        // 富文本严守「不超过屏幕可用高 52%」，普通文本保持原档位零回归
+        let richCapH = min(visible.height * 0.52, 900)
+        let maxShortH: CGFloat = hasRich ? richCapH : (hasQR ? 420 : 380)
+        let maxTallH: CGFloat = hasRich ? richCapH : (hasQR ? 440 : 400)
 
         if isShortSelection {
             // 矮选区（如单行/两行文字）：优先放在「选区 + 工具栏」整块下方 10pt，不盖原文也不撞工具栏；
@@ -789,8 +1146,8 @@ private final class OCRPrimaryButton: NSButton {
     private var isHot = false
     private var isPressed = false
     private var trackingArea: NSTrackingArea?
-    private let labelText: String
-    private let hasIcon: Bool
+    private var labelText: String
+    private var hasIcon: Bool
     private let buttonHeight: CGFloat
     private let fontSize: CGFloat
 
@@ -814,6 +1171,23 @@ private final class OCRPrimaryButton: NSButton {
         layer?.cornerRadius = height <= 24 ? 6 : 7
         setContentCompressionResistancePriority(.required, for: .horizontal)
         setContentHuggingPriority(.required, for: .horizontal)
+        applyStyle()
+    }
+
+    /// 视图模式切换时动态换文案 / 图标（重算固有宽度，避免「复制 Markdown」被截断）
+    func update(title: String, symbol: String?) {
+        labelText = title
+        hasIcon = (symbol != nil)
+        if let symbol {
+            imagePosition = .imageLeading
+            imageHugsTitle = true
+            image = TBIcon.symbolImage(named: symbol, pointSize: max(10.5, fontSize - 1), weight: .medium, hierarchical: false)
+            contentTintColor = DesignTokens.labelOnAccent
+        } else {
+            imagePosition = .noImage
+            image = nil
+        }
+        invalidateIntrinsicContentSize()
         applyStyle()
     }
 
@@ -885,7 +1259,7 @@ private final class OCRSecondaryButton: NSButton {
     private var isHot = false
     private var isPressed = false
     private var trackingArea: NSTrackingArea?
-    private let labelText: String
+    private var labelText: String
     private let buttonHeight: CGFloat
     private let fontSize: CGFloat
 
@@ -904,6 +1278,16 @@ private final class OCRSecondaryButton: NSButton {
         layer?.borderWidth = 0.5
         setContentCompressionResistancePriority(.required, for: .horizontal)
         setContentHuggingPriority(.required, for: .horizontal)
+        applyStyle()
+    }
+
+    /// 视图模式切换时动态换文案 / 图标（重算固有宽度，避免长文案被截断）
+    func update(title: String, symbol: String) {
+        labelText = title
+        imagePosition = .imageLeading
+        imageHugsTitle = true
+        image = TBIcon.symbolImage(named: symbol, pointSize: max(10.5, fontSize - 0.5), weight: .medium, hierarchical: false)
+        invalidateIntrinsicContentSize()
         applyStyle()
     }
 
@@ -969,5 +1353,189 @@ private final class OCRSecondaryButton: NSButton {
                 .foregroundColor: DesignTokens.label1,
             ])
         }
+    }
+}
+
+/// 紧凑 Apple 风格分段切换胶囊（「排版」/「Markdown」）：
+/// - 24pt 高、外圆角 7pt、有 0.5pt 细描边，浮在玻璃上只是一层薄膜；
+/// - 内滑块 5pt 圆角 + 极轻阴影，跟随选中项 0.16s 强缓出滑动（与 RecordingControlBar 的格式切换同语言）；
+/// - hover 只抬一档填充 + 文字回归 label1，不做花哨放大。
+@MainActor
+private final class OCRViewModeSegment: NSView {
+    var onSelect: ((OCRViewMode) -> Void)?
+
+    private static let inset: CGFloat = 2
+    private static let segmentHeight: CGFloat = 24
+    private static let outerRadius: CGFloat = 7
+    private static let knobRadius: CGFloat = 5
+    private static let fontSize: CGFloat = 11.5
+
+    private let modes: [OCRViewMode] = [.formatted, .markdown]
+    private let names = ["排版", "Markdown"]
+    private let titleLabels: [NSTextField]
+    private let itemWidths: [CGFloat]
+    private let knobLayer = CALayer()
+    private var tracking: NSTrackingArea?
+    private var isHot = false
+    private var selectedMode: OCRViewMode = .formatted
+    private var hasLaidOutOnce = false
+
+    init() {
+        var widths: [CGFloat] = []
+        var labels: [NSTextField] = []
+        for name in names {
+            // 按 semibold 量宽——选中态会加粗，宽度这里一次留够，切换时不会左右抖动
+            let textWidth = (name as NSString).size(withAttributes: [
+                .font: NSFont.systemFont(ofSize: Self.fontSize, weight: .semibold),
+            ]).width
+            widths.append(max(40, ceil(textWidth) + 20))
+            let label = NSTextField(labelWithString: name)
+            label.font = NSFont.systemFont(ofSize: Self.fontSize, weight: .medium)
+            label.alignment = .center
+            label.translatesAutoresizingMaskIntoConstraints = false
+            labels.append(label)
+        }
+        self.itemWidths = widths
+        self.titleLabels = labels
+        super.init(frame: .zero)
+
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+        layer?.cornerRadius = Self.outerRadius
+        layer?.cornerCurve = .continuous
+
+        knobLayer.cornerRadius = Self.knobRadius
+        knobLayer.cornerCurve = .continuous
+        knobLayer.shadowColor = NSColor.black.cgColor
+        knobLayer.shadowOpacity = 0.18
+        knobLayer.shadowRadius = 2
+        knobLayer.shadowOffset = CGSize(width: 0, height: -0.5)
+        layer?.addSublayer(knobLayer)
+
+        var cursorX = Self.inset
+        for (index, label) in labels.enumerated() {
+            addSubview(label)
+            NSLayoutConstraint.activate([
+                label.centerXAnchor.constraint(equalTo: leadingAnchor, constant: cursorX + widths[index] / 2),
+                label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            ])
+            cursorX += widths[index]
+        }
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: cursorX + Self.inset),
+            heightAnchor.constraint(equalToConstant: Self.segmentHeight),
+        ])
+        refreshAppearance()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setMode(_ mode: OCRViewMode, animated: Bool) {
+        selectedMode = mode
+        refreshAppearance()
+        updateKnobFrame(animated: animated && hasLaidOutOnce && !DesignTokens.Motion.reduceMotion)
+    }
+
+    private func updateKnobFrame(animated: Bool) {
+        guard bounds.height > Self.inset * 2,
+              let index = modes.firstIndex(of: selectedMode) else { return }
+        var x = Self.inset
+        for i in 0..<index { x += itemWidths[i] }
+        let target = CGRect(
+            x: x,
+            y: Self.inset,
+            width: itemWidths[index],
+            height: max(0, bounds.height - Self.inset * 2)
+        )
+        CATransaction.begin()
+        if animated {
+            CATransaction.setDisableActions(false)
+            CATransaction.setAnimationDuration(0.16)
+            CATransaction.setAnimationTimingFunction(DesignTokens.Motion.easeOutStrong)
+        } else {
+            CATransaction.setDisableActions(true)
+        }
+        knobLayer.frame = target
+        CATransaction.commit()
+    }
+
+    private func refreshAppearance() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            layer?.backgroundColor = (isHot ? DesignTokens.fillHover : DesignTokens.fill).cgColor
+            layer?.borderWidth = 0.5
+            layer?.borderColor = DesignTokens.stroke.cgColor
+            // 深色玻璃用半透明白滑块（0.20 / hover 0.24），浅色玻璃用原生白卡滑块（0.88 / hover 0.96）
+            let knobColor: NSColor = isDark
+                ? NSColor.white.withAlphaComponent(isHot ? 0.24 : 0.20)
+                : NSColor.white.withAlphaComponent(isHot ? 0.96 : 0.88)
+            knobLayer.backgroundColor = knobColor.cgColor
+            knobLayer.shadowOpacity = isDark ? 0.18 : 0.12
+        }
+        for (index, label) in titleLabels.enumerated() {
+            let isSelected = modes[index] == selectedMode
+            label.textColor = isSelected ? DesignTokens.label1 : DesignTokens.label2
+            label.font = NSFont.systemFont(ofSize: Self.fontSize, weight: isSelected ? .semibold : .medium)
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        updateKnobFrame(animated: false)
+        hasLaidOutOnce = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshAppearance()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(convert(point, from: superview)) ? self : nil
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHot = true
+        refreshAppearance()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHot = false
+        refreshAppearance()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        TactilePress.animate(view: self, pressed: true, scale: 0.97)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        TactilePress.animate(view: self, pressed: false)
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else { return }
+        let next: OCRViewMode = point.x < Self.inset + itemWidths[0] ? modes[0] : modes[1]
+        guard next != selectedMode else { return }
+        setMode(next, animated: true)
+        onSelect?(next)
     }
 }

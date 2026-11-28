@@ -76,6 +76,11 @@ final class OverlayController {
     private var boundaryWallStartTime: CFAbsoluteTime?
     private var boundaryWallEdge: ScrollBoundaryEdge?
     private var boundaryWallCheckWork: DispatchWorkItem?
+    /// 最近一次画布「真正增长」（.firstFrame / .appended / .prepended）的时刻。
+    /// 撞墙蓄力期间这个值必须保持不变，才能确认「用户确实在继续滚但画布零增长」。
+    private var lastScrollGrowthTime: CFAbsoluteTime = 0
+    /// 撞墙蓄力起点时的 lastScrollGrowthTime 快照（蓄力期间若画布又长高 = 误判，需重新蓄力）。
+    private var boundaryWallArmedGrowthTime: CFAbsoluteTime = 0
     private var lastScrollStepOutcome: ScrollStitchPipeline.StepOutcome?
     private var scrollViewportHeightPx = 1
     private var scrollInContainedRegion = false
@@ -98,6 +103,15 @@ final class OverlayController {
     /// 从未滚动就静止 ≠ 到底（用户在读屏定位），不能自动合成
     private var scrollEverScrolled = false
     private var scrollInitialSelection: CGRect?
+
+    /// 录屏 / GIF 会话状态
+    private var pendingRecordingFormat: RecordingFormat?
+    private var recordingPhase: RecordingPhase?
+    private var recordingRegionGlobal: CGRect?
+    private var recordingScreen: NSScreen?
+    private var recordingOptions: RecordingOptions = RecordingOptions()
+    private var recordingControlBar: RecordingControlBar?
+    private var isStoppingRecording = false
     /// 会话级 Carbon Esc 拦截：在 HIToolbox/WindowServer 层直接接管 Esc，
     /// 彻底不依赖 macOS 14+ 协作激活（NSApp.isActive / keyWindow）是否放行，
     /// 重启后首次唤起 0ms 也能一按 Esc 立刻关闭，且绝不漏给底层 App。
@@ -179,6 +193,10 @@ final class OverlayController {
         }
         if scrollController != nil {
             cancelScrollCapture()
+            return
+        }
+        if case .preparing = recordingPhase {
+            cancelRecordingSession()
             return
         }
         if OCRResultPanel.isPresented {
@@ -277,13 +295,23 @@ final class OverlayController {
         ])
     }
 
-    func begin(completion: @escaping (Result) -> Void, onShown: (() -> Void)? = nil) {
+    func beginForRecording(format: RecordingFormat, completion: @escaping (Result) -> Void) {
+        begin(recordingFormat: format, completion: completion, onShown: nil)
+    }
+
+    func begin(
+        recordingFormat: RecordingFormat? = nil,
+        completion: @escaping (Result) -> Void,
+        onShown: (() -> Void)? = nil
+    ) {
         self.completion = completion
         lastExportSnapshot = nil
         overlaySessionEpoch += 1
         // 补丁 E（reviewer）：防御性清滚动残留（不依赖 coordinator state 门禁——
         // 缺失边①：任何绕过路径留下的吞键/采样/HUD 状态一律清零）
         teardownScrollSession()
+        teardownRecordingSession()
+        pendingRecordingFormat = recordingFormat
         // 用户裁定 2026-11-22：设置窗在冻结期间保持可见——它会被一起拍进冻结图，
         // 用户可以直接框选截设置面板本身（旧实现 begin 时先退场 ⇒ 永远截不到）。
         // 冻结完成后、覆盖层上屏前再退场（见下方 Task 内 restoreSettingsAfterCapture），
@@ -432,11 +460,13 @@ final class OverlayController {
         unregisterOverlayEscapeHotKey()
         dismissAll()
         editorSession = nil
+        pendingRecordingFormat = nil
         // 保留 toolbar 实例供下次 0ms 复用（仅执行退场隐藏，不再 nil 销毁重建）
         toolbar?.dismiss()
         ocrCloseObserver.map { NotificationCenter.default.removeObserver($0) }
         ocrCloseObserver = nil
         teardownScrollSession()
+        teardownRecordingSession()
         // 设置窗回场：截图开始时它若开着（被拍进了冻结图），覆盖层上屏前我们
         // 让它退过场（见 begin 内用户裁定）；会话结束后原样回场，现场不丢
         if settingsWasVisibleAtCaptureBegin, !SettingsWindowController.shared.isVisible {
@@ -502,7 +532,7 @@ final class OverlayController {
     }
 
     /// 无条件拆滚动会话资源（热键/HUD/采样器/滚轮监听）；不影响编辑会话
-    private func teardownScrollSession() {
+    private func teardownScrollSession(restoreFrozenBackdrop: Bool = false) {
         isScrollComposing = false
         scrollEscForceCount = 0
         scrollSessionToken += 1
@@ -534,13 +564,15 @@ final class OverlayController {
         lastUpScrollTime = 0
         scrollDownEventsSinceGrowth = 0
         scrollUpEventsSinceGrowth = 0
+        lastScrollGrowthTime = 0
+        boundaryWallArmedGrowthTime = 0
         scrollInContainedRegion = false
         scrollEverScrolled = false
         // 焦点屏语义：滚动态只可能挂在 scrollScreen 上，其余屏窗口不换态
         // （防御：scrollScreen 为空时仍全量清扫，保证会话结束无残留）
         let focal = scrollScreen
         for window in windows where focal == nil || window.owningScreen == focal {
-            window.exitScrollMode()
+            window.exitScrollMode(restoreFrozenBackdrop: restoreFrozenBackdrop)
         }
     }
 
@@ -644,7 +676,7 @@ final class OverlayController {
 
     // MARK: - 拖选完成（OverlayView 回调）
 
-    /// 松手确认：冻结底图并进入编辑态
+    /// 松手确认：冻结底图并进入编辑态（若从录屏/GIF 入口触发则直接进入录制准备态）
     func didSelect(rect: CGRect, on screen: NSScreen, windowID: CGWindowID? = nil) {
         selectionScreen = screen
         selectionRectGlobal = rect
@@ -655,6 +687,12 @@ final class OverlayController {
             "displayId": "\(DisplayRegistry.displayID(of: screen).map(String.init) ?? "?")",
         ])
         AppCoordinatorShared.didEnterConfirm()
+
+        if let recFormat = pendingRecordingFormat {
+            pendingRecordingFormat = nil
+            enterRecordingPreparing(format: recFormat, rect: rect, screen: screen)
+            return
+        }
 
         // 窗口截图：走 SCK 单窗口滤镜（拿窗口自身内容，被遮挡也正确）
         // ⚡ 其余走冻结帧本地裁剪（零延迟，所见=所得）
@@ -898,6 +936,10 @@ final class OverlayController {
             pinCurrentImage()
         case .scroll:
             beginScrollCapture()
+        case .record:
+            beginRecordingFromEditor(format: .mp4)
+        case .recordGIF:
+            beginRecordingFromEditor(format: .gif)
         case .autoRedact:
             runAutoRedact()
         case .toggleBackdrop:
@@ -1117,6 +1159,8 @@ final class OverlayController {
         lastUpScrollTime = 0
         scrollDownEventsSinceGrowth = 0
         scrollUpEventsSinceGrowth = 0
+        lastScrollGrowthTime = 0
+        boundaryWallArmedGrowthTime = 0
         lastScrollStepOutcome = nil
         resetBoundaryWall()
         scrollInContainedRegion = false
@@ -1162,7 +1206,7 @@ final class OverlayController {
             CaptureToast.show(message: "滚动截图启动失败：\(error.localizedDescription)", status: .warn)
             // reviewer 补丁 D：工具栏/焦点在 try 前已退场——不还原则编辑器
             // 只剩蒙层无 UI（残态僵死）。回滚：清滚动状态 + 恢复工具栏与焦点
-            teardownScrollSession()
+            teardownScrollSession(restoreFrozenBackdrop: true)
             scrollSelectionRect = nil
             scrollScreen = nil
             if let session = editorSession {
@@ -1254,22 +1298,28 @@ final class OverlayController {
     }
 
     /// 双向边界撞墙检测：
-    /// - 向下滑到底：位于画布最底缘 + 最近 0.75s 内有持续向下滚动输入；
-    /// - 从下往上滑到顶：位于画布最顶缘（posY ≤ edgeTolerance）+ 最近 0.75s 内有持续向上滚动输入；
+    /// - 向下滑到底：位于画布最底缘 + 最近 1.25s 内有向下滚动输入；
+    /// - 从下往上滑到顶：位于画布最顶缘（posY ≤ edgeTolerance）+ 最近 1.25s 内有向上滚动输入；
     /// 中途停下来看屏无滚动输入时恒返 nil，绝不误触发自动结束。
     private func activeBoundaryWallEdge(_ outcome: ScrollStitchPipeline.StepOutcome) -> ScrollBoundaryEdge? {
         guard scrollEverScrolled else { return nil }
         let now = CFAbsoluteTimeGetCurrent()
-        let edgeTolerance = min(40, max(16, outcome.maxViewportPosition / 4))
+        let edgeTolerance = boundaryEdgeTolerance(outcome)
         let atBottomEdge = outcome.viewportPosition >= outcome.maxViewportPosition - edgeTolerance
-        if atBottomEdge && (now - lastDownScrollTime) <= 0.75 && scrollDownEventsSinceGrowth >= 2 {
+        if atBottomEdge && (now - lastDownScrollTime) <= 1.25 && scrollDownEventsSinceGrowth >= 1 {
             return .bottom
         }
         let atTopEdge = outcome.viewportPosition <= edgeTolerance
-        if atTopEdge && (now - lastUpScrollTime) <= 0.75 && scrollUpEventsSinceGrowth >= 2 {
+        if atTopEdge && (now - lastUpScrollTime) <= 1.25 && scrollUpEventsSinceGrowth >= 1 {
             return .top
         }
         return nil
+    }
+
+    /// 边界容差：原实现 maxViewportPosition / 4 在 4K Retina 下只有约 20pt，
+    /// macOS 浏览器触底橡皮筋回弹轻易移动 50–160px，立刻被顶出「atEdge」判定 ⇒ 放宽到 64–220pt。
+    private func boundaryEdgeTolerance(_ outcome: ScrollStitchPipeline.StepOutcome) -> Int {
+        min(220, max(64, outcome.maxViewportPosition / 5))
     }
 
     private func resetBoundaryWall() {
@@ -1288,19 +1338,37 @@ final class OverlayController {
             boundaryWallEdge = edge
             boundaryWallStartTime = now
             boundaryWallStaticFrames = 0
+            // 记录蓄力起点的画布增长时刻：排空期间只要这个值不变，就说明用户在撞墙而非真在滚
+            boundaryWallArmedGrowthTime = lastScrollGrowthTime
+            Log.event(.scroll, "scroll.bottom.wallArm", [
+                "edge": edge == .top ? "top" : "bottom",
+                "posY": "\(lastScrollStepOutcome?.viewportPosition ?? -1)",
+                "maxPosY": "\(lastScrollStepOutcome?.maxViewportPosition ?? -1)",
+                "downEvts": "\(scrollDownEventsSinceGrowth)",
+                "upEvts": "\(scrollUpEventsSinceGrowth)",
+            ])
         }
         if fromFrame {
             boundaryWallStaticFrames += 1
         }
         let start = boundaryWallStartTime ?? now
         let elapsed = now - start
-        if elapsed >= 0.32, !scrollFrameInFlight, scrollFrameQueue.isEmpty {
+        let queueDrained = !scrollFrameInFlight && scrollFrameQueue.isEmpty
+        // 关键修复（2026-11-26 4K 60fps 实机病例）：
+        // 4K 下 SCStream 即使画面完全静止也持续 57fps 推帧（17.5ms/帧），而单帧解码耗时 17~20ms，
+        // 导致 scrollFrameInFlight/scrollFrameQueue 永远非空——此前硬要求 queueDrained 导致触底永远不触发！
+        // 现改为：只要蓄力 ≥ 0.36s 且画布零增长，并且满足「已连续处理 ≥ 3 帧无增长（确认队列里没有滞后的滚动帧）」
+        // 或「队列已排空（静止 0 推帧场景）」，即可立刻确认触底/触顶。
+        let confirmedStalled = boundaryWallStaticFrames >= 3 || (queueDrained && elapsed >= 0.42)
+        if elapsed >= 0.36,
+           lastScrollGrowthTime == boundaryWallArmedGrowthTime,
+           confirmedStalled {
             resetBoundaryWall()
             detectScrollBottom(isTop: edge == .top)
             return
         }
         guard boundaryWallCheckWork == nil else { return }
-        scheduleBoundaryWallCheck(expectedEdge: edge, delay: max(0.05, 0.32 - elapsed))
+        scheduleBoundaryWallCheck(expectedEdge: edge, delay: max(0.05, 0.36 - elapsed))
     }
 
     private func scheduleBoundaryWallCheck(expectedEdge: ScrollBoundaryEdge, delay: TimeInterval) {
@@ -1311,20 +1379,47 @@ final class OverlayController {
                   self.scrollSessionToken == token,
                   self.scrollController != nil,
                   !self.scrollBottomDetected,
-                  self.scrollEverScrolled,
-                  let outcome = self.lastScrollStepOutcome,
-                  let edge = self.activeBoundaryWallEdge(outcome),
-                  edge == expectedEdge
+                  self.scrollEverScrolled
             else {
                 return
             }
             self.boundaryWallCheckWork = nil
-            if self.scrollFrameInFlight || !self.scrollFrameQueue.isEmpty {
-                self.scheduleBoundaryWallCheck(expectedEdge: expectedEdge, delay: 0.08)
+            guard let outcome = self.lastScrollStepOutcome else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            // 蓄力期间画布又长高了 ⇒ 用户在正常滚动而非撞墙，作废本次蓄力
+            guard self.lastScrollGrowthTime == self.boundaryWallArmedGrowthTime else {
+                self.resetBoundaryWall()
+                return
+            }
+            let queueDrained = !self.scrollFrameInFlight && self.scrollFrameQueue.isEmpty
+            let elapsed = self.boundaryWallStartTime.map { now - $0 } ?? 0
+            // 若尚未观测到足够多的静止确认帧且队列仍在处理中，继续每 80ms 复核（上限等待队列排空或 ≥3 静止帧）
+            if self.boundaryWallStaticFrames < 3 && !queueDrained {
+                if elapsed < 1.8 {
+                    self.scheduleBoundaryWallCheck(expectedEdge: expectedEdge, delay: 0.08)
+                } else {
+                    self.resetBoundaryWall()
+                }
+                return
+            }
+            let tolerance = self.boundaryEdgeTolerance(outcome)
+            let atExpectedEdge = expectedEdge == .bottom
+                ? outcome.viewportPosition >= outcome.maxViewportPosition - tolerance
+                : outcome.viewportPosition <= tolerance
+            let relevantScrollTime = expectedEdge == .bottom ? self.lastDownScrollTime : self.lastUpScrollTime
+            let relevantEvents = expectedEdge == .bottom
+                ? self.scrollDownEventsSinceGrowth
+                : self.scrollUpEventsSinceGrowth
+            // 主路径：仍满足完整边界条件；兼容路径：队列消化耗时吃掉了 1.25s 窗口，
+            // 但用户确实在蓄力期间向该方向滚过且当前仍在边上 ⇒ 同样认。
+            let matched = self.activeBoundaryWallEdge(outcome) == expectedEdge
+                || (atExpectedEdge && (now - relevantScrollTime) <= 2.2 && relevantEvents >= 1)
+            guard matched else {
+                self.resetBoundaryWall()
                 return
             }
             self.resetBoundaryWall()
-            self.detectScrollBottom(isTop: edge == .top)
+            self.detectScrollBottom(isTop: expectedEdge == .top)
         }
         boundaryWallCheckWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
@@ -1341,6 +1436,7 @@ final class OverlayController {
 
         switch outcome.status {
         case .firstFrame:
+            lastScrollGrowthTime = CFAbsoluteTimeGetCurrent()
             resetBoundaryWall()
             scrollInContainedRegion = false
             Log.event(.scroll, "scroll.frame.n", [
@@ -1357,7 +1453,11 @@ final class OverlayController {
             }
 
         case .skipped:
-            resetBoundaryWall()
+            // 触底橡皮筋/滚动条淡出会偶发一帧 skip：只要仍在底缘/顶缘撞墙就保留已蓄力的计时，
+            // 否则会反复把已经蓄了一半的触底计时器清零，用户永远等不到自动合成。
+            if activeBoundaryWallEdge(outcome) == nil {
+                resetBoundaryWall()
+            }
             var fields: [String: String] = [
                 "afterN": "\(outcome.frameCount)",
                 "prepMs": "\(outcome.prepMs)",
@@ -1389,6 +1489,7 @@ final class OverlayController {
             }
             scrollDownEventsSinceGrowth = 0
             scrollUpEventsSinceGrowth = 0
+            lastScrollGrowthTime = CFAbsoluteTimeGetCurrent()
             resetBoundaryWall()
             scrollInContainedRegion = false
             revokeBottomIfNeeded()
@@ -1413,6 +1514,7 @@ final class OverlayController {
             }
             scrollDownEventsSinceGrowth = 0
             scrollUpEventsSinceGrowth = 0
+            lastScrollGrowthTime = CFAbsoluteTimeGetCurrent()
             resetBoundaryWall()
             scrollInContainedRegion = false
             revokeBottomIfNeeded()
@@ -1534,7 +1636,7 @@ final class OverlayController {
         scrollBottomDetected = false
         let focal = scrollScreen
         for window in windows where focal == nil || window.owningScreen == focal {
-            window.exitScrollMode()
+            window.exitScrollMode(restoreFrozenBackdrop: false)
         }
 
         guard let selection, let screen else {
@@ -1814,6 +1916,248 @@ final class OverlayController {
             case .save: completion?(.save(finalImage))
             case .quickSave, .cancel: break
             }
+        }
+    }
+
+    // MARK: - 屏幕录制与 GIF 录制
+
+    /// 从静态编辑器切换进录制准备态：清空静态标注与冻结帧，保留当前选区框并展示录制控制栏
+    func beginRecordingFromEditor(format: RecordingFormat) {
+        guard let session = editorSession else { return }
+        let rect = session.selectionGlobal
+        let screen = session.screen
+        OCRResultPanel.dismissIfPresented()
+        _ = editorWindow()?.overlayView.cancelActiveTextEditingIfNeeded()
+        toolbar?.hideTooltip()
+        toolbar?.dismiss()
+        editorSession = nil
+        frozenImages.removeAll()
+        enterRecordingPreparing(format: format, rect: rect, screen: screen)
+    }
+
+    private func enterRecordingPreparing(format: RecordingFormat, rect: CGRect, screen: NSScreen) {
+        teardownRecordingSession()
+        var opts = AppCoordinatorShared.coordinator?.settings.recordingOptions ?? RecordingOptions()
+        opts.format = format
+        recordingOptions = opts
+        recordingPhase = .preparing
+        recordingRegionGlobal = rect
+        recordingScreen = screen
+        selectionRectGlobal = rect
+        selectionScreen = screen
+
+        for win in windows where win.owningScreen == screen {
+            win.enterRecordingPreparingMode(globalRect: rect)
+            win.orderFrontRegardless()
+            win.makeKey()
+        }
+        // 其他屏蒙层如有残留则撤掉
+        for win in windows where win.owningScreen != screen {
+            win.orderOut(nil)
+        }
+
+        let bar = RecordingControlBar(
+            options: opts,
+            callbacks: RecordingControlBar.Callbacks(
+                onOptionsChanged: { [weak self] updated in
+                    self?.recordingOptions = updated
+                    AppCoordinatorShared.coordinator?.updateRecordingOptions(updated)
+                },
+                onStart: { [weak self] in
+                    self?.startRecordingFromBar()
+                },
+                onPauseToggle: { [weak self] in
+                    self?.togglePauseRecording()
+                },
+                onStop: { [weak self] in
+                    self?.stopRecordingFromBar()
+                },
+                onCancel: { [weak self] in
+                    self?.cancelRecordingSession()
+                }
+            )
+        )
+        bar.updateSelectionSize(rect.size, backingScale: screen.backingScaleFactor)
+        bar.place(nearGlobalRect: rect, on: screen)
+        bar.orderFrontRegardless()
+        recordingControlBar = bar
+        Log.event(.recording, "recording.prepare", [
+            "format": format.rawValue,
+            "ptW": "\(Int(rect.width))",
+            "ptH": "\(Int(rect.height))",
+        ])
+    }
+
+    /// 准备态调整选区框时同步更新控制栏像素尺寸与位置
+    func updateRecordingRegionGlobal(_ newGlobal: CGRect, on screen: NSScreen) {
+        guard case .preparing = recordingPhase else { return }
+        recordingRegionGlobal = newGlobal
+        recordingScreen = screen
+        selectionRectGlobal = newGlobal
+        selectionScreen = screen
+        recordingControlBar?.updateSelectionSize(newGlobal.size, backingScale: screen.backingScaleFactor)
+        recordingControlBar?.place(nearGlobalRect: newGlobal, on: screen)
+    }
+
+    func startRecordingFromBar() {
+        guard case .preparing = recordingPhase,
+              let rect = recordingRegionGlobal,
+              let screen = recordingScreen,
+              let displayID = DisplayRegistry.displayID(of: screen),
+              let recorder = AppCoordinatorShared.deps?.recording else { return }
+
+        // 进入实际录制后立即注销会话级 Esc 热键，绝不拦截用户在其他 App 里按 Esc
+        unregisterOverlayEscapeHotKey()
+
+        let settings = AppCoordinatorShared.coordinator?.settings ?? AppSettings.defaultSettings
+        // 直接采用控制栏上的音轨开关组合（无声 / 仅系统声 / 仅麦克风 / 系统声+麦克风），不再强制静音
+        let effectiveOptions = recordingOptions
+        let dest = ExportCoordinator().prepareRecordingOutputURL(
+            format: recordingOptions.format,
+            settings: settings
+        )
+        let request = ScreenRecordingRequest(
+            regionGlobal: rect,
+            displayID: displayID,
+            screenFrame: screen.frame,
+            backingScale: screen.backingScaleFactor,
+            preferDisplayP3: screen.canRepresent(.p3),
+            options: effectiveOptions,
+            outputURL: dest.url,
+            isTemporaryFile: dest.isTemporary
+        )
+        Log.event(.recording, "recording.start.request", [
+            "format": effectiveOptions.format.rawValue,
+            "systemAudio": effectiveOptions.captureSystemAudio ? "1" : "0",
+            "microphone": effectiveOptions.captureMicrophone ? "1" : "0",
+            "cursor": effectiveOptions.showCursor ? "1" : "0",
+            "fps": "\(effectiveOptions.effectiveFPS)",
+        ])
+
+        recordingPhase = .recording(elapsed: 0)
+        for win in windows where win.owningScreen == screen {
+            win.enterRecordingActiveMode(globalRect: rect, paused: false)
+        }
+        recordingControlBar?.updatePhase(.recording(elapsed: 0), anchorGlobalRect: rect, on: screen)
+        // 把焦点归还给用户原本要操作/录制的应用
+        restoreFocusRobust()
+
+        let epoch = overlaySessionEpoch
+        Task { @MainActor [weak self] in
+            do {
+                try await recorder.start(request: request) { [weak self] event in
+                    guard let self, self.overlaySessionEpoch == epoch else { return }
+                    self.handleRecordingEvent(event)
+                }
+                guard let self, self.overlaySessionEpoch == epoch else { return }
+                AppCoordinatorShared.coordinator?.setRecordingActiveState(true)
+            } catch {
+                guard let self, self.overlaySessionEpoch == epoch else { return }
+                Log.error(.recording, "recording.start.fail", ["err": error.localizedDescription])
+                CaptureToast.show(message: "无法开始录制：\(error.localizedDescription)", status: .warn)
+                AppCoordinatorShared.coordinator?.setRecordingActiveState(false)
+                self.perform(action: .cancel)
+            }
+        }
+    }
+
+    private func handleRecordingEvent(_ event: ScreenRecordingEvent) {
+        guard let rect = recordingRegionGlobal, let screen = recordingScreen else { return }
+        switch event {
+        case .started:
+            recordingPhase = .recording(elapsed: 0)
+            recordingControlBar?.updatePhase(.recording(elapsed: 0), anchorGlobalRect: rect, on: screen)
+        case .progress(let elapsed):
+            recordingPhase = .recording(elapsed: elapsed)
+            recordingControlBar?.updatePhase(.recording(elapsed: elapsed), anchorGlobalRect: rect, on: screen)
+        case .audioLevels(let system, let microphone):
+            // 实时音频电平只驱动控制条上的声波胶囊，不改计时/状态；非录制态由控制条自行放平归零
+            recordingControlBar?.updateAudioLevels(system: system, microphone: microphone)
+        case .paused(let elapsed):
+            recordingPhase = .paused(elapsed: elapsed)
+            for win in windows where win.owningScreen == screen {
+                win.setRecordingPaused(true)
+            }
+            recordingControlBar?.updatePhase(.paused(elapsed: elapsed), anchorGlobalRect: rect, on: screen)
+        case .resumed:
+            for win in windows where win.owningScreen == screen {
+                win.setRecordingPaused(false)
+            }
+            if case .paused(let elapsed) = recordingPhase {
+                recordingPhase = .recording(elapsed: elapsed)
+                recordingControlBar?.updatePhase(.recording(elapsed: elapsed), anchorGlobalRect: rect, on: screen)
+            }
+        case .failed(let message):
+            CaptureToast.show(message: "录制中断：\(message)", status: .warn)
+            AppCoordinatorShared.coordinator?.setRecordingActiveState(false)
+            perform(action: .cancel)
+        }
+    }
+
+    func togglePauseRecording() {
+        guard let recorder = AppCoordinatorShared.deps?.recording, recorder.isRecording else { return }
+        Task { @MainActor in
+            if recorder.isPaused {
+                await recorder.resume()
+            } else {
+                await recorder.pause()
+            }
+        }
+    }
+
+    func stopRecordingFromBar() {
+        guard !isStoppingRecording,
+              let recorder = AppCoordinatorShared.deps?.recording,
+              recorder.isRecording else { return }
+        isStoppingRecording = true
+        recordingPhase = .finalizing
+        if let rect = recordingRegionGlobal, let screen = recordingScreen {
+            recordingControlBar?.updatePhase(.finalizing, anchorGlobalRect: rect, on: screen)
+        }
+
+        let epoch = overlaySessionEpoch
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isStoppingRecording = false }
+            do {
+                let result = try await recorder.stop()
+                guard self.overlaySessionEpoch == epoch else { return }
+                AppCoordinatorShared.coordinator?.setRecordingActiveState(false)
+                let completion = self.completion
+                self.end()
+                self.completion = nil
+                completion?(.cancelled)
+                AppCoordinatorShared.coordinator?.handleRecordingCompleted(result)
+            } catch {
+                Log.error(.recording, "recording.stop.fail", ["err": error.localizedDescription])
+                CaptureToast.show(message: "录制导出失败：\(error.localizedDescription)", status: .warn)
+                AppCoordinatorShared.coordinator?.setRecordingActiveState(false)
+                if self.overlaySessionEpoch == epoch {
+                    self.perform(action: .cancel)
+                }
+            }
+        }
+    }
+
+    func cancelRecordingSession() {
+        if let recorder = AppCoordinatorShared.deps?.recording, recorder.isRecording {
+            Task { @MainActor in
+                await recorder.cancel()
+            }
+        }
+        AppCoordinatorShared.coordinator?.setRecordingActiveState(false)
+        perform(action: .cancel)
+    }
+
+    private func teardownRecordingSession() {
+        isStoppingRecording = false
+        recordingPhase = nil
+        recordingRegionGlobal = nil
+        recordingScreen = nil
+        recordingControlBar?.dismiss()
+        recordingControlBar = nil
+        for win in windows {
+            win.exitRecordingMode()
         }
     }
 }

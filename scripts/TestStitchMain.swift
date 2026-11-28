@@ -25,6 +25,7 @@ struct TestStitchMain {
         try testIncrementalSessionWithBounceBack()
         try testWidescreenLightChatDocLayout()
         try testMultiStepRollbackCanvasWindowZeroDrift()
+        try testStickySidebarAndRepetitiveTableBackAndForth()
     }
 
     // MARK: - 用例 1~5：基础 + 负向 + 不等高 + 4K 性能
@@ -394,6 +395,82 @@ struct TestStitchMain {
         print("[TestStitch] 用例12 PASS: 6 次往返 contained + 续拼零漂移 (总高 \(result.image.height))")
     }
 
+    // MARK: - 用例 13：固定顶栏 + 固定左侧栏 + 高重复表格行，剧烈来回滚动（Raptor 网页实机病例）
+    // 线上现场：滚到 pxH=4892 后反复上下滚动，旧实现把已到顶的画面误判成向上越界，
+    // 连续 3 次 Prepend（144 / 1077 / 1201），侧栏与表格重复贴 5 遍、maxViewportPosition 虚增。
+
+    static func testStickySidebarAndRepetitiveTableBackAndForth() throws {
+        print("[TestStitch] 用例13: 固定顶栏(72) + 固定左侧栏(220) + 高重复表格行(72~80px)，剧烈来回滚动")
+        let width = 1100
+        let pageHeight = 2200
+        let viewportH = 680
+        let headerH = 72
+        let sidebarW = 220
+        let bodyH = viewportH - headerH // 608
+
+        let table = try renderRepetitiveTablePage(
+            width: width - sidebarW, height: pageHeight, seed: 20261126)
+        let header = try renderLightStickyHeader(width: width, height: headerH)
+        let sidebar = try renderStickySidebar(width: sidebarW, height: bodyH)
+
+        // 剧烈来回滚动轨迹：回到顶部 2 次、中段反复折返、到底 1520、回弹 1380、再到底 1520
+        let trajectory = [0, 180, 420, 740, 520, 260, 0, 0, 310, 620, 740, 1080, 1520, 1380, 1520, 1520]
+        let session = Stitcher.Session()
+        var statuses: [Stitcher.PushStatus] = []
+        var topVisitedPositions: [Int] = []
+        for (idx, scrollY) in trajectory.enumerated() {
+            let frame = try composeStickySidebarViewport(
+                width: width, viewportH: viewportH, headerH: headerH, sidebarW: sidebarW,
+                table: table, header: header, sidebar: sidebar, scrollY: scrollY)
+            let status = session.push(frame)
+            statuses.append(status)
+            print("[TestStitch] 用例13 帧\(idx) y=\(scrollY) → \(status) "
+                + "(pos=\(session.viewportPosition), max=\(session.maxViewportPosition), H=\(session.canvasHeight))")
+            if idx > 0 && scrollY == 0 {
+                topVisitedPositions.append(session.viewportPosition)
+            }
+        }
+
+        guard case .firstFrame = statuses[0] else {
+            throw TestError("用例13 帧0 应为 firstFrame，实际 \(statuses[0])")
+        }
+        let prependCount = statuses.reduce(0) { count, status in
+            if case .prepended = status { return count + 1 }
+            return count
+        }
+        guard prependCount == 0 else {
+            throw TestError("用例13 出现 \(prependCount) 次 prepended（顶栏/侧栏被重复贴到画布上方），statuses=\(statuses)")
+        }
+        print("[TestStitch] 用例13 prepended 次数 = 0 ✓")
+
+        guard topVisitedPositions.count == 2 else {
+            throw TestError("用例13 期望 2 次回到顶部，实际 \(topVisitedPositions)")
+        }
+        for pos in topVisitedPositions {
+            guard pos <= 4 else {
+                throw TestError("用例13 回到顶部时 viewportPosition=\(pos) 应 <= 4 ✗")
+            }
+        }
+        print("[TestStitch] 用例13 回到顶部两次的 viewportPosition = \(topVisitedPositions) ✓")
+
+        // 触底自动完成依赖：滚到底后 viewportPosition 必须追上 maxViewportPosition
+        let tailGap = abs(session.viewportPosition - session.maxViewportPosition)
+        guard tailGap <= 4 else {
+            throw TestError("用例13 到底后 |pos - maxPos| = \(tailGap) > 4（触底自动完成会失效）")
+        }
+        print("[TestStitch] 用例13 到底后 viewportPosition=\(session.viewportPosition), "
+            + "maxViewportPosition=\(session.maxViewportPosition), 差值 \(tailGap) ✓")
+
+        let result = try session.finish()
+        try assertClose(result.image.height, pageHeight, tolerance: 4, label: "用例13 长图总高（真值 2200）")
+        try assertEquals(result.image.width, width, "用例13 长图宽度")
+        // 顶栏只在长图顶部出现一次
+        let truthTop = try composeHeaderTopTruth(
+            width: width, height: pageHeight, header: header)
+        try verifyRegionExact(result.image, against: truthTop, startRow: 0, endRow: headerH, label: "用例13 顶栏仅在长图顶部一次")
+        print("[TestStitch] 用例13 PASS: 0 次 Prepend、无重复内容膨胀（总高 \(result.image.height) ≈ 2200）")
+    }
+
     // MARK: - 测试画面生成器
 
     static func renderPage(width: Int, height: Int, seed: Int, invert: Bool = false) throws -> CGImage {
@@ -623,6 +700,146 @@ struct TestStitchMain {
         ctx.fill(CGRect(x: CGFloat(boxX + boxW - 44), y: 26, width: 32, height: CGFloat(height - 52)))
         guard let img = ctx.makeImage() else { throw TestError("LightFooter makeImage 失败") }
         return img
+    }
+
+    /// 模拟 Raptor 右侧数据表格区：行高 72~80 微变、列线/斑马纹样式恒定，仅局部文本与数字不同（高重复度）
+    static func renderRepetitiveTablePage(width: Int, height: Int, seed: Int) throws -> CGImage {
+        guard let ctx = makeContext(width: width, height: height) else {
+            throw TestError("RepetitiveTable CGContext 创建失败")
+        }
+        ctx.setFillColor(CGColor(gray: 1.0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+
+        let columnXs = [300, 520, 700].filter { $0 < width }
+        // 行高 72~80 微变（真实表格的单元格内容换行导致），样式/列线/斑马纹高度重复
+        var rowHeights: [Int] = []
+        var rowTops: [Int] = []
+        var fillState = UInt64(truncatingIfNeeded: seed) | 1
+        var cursorY = 0
+        while cursorY < height {
+            fillState = fillState &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            rowTops.append(cursorY)
+            let rowH = 72 + Int((fillState >> 33) % 9)
+            rowHeights.append(rowH)
+            cursorY += rowH
+        }
+
+        for row in rowTops.indices {
+            let top = rowTops[row]
+            let rowH = rowHeights[row]
+            let baseY = CGFloat(height - top - rowH) // CGContext Y-up 的行底
+            if row % 2 == 0 {
+                ctx.setFillColor(CGColor(gray: 0.975, alpha: 1))
+                ctx.fill(CGRect(x: 0, y: baseY, width: CGFloat(width), height: CGFloat(rowH)))
+            }
+            // 行分隔线 + 列线（样式完全一致）
+            ctx.setFillColor(CGColor(gray: 0.90, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: baseY, width: CGFloat(width), height: 1))
+            for columnX in columnXs {
+                ctx.fill(CGRect(x: CGFloat(columnX), y: baseY, width: 1, height: CGFloat(rowH)))
+            }
+
+            var state = UInt64(truncatingIfNeeded: row &* 6_364_136_223_846_793_005)
+                ^ (UInt64(truncatingIfNeeded: seed) &* 2_654_435_761)
+            func next() -> Int {
+                state ^= state << 13
+                state ^= state >> 7
+                state ^= state << 17
+                return Int(state % 10_000)
+            }
+            let textY = baseY + CGFloat(rowH / 2 - 5)
+
+            // 名称列：宽度 90~230 逐行变化（文字长度不同，但风格一致）
+            ctx.setFillColor(CGColor(gray: 0.22, alpha: 1))
+            ctx.fill(CGRect(x: 24, y: textY, width: CGFloat(90 + next() % 141), height: 10))
+            // 状态胶囊：4 种颜色轮转
+            let pillColors: [(CGFloat, CGFloat, CGFloat)] = [
+                (0.20, 0.62, 0.36), (0.25, 0.56, 0.98), (0.92, 0.62, 0.20), (0.72, 0.28, 0.36),
+            ]
+            let pill = pillColors[next() % 4]
+            ctx.setFillColor(CGColor(srgbRed: pill.0, green: pill.1, blue: pill.2, alpha: 0.9))
+            ctx.fill(CGRect(x: 340, y: textY - 2, width: 52, height: 14))
+
+            // 中间两列：每行 2~4 段变宽/变位文本（内容差异大，但行高、列线、斑马纹完全相同）
+            ctx.setFillColor(CGColor(gray: 0.42, alpha: 1))
+            var segmentX = 540
+            let segmentCount = 2 + next() % 4
+            for _ in 0..<segmentCount {
+                let segmentW = 18 + next() % 92
+                if segmentX + segmentW > width - 40 { break }
+                ctx.fill(CGRect(x: CGFloat(segmentX), y: textY, width: CGFloat(segmentW), height: 9))
+                segmentX += segmentW + 8 + next() % 14
+            }
+            // 右侧数值块：位数、位宽、间隔逐行微变（局部数字差异，无周期）
+            ctx.setFillColor(CGColor(gray: 0.16, alpha: 1))
+            var digitX = width - 32
+            let digitCount = 2 + next() % 5
+            for _ in 0..<digitCount {
+                let digitW = 6 + next() % 19
+                digitX -= digitW + 4
+                if digitX < width / 2 { break }
+                ctx.fill(CGRect(x: CGFloat(digitX), y: textY, width: CGFloat(digitW), height: 10))
+            }
+        }
+        guard let image = ctx.makeImage() else { throw TestError("RepetitiveTable makeImage 失败") }
+        return image
+    }
+
+    /// 固定左侧边栏（导航图标 + 菜单文本，整列跨全部视口高度 − 顶栏）
+    static func renderStickySidebar(width: Int, height: Int) throws -> CGImage {
+        guard let ctx = makeContext(width: width, height: height) else {
+            throw TestError("StickySidebar CGContext 创建失败")
+        }
+        ctx.setFillColor(CGColor(gray: 0.985, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+        ctx.setFillColor(CGColor(gray: 0.88, alpha: 1))
+        ctx.fill(CGRect(x: CGFloat(width - 1), y: 0, width: 1, height: CGFloat(height)))
+        // 品牌块
+        ctx.setFillColor(CGColor(srgbRed: 0.22, green: 0.48, blue: 0.86, alpha: 1))
+        ctx.fill(CGRect(x: 20, y: CGFloat(height - 56), width: 28, height: 28))
+        ctx.setFillColor(CGColor(gray: 0.20, alpha: 1))
+        ctx.fill(CGRect(x: 58, y: CGFloat(height - 48), width: 96, height: 12))
+        // 导航项
+        for i in 0..<12 {
+            let yTop = 76 + i * 42
+            if yTop + 28 >= height { break }
+            let cy = CGFloat(height - yTop - 28)
+            ctx.setFillColor(CGColor(gray: 0.55, alpha: 1))
+            ctx.fill(CGRect(x: 24, y: cy + 6, width: 16, height: 16))
+            ctx.setFillColor(CGColor(gray: i == 1 ? 0.18 : 0.38, alpha: 1))
+            ctx.fill(CGRect(x: 52, y: cy + 10, width: CGFloat(96 + (i % 3) * 24), height: 10))
+        }
+        guard let image = ctx.makeImage() else { throw TestError("StickySidebar makeImage 失败") }
+        return image
+    }
+
+    /// 组合 Raptor 视口：顶部固定顶栏（跨全宽）+ 左侧固定侧边栏 + 右侧表格区随 `scrollY` 滚动
+    static func composeStickySidebarViewport(
+        width: Int, viewportH: Int, headerH: Int, sidebarW: Int,
+        table: CGImage, header: CGImage, sidebar: CGImage, scrollY: Int
+    ) throws -> CGImage {
+        let bodyH = viewportH - headerH
+        let bodySlice = try cropped(table, y: scrollY + headerH, height: bodyH, name: "raptor-table")
+        guard let ctx = makeContext(width: width, height: viewportH) else {
+            throw TestError("RaptorViewport CGContext 创建失败")
+        }
+        ctx.draw(bodySlice, in: CGRect(x: sidebarW, y: 0, width: width - sidebarW, height: bodyH))
+        ctx.draw(sidebar, in: CGRect(x: 0, y: 0, width: sidebarW, height: bodyH))
+        ctx.draw(header, in: CGRect(x: 0, y: viewportH - headerH, width: width, height: headerH))
+        guard let image = ctx.makeImage() else { throw TestError("RaptorViewport makeImage 失败") }
+        return image
+    }
+
+    /// 真值参考：只有长图顶部有顶栏，其余区域留白（用于验证顶栏没有被重复贴）
+    static func composeHeaderTopTruth(width: Int, height: Int, header: CGImage) throws -> CGImage {
+        guard let ctx = makeContext(width: width, height: height) else {
+            throw TestError("HeaderTopTruth CGContext 创建失败")
+        }
+        ctx.setFillColor(CGColor(gray: 1.0, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+        ctx.draw(header, in: CGRect(x: 0, y: height - header.height, width: width, height: header.height))
+        guard let image = ctx.makeImage() else { throw TestError("HeaderTopTruth makeImage 失败") }
+        return image
     }
 
     static func composeTruthStickyPage(
